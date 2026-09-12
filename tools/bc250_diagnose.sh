@@ -173,14 +173,79 @@ if [ -z "$SUNSHINE_PID" ]; then
     echo -e "    different ways (systemd --user service, desktop autostart,"
     echo -e "    Flatpak, manual shell) that each source its environment"
     echo -e "    differently."
-elif [ ! -r "/proc/$SUNSHINE_PID/environ" ]; then
-    echo -e "  ${YELLOW}! Found Sunshine (PID ${SUNSHINE_PID}) but cannot read${NC}"
-    echo -e "    /proc/${SUNSHINE_PID}/environ (permission denied - it may be"
-    echo -e "    running as a different user). Re-run this script as that user,"
-    echo -e "    or with sudo, for this check to work."
 else
     echo -e "  ${GREEN}✓ Found running Sunshine process (PID ${SUNSHINE_PID})${NC}"
 
+    # Capability check FIRST, and independent of whether /proc/.../environ is
+    # readable below: Sunshine's binary normally carries a file capability
+    # (commonly cap_sys_admin, for KMS screen capture). Executing a binary
+    # with elevated file capabilities puts the kernel into secure-execution
+    # mode (AT_SECURE=1), in which glibc's secure_getenv() - which libva uses
+    # specifically for LIBVA_DRIVER_NAME/LIBVA_DRIVERS_PATH, because those
+    # variables control which shared library gets dlopen()'d into a
+    # privileged process - returns nothing AT ALL, regardless of what is
+    # actually in the environment. This is deliberate libva security design,
+    # not a bug, and it is invisible to a plain environment-variable check:
+    # the variable can be genuinely present (confirmed further below) and
+    # still be silently ignored. This was found and fixed on this exact
+    # project before - see docs/DEVLOG.md 10.5/10.6/12.6 for the full
+    # root-cause writeup, and a real bug report this exact check would have
+    # caught immediately instead of reporting a clean pass.
+    #
+    # NOTE: a nonzero CapEff is only meaningful evidence of this if the
+    # process is NOT running as root - UID 0 has the full capability set
+    # inherently, with no file-capability/secure-exec transition involved,
+    # so CapEff alone would false-positive on any root-run process
+    # (confirmed while testing this check). The AT_SECURE mechanism this
+    # step is looking for specifically requires a non-root process gaining
+    # capabilities beyond what its parent had, via a file capability set on
+    # its own binary (`getcap`/`setcap`) - which is exactly how Sunshine
+    # normally gets cap_sys_admin for KMS capture on a real desktop, and the
+    # only way a non-root process ever ends up with a nonzero CapEff at all.
+    SUNSHINE_UID=$(awk '/^Uid:/{print $2}' "/proc/$SUNSHINE_PID/status" 2>/dev/null)
+    CAPEFF=$(awk '/^CapEff:/{print $2}' "/proc/$SUNSHINE_PID/status" 2>/dev/null)
+    if [ -n "$CAPEFF" ] && [ "$CAPEFF" != "0000000000000000" ] && [ "${SUNSHINE_UID:-0}" != "0" ]; then
+        echo -e "  ${RED}✗ Sunshine's process has elevated file capabilities (CapEff=${CAPEFF}).${NC}"
+        echo -e "    This puts it in the kernel's secure-execution mode, in which libva"
+        echo -e "    CANNOT see LIBVA_DRIVER_NAME/LIBVA_DRIVERS_PATH at all - regardless of"
+        echo -e "    what the environment check below finds. This is the single most"
+        echo -e "    common cause of a 'vainfo works, Sunshine still uses software"
+        echo -e "    encoding' report."
+        SUNSHINE_EXE=$(readlink -f "/proc/$SUNSHINE_PID/exe" 2>/dev/null || true)
+        if [ -n "$SUNSHINE_EXE" ] && command -v getcap &> /dev/null; then
+            CAPSTR=$(getcap "$SUNSHINE_EXE" 2>/dev/null)
+            [ -n "$CAPSTR" ] && echo -e "    ($CAPSTR)"
+        fi
+        echo
+        echo -e "    ${BOLD}Fix - do this instead of setting environment variables:${NC}"
+        echo -e "      sudo ./tools/install_vaapi_boot_redirect.sh"
+        echo -e "    This redirects the system's default (radeonsi) VA-API driver slot to"
+        echo -e "    this driver directly, which works regardless of secure_getenv() -"
+        echo -e "    persists across reboots on immutable/ostree systems too."
+        echo
+        echo -e "    ${YELLOW}The environment check below may still show everything 'correct' -${NC}"
+        echo -e "    ${YELLOW}that does not mean hardware encoding will actually work. Trust${NC}"
+        echo -e "    ${YELLOW}this capability check over that one.${NC}"
+    elif [ "${SUNSHINE_UID:-0}" = "0" ]; then
+        echo -e "  ${GREEN}✓ Sunshine is running as root (UID 0)${NC}"
+        echo -e "    - not itself the AT_SECURE/secure_getenv() trigger this check looks"
+        echo -e "    for (that specifically requires a non-root process gaining"
+        echo -e "    capabilities via a file capability on its own binary). libva's"
+        echo -e "    environment-variable lookup should apply normally here; the check"
+        echo -e "    below is meaningful. Running a real desktop session's Sunshine as"
+        echo -e "    root is unusual, though - worth double-checking that's intentional."
+    else
+        echo -e "  ${GREEN}✓ No elevated file capabilities detected on Sunshine's process${NC}"
+        echo -e "    (CapEff=${CAPEFF:-unreadable}) - libva's environment-variable lookup"
+        echo -e "    should apply normally; the check below is meaningful here."
+    fi
+    echo
+
+    if [ ! -r "/proc/$SUNSHINE_PID/environ" ]; then
+        echo -e "  ${YELLOW}! Cannot read /proc/${SUNSHINE_PID}/environ (permission denied -${NC}"
+        echo -e "    it may be running as a different user). Re-run this script as that"
+        echo -e "    user, or with sudo, to also check its environment variables."
+    else
     SUNSHINE_ENV=$(tr '\0' '\n' < "/proc/$SUNSHINE_PID/environ" 2>/dev/null || true)
     SUNSHINE_LIBVA_DRIVER=$(echo "$SUNSHINE_ENV" | grep '^LIBVA_DRIVER_NAME=' | cut -d= -f2-)
     SUNSHINE_LIBVA_PATH=$(echo "$SUNSHINE_ENV" | grep '^LIBVA_DRIVERS_PATH=' | cut -d= -f2-)
@@ -240,6 +305,7 @@ else
             [ "$IS_STANDARD_DIR" -eq 0 ] && echo -e "    Environment=LIBVA_DRIVERS_PATH=$FOUND_DRIVER_DIR"
         fi
         echo -e "  then: systemctl --user daemon-reload && systemctl --user restart <unit>"
+    fi
     fi
 fi
 
