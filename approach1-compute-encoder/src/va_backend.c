@@ -764,6 +764,7 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                                             "window_size=%u initial_qp=%u min_qp=%u\n",
                                     rc->bits_per_second, rc->target_percentage,
                                     rc->window_size, rc->initial_qp, rc->min_qp);
+                        }
                         if (rc->initial_qp > 0) {
                             h264_encoder_set_qp(c->h264_enc, rc->initial_qp);
                         }
