@@ -119,6 +119,44 @@ the errors below.
   `LD_PRELOAD`-into-`AT_SECURE` technique only; it costs ~40% of frame rate.
   §17
 
+## Boot safety — this project must never be able to brick a boot
+
+This repo installs exactly one systemd unit
+(`tools/bc250-vaapi-boot-redirect.service`) and touches **no** grub config,
+kernel args, dracut/initramfs, `modprobe.d`, or `ld.so.conf` — deliberately.
+Everything else it writes is `/etc/environment.d/99-bc250.conf` (plain env
+vars) and one symlink in `/usr/lib64/dri`, neither of which is boot-critical.
+**Keep it that way.** If a change would add a second unit or touch any of the
+above, that is a different class of risk and needs to be justified explicitly.
+
+The unit follows rules learned from a real incident on the dev board — a
+sibling unit from the separate VCN-hardware project (`amdgpu-vcn-early.
+service`) used `DefaultDependencies=no` + `Before=<early target>`, hung
+`local-fs-pre.target` for 45s every boot, and needed a live USB to recover.
+Our unit had the same shape and was masked alongside it. The rules:
+
+- **Never `DefaultDependencies=no`** — it also drops `Before=shutdown.target`,
+  so the unit can hang shutdown too.
+- **Never order `Before=` an early target** (`sysinit.target`,
+  `basic.target`, `local-fs-pre.target`, `systemd-udevd.service`). This unit's
+  work calls `rpm-ostree`, which is a D-Bus client; ordering a unit that can
+  block ahead of the target that brings up the thing it blocks on is how a
+  machine becomes unbootable. `WantedBy=multi-user.target`, ordered only
+  `Before=display-manager.service graphical.target`.
+- **Always set `TimeoutStartSec=`**, and wrap any command that talks to a
+  daemon in `timeout`. Unbounded blocking at boot is the actual failure mode;
+  a failed unit is harmless, a hung one is not.
+- **Validate before enabling.** `install_vaapi_boot_redirect.sh` runs
+  `systemd-analyze verify` and test-starts the unit before `systemctl enable`,
+  so a broken unit is an error message rather than a surprise at next boot.
+- **`tools/uninstall_vaapi_boot_redirect.sh` is the documented escape hatch**;
+  `systemctl mask bc250-vaapi-boot-redirect.service` is the fast one from a
+  rescue shell.
+
+Worst case by construction: the display manager starts up to 45s late, once,
+with SSH available throughout. The machine always reaches
+`multi-user.target`.
+
 ## Board and repo operations
 
 - Board is `user@10.0.0.104`. Builds happen in `distrobox enter driver-build`.
