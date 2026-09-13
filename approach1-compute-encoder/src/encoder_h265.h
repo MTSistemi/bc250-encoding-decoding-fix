@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "gpu_compute.h"
+#include "rate_control.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,6 +27,15 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
 
 void hevc_encoder_set_force_idr(hevc_encoder_t *encoder);
 void hevc_encoder_set_gop_size(hevc_encoder_t *encoder, uint32_t gop_size);
+uint32_t hevc_encoder_get_gop_size(const hevc_encoder_t *encoder);
+void hevc_encoder_set_qp(hevc_encoder_t *encoder, int qp);
+int hevc_encoder_get_qp(const hevc_encoder_t *encoder);
+void hevc_encoder_set_bitrate(hevc_encoder_t *encoder, uint32_t bitrate);
+uint32_t hevc_encoder_get_bitrate(const hevc_encoder_t *encoder);
+void hevc_encoder_set_fps(hevc_encoder_t *encoder, uint32_t fps);
+uint32_t hevc_encoder_get_fps(const hevc_encoder_t *encoder);
+void hevc_encoder_set_rc_mode(hevc_encoder_t *encoder, rc_mode_t mode);
+rc_mode_t hevc_encoder_get_rc_mode(const hevc_encoder_t *encoder);
 
 /*
  * @input_memory: backing device memory of `input_surface`, needed for the

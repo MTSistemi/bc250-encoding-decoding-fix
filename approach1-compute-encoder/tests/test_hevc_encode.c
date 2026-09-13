@@ -168,10 +168,82 @@ static void test_multi_frame_gop(void) {
     printf("[test_hevc_encode] Multi-frame GOP OK.\n");
 }
 
+static void test_dynamic_qp_and_rate_control(void) {
+    printf("[test_hevc_encode] Testing dynamic QP and rate control...\n");
+
+    const uint32_t width = 128, height = 96, fps = 30, bitrate = 2000000;
+    hevc_encoder_t *enc = hevc_encoder_create(NULL, width, height, fps, bitrate);
+    assert(enc != NULL);
+
+    /* Verify default properties */
+    assert(hevc_encoder_get_gop_size(enc) == 30);
+    assert(hevc_encoder_get_qp(enc) == 27);
+    assert(hevc_encoder_get_bitrate(enc) == 2000000);
+    assert(hevc_encoder_get_fps(enc) == 30);
+    assert(hevc_encoder_get_rc_mode(enc) == RC_CQP);
+
+    uint8_t *y_plane = malloc((size_t)width * height);
+    uint8_t *uv_plane = malloc((size_t)(width / 2) * (height / 2) * 2);
+    const size_t out_cap = (size_t)width * height * 2 + 65536;
+    uint8_t *out_buf = malloc(out_cap);
+    assert(y_plane && uv_plane && out_buf);
+
+    /* Generate rich pattern with high frequency content */
+    for (uint32_t r = 0; r < height; r++)
+        for (uint32_t c = 0; c < width; c++)
+            y_plane[r * width + c] = (uint8_t)(((r * 17) ^ (c * 31)) & 0xFF);
+    for (uint32_t r = 0; r < height / 2; r++)
+        for (uint32_t c = 0; c < width / 2; c++) {
+            uv_plane[r * width + c * 2 + 0] = (uint8_t)((r * 13 + c * 7) & 0xFF);
+            uv_plane[r * width + c * 2 + 1] = (uint8_t)((r * 23 + c * 11) & 0xFF);
+        }
+
+    /* Encode at low QP (18) */
+    hevc_encoder_set_qp(enc, 18);
+    assert(hevc_encoder_get_qp(enc) == 18);
+    hevc_encoder_set_force_idr(enc);
+    int size_qp18 = hevc_encoder_encode_raw(enc, y_plane, (int)width, uv_plane, (int)width, out_buf, out_cap);
+    assert(size_qp18 > 0);
+
+    /* Encode at high QP (40) */
+    hevc_encoder_set_qp(enc, 40);
+    assert(hevc_encoder_get_qp(enc) == 40);
+    hevc_encoder_set_force_idr(enc);
+    int size_qp40 = hevc_encoder_encode_raw(enc, y_plane, (int)width, uv_plane, (int)width, out_buf, out_cap);
+    assert(size_qp40 > 0);
+
+    printf("  QP 18 IDR size: %d bytes | QP 40 IDR size: %d bytes\n", size_qp18, size_qp40);
+    assert(size_qp40 < size_qp18 && "QP 40 output must be more compressed than QP 18");
+
+    /* Test Rate Control Mode and Parameter Setters */
+    hevc_encoder_set_rc_mode(enc, RC_VBR);
+    assert(hevc_encoder_get_rc_mode(enc) == RC_VBR);
+
+    hevc_encoder_set_bitrate(enc, 6000000);
+    assert(hevc_encoder_get_bitrate(enc) == 6000000);
+
+    hevc_encoder_set_fps(enc, 60);
+    assert(hevc_encoder_get_fps(enc) == 60);
+
+    hevc_encoder_set_rc_mode(enc, RC_LOW_LATENCY);
+    assert(hevc_encoder_get_rc_mode(enc) == RC_LOW_LATENCY);
+
+    /* Encode frames under rate control */
+    for (int f = 0; f < 5; f++) {
+        int w = hevc_encoder_encode_raw(enc, y_plane, (int)width, uv_plane, (int)width, out_buf, out_cap);
+        assert(w > 0);
+    }
+
+    free(y_plane); free(uv_plane); free(out_buf);
+    hevc_encoder_destroy(enc);
+    printf("[test_hevc_encode] Dynamic QP and rate control OK.\n");
+}
+
 int main(void) {
     test_transform_round_trip();
     test_mpm_derivation();
     test_multi_frame_gop();
+    test_dynamic_qp_and_rate_control();
 
     printf("[test_hevc_encode] ALL HEVC BITSTREAM STRUCTURE TESTS PASSED!\n");
     return 0;

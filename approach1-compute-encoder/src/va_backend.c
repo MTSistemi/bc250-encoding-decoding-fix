@@ -21,7 +21,7 @@ VAStatus bc250_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list
     if (!ctx || !num_profiles) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     if (!profile_list) {
-        *num_profiles = 4;
+        *num_profiles = 5;
         return VA_STATUS_SUCCESS;
     }
 
@@ -37,6 +37,7 @@ VAStatus bc250_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list
 #endif
     profile_list[i++] = VAProfileH264Main;
     profile_list[i++] = VAProfileH264High;
+    profile_list[i++] = VAProfileHEVCMain;
 
     *num_profiles = i;
     return VA_STATUS_SUCCESS;
@@ -52,7 +53,8 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
     int is_supported_profile = (profile == VAProfileH264ConstrainedBaseline ||
                                 profile == VAProfileH264Baseline ||
                                 profile == VAProfileH264Main ||
-                                profile == VAProfileH264High);
+                                profile == VAProfileH264High ||
+                                profile == VAProfileHEVCMain);
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
@@ -109,9 +111,40 @@ VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEn
                 break;
             case VAConfigAttribEncMaxSlices:
                 /* Up to 16 slices per picture supported via multi-threaded OpenMP
-                 * CPU entropy coding and BC250_SLICES_PER_FRAME. */
-                attrib_list[i].value = 16;
+                 * CPU entropy coding and BC250_SLICES_PER_FRAME for H.264.
+                 * HEVC uses 1 slice per picture. */
+                attrib_list[i].value = (profile == VAProfileHEVCMain) ? 1 : 16;
                 break;
+#if defined(VA_CHECK_VERSION)
+#if VA_CHECK_VERSION(1, 13, 0)
+            case VAConfigAttribEncHEVCFeatures:
+                if (profile == VAProfileHEVCMain) {
+                    VAConfigAttribValEncHEVCFeatures features;
+                    memset(&features, 0, sizeof(features));
+                    attrib_list[i].value = features.value;
+                } else {
+                    attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
+                }
+                break;
+            case VAConfigAttribEncHEVCBlockSizes:
+                if (profile == VAProfileHEVCMain) {
+                    VAConfigAttribValEncHEVCBlockSizes bs;
+                    memset(&bs, 0, sizeof(bs));
+                    /* CTU 16x16: 1 << (1 + 3) = 16 */
+                    bs.bits.log2_max_coding_tree_block_size_minus3 = 1;
+                    bs.bits.log2_min_coding_tree_block_size_minus3 = 1;
+                    /* Min CB 8x8: 1 << (0 + 3) = 8 */
+                    bs.bits.log2_min_luma_coding_block_size_minus3 = 0;
+                    /* Min/Max TB 4x4: 1 << (0 + 2) = 4 */
+                    bs.bits.log2_max_luma_transform_block_size_minus2 = 0;
+                    bs.bits.log2_min_luma_transform_block_size_minus2 = 0;
+                    attrib_list[i].value = bs.value;
+                } else {
+                    attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
+                }
+                break;
+#endif
+#endif
             default:
                 attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
                 break;
@@ -361,6 +394,23 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
             if (entry == VAEntrypointEncSlice) {
                 if (prof == VAProfileHEVCMain) {
                     c->hevc_enc = hevc_encoder_create(&data->gpu, picture_width, picture_height, 30, 4000000);
+                    if (c->hevc_enc) {
+                        for (int a = 0; a < data->configs[config_id].num_attribs; a++) {
+                            if (data->configs[config_id].attribs[a].type == VAConfigAttribRateControl) {
+                                unsigned int rc_attrib = data->configs[config_id].attribs[a].value;
+                                if (rc_attrib == VA_RC_CQP) {
+                                    hevc_encoder_set_rc_mode(c->hevc_enc, RC_CQP);
+                                } else if (rc_attrib & VA_RC_VBR) {
+                                    hevc_encoder_set_rc_mode(c->hevc_enc, RC_VBR);
+                                } else if (rc_attrib & VA_RC_CBR) {
+                                    hevc_encoder_set_rc_mode(c->hevc_enc, RC_LOW_LATENCY);
+                                } else if (rc_attrib & VA_RC_CQP) {
+                                    hevc_encoder_set_rc_mode(c->hevc_enc, RC_CQP);
+                                }
+                                break;
+                            }
+                        }
+                    }
                 } else {
                     c->h264_enc = h264_encoder_create(&data->gpu, picture_width, picture_height, 30, 4000000, prof);
                     if (c->h264_enc) {
@@ -643,6 +693,10 @@ VAStatus bc250_BeginPicture(VADriverContextP ctx, VAContextID context, VASurface
     c->h264_state.has_pic = 0;
     c->h264_state.has_slice = 0;
 
+    c->hevc_state.has_seq = 0;
+    c->hevc_state.has_pic = 0;
+    c->hevc_state.has_slice = 0;
+
     DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
@@ -689,53 +743,74 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
         bc250_buffer *b = &data->buffers[buf_id];
         switch (b->type) {
             case VAEncSequenceParameterBufferType:
-                if (b->size >= sizeof(VAEncSequenceParameterBufferH264)) {
+                if (c->h264_enc && b->size >= sizeof(VAEncSequenceParameterBufferH264)) {
                     memcpy(&c->h264_state.seq_param, b->data, sizeof(VAEncSequenceParameterBufferH264));
                     c->h264_state.has_seq = 1;
-                    if (c->h264_enc) {
-                        VAEncSequenceParameterBufferH264 *seq = &c->h264_state.seq_param;
-                        if (seq->intra_period > 0) {
-                            h264_encoder_set_gop_size(c->h264_enc, seq->intra_period);
+                    VAEncSequenceParameterBufferH264 *seq = &c->h264_state.seq_param;
+                    if (seq->intra_period > 0) {
+                        h264_encoder_set_gop_size(c->h264_enc, seq->intra_period);
+                    }
+                    if (seq->bits_per_second > 0) {
+                        unsigned int pct = c->h264_state.rc_target_percentage;
+                        if (pct == 0 || pct > 100) pct = 100;
+                        uint32_t seq_target = (uint32_t)(((uint64_t)seq->bits_per_second * pct) / 100);
+                        if (seq_target == 0) seq_target = seq->bits_per_second;
+                        if (getenv("BC250_DEBUG_RC")) {
+                            fprintf(stderr, "[bc250-rc] SeqParam H264: bits_per_second=%u pct=%u -> target=%u "
+                                            "intra_period=%u\n",
+                                    seq->bits_per_second, pct, seq_target, seq->intra_period);
                         }
-                        if (seq->bits_per_second > 0) {
-                            /* Scale by the same target_percentage the misc
-                             * RateControl buffer carries (see the field's
-                             * doc comment in va_backend.h). Without this,
-                             * ffmpeg's "50% of 2X" convention made this
-                             * path re-init rate control at 2X the real
-                             * target, clobbering the misc path's correct
-                             * value - whichever buffer arrives last wins,
-                             * and this one usually does. */
-                            unsigned int pct = c->h264_state.rc_target_percentage;
-                            if (pct == 0 || pct > 100) pct = 100;
-                            uint32_t seq_target = (uint32_t)(((uint64_t)seq->bits_per_second * pct) / 100);
-                            if (seq_target == 0) seq_target = seq->bits_per_second;
-                            if (getenv("BC250_DEBUG_RC")) {
-                                fprintf(stderr, "[bc250-rc] SeqParam: bits_per_second=%u pct=%u -> target=%u "
-                                                "intra_period=%u\n",
-                                        seq->bits_per_second, pct, seq_target, seq->intra_period);
-                            }
-                            h264_encoder_set_bitrate(c->h264_enc, seq_target);
-                        } else if (getenv("BC250_DEBUG_RC")) {
-                            fprintf(stderr, "[bc250-rc] SeqParam: bits_per_second=0 intra_period=%u\n",
-                                    seq->intra_period);
+                        h264_encoder_set_bitrate(c->h264_enc, seq_target);
+                    } else if (getenv("BC250_DEBUG_RC")) {
+                        fprintf(stderr, "[bc250-rc] SeqParam H264: bits_per_second=0 intra_period=%u\n",
+                                seq->intra_period);
+                    }
+                } else if (c->hevc_enc && b->size >= sizeof(VAEncSequenceParameterBufferHEVC)) {
+                    memcpy(&c->hevc_state.seq_param, b->data, sizeof(VAEncSequenceParameterBufferHEVC));
+                    c->hevc_state.has_seq = 1;
+                    VAEncSequenceParameterBufferHEVC *seq = &c->hevc_state.seq_param;
+                    if (seq->intra_period > 0) {
+                        hevc_encoder_set_gop_size(c->hevc_enc, seq->intra_period);
+                    }
+                    if (seq->bits_per_second > 0) {
+                        unsigned int pct = c->h264_state.rc_target_percentage;
+                        if (pct == 0 || pct > 100) pct = 100;
+                        uint32_t seq_target = (uint32_t)(((uint64_t)seq->bits_per_second * pct) / 100);
+                        if (seq_target == 0) seq_target = seq->bits_per_second;
+                        if (getenv("BC250_DEBUG_RC")) {
+                            fprintf(stderr, "[bc250-rc] SeqParam HEVC: bits_per_second=%u pct=%u -> target=%u "
+                                            "intra_period=%u\n",
+                                    seq->bits_per_second, pct, seq_target, seq->intra_period);
                         }
+                        hevc_encoder_set_bitrate(c->hevc_enc, seq_target);
+                    } else if (getenv("BC250_DEBUG_RC")) {
+                        fprintf(stderr, "[bc250-rc] SeqParam HEVC: bits_per_second=0 intra_period=%u\n",
+                                seq->intra_period);
                     }
                 }
                 break;
             case VAEncPictureParameterBufferType:
-                if (b->size >= sizeof(VAEncPictureParameterBufferH264)) {
+                if (c->h264_enc && b->size >= sizeof(VAEncPictureParameterBufferH264)) {
                     VAEncPictureParameterBufferH264 *pic = (VAEncPictureParameterBufferH264*)b->data;
                     memcpy(&c->h264_state.pic_param, pic, sizeof(VAEncPictureParameterBufferH264));
                     c->h264_state.has_pic = 1;
                     c->coded_buf_id = pic->coded_buf;
-                    if (c->h264_enc) {
-                        if (pic->pic_fields.bits.idr_pic_flag) {
-                            h264_encoder_force_idr(c->h264_enc);
-                        }
-                        if (pic->pic_init_qp > 0) {
-                            h264_encoder_set_qp(c->h264_enc, pic->pic_init_qp);
-                        }
+                    if (pic->pic_fields.bits.idr_pic_flag) {
+                        h264_encoder_force_idr(c->h264_enc);
+                    }
+                    if (pic->pic_init_qp > 0) {
+                        h264_encoder_set_qp(c->h264_enc, pic->pic_init_qp);
+                    }
+                } else if (c->hevc_enc && b->size >= sizeof(VAEncPictureParameterBufferHEVC)) {
+                    VAEncPictureParameterBufferHEVC *pic = (VAEncPictureParameterBufferHEVC*)b->data;
+                    memcpy(&c->hevc_state.pic_param, pic, sizeof(VAEncPictureParameterBufferHEVC));
+                    c->hevc_state.has_pic = 1;
+                    c->coded_buf_id = pic->coded_buf;
+                    if (pic->pic_fields.bits.idr_pic_flag || pic->nal_unit_type == 19 || pic->nal_unit_type == 20) {
+                        hevc_encoder_set_force_idr(c->hevc_enc);
+                    }
+                    if (pic->pic_init_qp > 0) {
+                        hevc_encoder_set_qp(c->hevc_enc, pic->pic_init_qp);
                     }
                 }
                 break;
@@ -745,7 +820,7 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                     if (getenv("BC250_DEBUG_RC")) {
                         fprintf(stderr, "[bc250-rc] MiscParam: type=%d\n", (int)misc->type);
                     }
-                    if (misc->type == VAEncMiscParameterTypeRateControl && c->h264_enc) {
+                    if (misc->type == VAEncMiscParameterTypeRateControl && (c->h264_enc || c->hevc_enc)) {
                         VAEncMiscParameterRateControl *rc = (VAEncMiscParameterRateControl*)misc->data;
                         if (getenv("BC250_DEBUG_RC")) {
                             fprintf(stderr, "[bc250-rc] RateControl: bits_per_second=%u target_percentage=%u "
@@ -753,80 +828,56 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                                     rc->bits_per_second, rc->target_percentage,
                                     rc->window_size, rc->initial_qp, rc->min_qp);
                         }
-                        if (rc->initial_qp > 0) {
-                            h264_encoder_set_qp(c->h264_enc, rc->initial_qp);
-                        }
-                        if (rc->bits_per_second > 0) {
-                            /* docs/rate_control_audit.md section 2: ffmpeg's actual
-                             * default h264_vaapi invocation (-b:v X, no -rc_mode) is
-                             * VBR with target_percentage=50 and bits_per_second=2X -
-                             * i.e. the real intended target is X, encoded as "50% of
-                             * 2X". Previously this only ever read bits_per_second and
-                             * ignored target_percentage entirely, so the driver was
-                             * handed 2X and treated it as if it were the real target -
-                             * a 2x error before rate_control.c even runs. Apply the
-                             * percentage here, falling back to 100% when it's unset/
-                             * out of range (0 or >100), matching common VA-API driver
-                             * convention for an absent/invalid percentage field. */
-                            unsigned int pct = rc->target_percentage;
-                            if (pct == 0 || pct > 100) pct = 100;
-                            /* Remember it so the sequence-parameter path can
-                             * scale its own raw bits_per_second identically. */
-                            c->h264_state.rc_target_percentage = pct;
-                            uint32_t target_bps = (uint32_t)(((uint64_t)rc->bits_per_second * pct) / 100);
-                            if (target_bps == 0) target_bps = rc->bits_per_second;
-                            h264_encoder_set_bitrate(c->h264_enc, target_bps);
+                        unsigned int pct = rc->target_percentage;
+                        if (pct == 0 || pct > 100) pct = 100;
+                        c->h264_state.rc_target_percentage = pct;
+                        uint32_t target_bps = (uint32_t)(((uint64_t)rc->bits_per_second * pct) / 100);
+                        if (target_bps == 0) target_bps = rc->bits_per_second;
 
-                            /* CBR-intent signal for filler/padding (see
-                             * h264_encoder_set_cbr_intent's doc comment and
-                             * docs/rate_control_audit.md's "no filler data"
-                             * finding). This driver has no code path today
-                             * that reads back the VAConfigAttribRateControl
-                             * value an application chose at vaCreateConfig()
-                             * time (bc250_CreateConfig stores the attrib
-                             * list, but bc250_CreateContext never reads it
-                             * back out - docs/rate_control_audit.md section
-                             * 4 point 5, still open, out of this change's
-                             * scope), so that isn't available here as a
-                             * signal. What *is* already real, already read,
-                             * and already board-confirmed (this buffer's own
-                             * handling above, and the audit's ffmpeg -v
-                             * verbose logs) is target_percentage itself:
-                             * real CBR (`-rc_mode CBR`) sends exactly 100
-                             * ("RC target: 100% of X bps"); ffmpeg's actual
-                             * VBR default sends 50 ("RC target: 50% of
-                             * 2X bps"). The VA-API spec text for this field
-                             * (va.h) even says as much: "In CBR mode this
-                             * value is ignored (treated as 100%)" - a raw,
-                             * unclamped 100 is specifically the CBR
-                             * signature, not just a coincidentally-loose
-                             * VBR ceiling. Require the RAW field (not the
-                             * `pct` fallback above, which also maps 0/
-                             * out-of-range to 100 for the arithmetic above -
-                             * an absent field is not an explicit CBR
-                             * request, so it must not enable padding).
-                             * Also honor rc_flags.bits.disable_bit_stuffing,
-                             * the VA-API's own explicit "don't insert
-                             * filler" signal, when the caller sets it. */
-                            bool cbr_intent = (rc->target_percentage == 100) &&
-                                              !rc->rc_flags.bits.disable_bit_stuffing;
-                            h264_encoder_set_cbr_intent(c->h264_enc, cbr_intent);
+                        if (c->h264_enc) {
+                            if (rc->initial_qp > 0) {
+                                h264_encoder_set_qp(c->h264_enc, rc->initial_qp);
+                            }
+                            if (rc->bits_per_second > 0) {
+                                h264_encoder_set_bitrate(c->h264_enc, target_bps);
+                                bool cbr_intent = (rc->target_percentage == 100) &&
+                                                  !rc->rc_flags.bits.disable_bit_stuffing;
+                                h264_encoder_set_cbr_intent(c->h264_enc, cbr_intent);
+                            }
+                        } else if (c->hevc_enc) {
+                            if (rc->initial_qp > 0) {
+                                hevc_encoder_set_qp(c->hevc_enc, rc->initial_qp);
+                            }
+                            if (rc->bits_per_second > 0) {
+                                hevc_encoder_set_bitrate(c->hevc_enc, target_bps);
+                            }
                         }
-                    } else if (misc->type == VAEncMiscParameterTypeFrameRate && c->h264_enc) {
+                    } else if (misc->type == VAEncMiscParameterTypeFrameRate && (c->h264_enc || c->hevc_enc)) {
                         VAEncMiscParameterFrameRate *fr = (VAEncMiscParameterFrameRate*)misc->data;
                         uint32_t num = fr->framerate & 0xFFFF;
                         uint32_t den = (fr->framerate >> 16) & 0xFFFF;
                         if (den == 0) den = 1;
                         if (num > 0) {
-                            h264_encoder_set_fps(c->h264_enc, num / den);
+                            if (c->h264_enc) {
+                                h264_encoder_set_fps(c->h264_enc, num / den);
+                            } else if (c->hevc_enc) {
+                                hevc_encoder_set_fps(c->hevc_enc, num / den);
+                            }
                         }
                     }
                 }
                 break;
             case VAEncSliceParameterBufferType:
-                if (b->size >= sizeof(VAEncSliceParameterBufferH264)) {
+                if (c->h264_enc && b->size >= sizeof(VAEncSliceParameterBufferH264)) {
                     memcpy(&c->h264_state.slice_param, b->data, sizeof(VAEncSliceParameterBufferH264));
                     c->h264_state.has_slice = 1;
+                } else if (c->hevc_enc && b->size >= sizeof(VAEncSliceParameterBufferHEVC)) {
+                    memcpy(&c->hevc_state.slice_param, b->data, sizeof(VAEncSliceParameterBufferHEVC));
+                    c->hevc_state.has_slice = 1;
+                    VAEncSliceParameterBufferHEVC *slice = &c->hevc_state.slice_param;
+                    if (slice->slice_type == 2) {
+                        hevc_encoder_set_force_idr(c->hevc_enc);
+                    }
                 }
                 break;
             case VAEncPackedHeaderParameterBufferType:

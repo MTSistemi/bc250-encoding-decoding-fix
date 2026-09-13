@@ -303,6 +303,8 @@ struct hevc_encoder {
     bool     force_idr;
     bool     has_ref;
     int qp;
+    int pps_init_qp;
+    rate_control_t rc;
 
     /* Source (post-download, padded/replicated to coded dimensions) and
      * reconstructed planes. Luma at coded_w x coded_h; chroma at
@@ -355,6 +357,10 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
             if (q >= 1 && q <= 51) enc->qp = q;
         }
     }
+    enc->pps_init_qp = enc->qp;
+    rc_init(&enc->rc, RC_CQP, bitrate, (double)enc->fps, width, height);
+    enc->rc.current_qp = enc->qp;
+    enc->rc.base_qp = enc->qp;
 
     enc->gop_size = enc->fps;
     {
@@ -422,6 +428,75 @@ void hevc_encoder_set_force_idr(hevc_encoder_t *encoder)
 void hevc_encoder_set_gop_size(hevc_encoder_t *encoder, uint32_t gop_size)
 {
     if (encoder && gop_size >= 1) encoder->gop_size = gop_size;
+}
+
+uint32_t hevc_encoder_get_gop_size(const hevc_encoder_t *encoder)
+{
+    return encoder ? encoder->gop_size : 30;
+}
+
+void hevc_encoder_set_qp(hevc_encoder_t *encoder, int qp)
+{
+    if (encoder) {
+        if (qp < 0) qp = 0;
+        if (qp > 51) qp = 51;
+        encoder->qp = qp;
+        encoder->rc.base_qp = qp;
+        encoder->rc.current_qp = qp;
+    }
+}
+
+int hevc_encoder_get_qp(const hevc_encoder_t *encoder)
+{
+    return encoder ? encoder->qp : 27;
+}
+
+void hevc_encoder_set_bitrate(hevc_encoder_t *encoder, uint32_t bitrate)
+{
+    if (encoder && bitrate > 0 && bitrate != encoder->rc.target_bitrate) {
+        encoder->bitrate = bitrate;
+        rc_init(&encoder->rc, encoder->rc.mode, bitrate, (double)encoder->fps,
+                encoder->width, encoder->height);
+    }
+}
+
+uint32_t hevc_encoder_get_bitrate(const hevc_encoder_t *encoder)
+{
+    return encoder ? encoder->bitrate : 0;
+}
+
+void hevc_encoder_set_fps(hevc_encoder_t *encoder, uint32_t fps)
+{
+    if (encoder && fps > 0 && fps != encoder->fps) {
+        encoder->fps = fps;
+        rc_init(&encoder->rc, encoder->rc.mode, encoder->rc.target_bitrate,
+                (double)fps, encoder->width, encoder->height);
+    }
+}
+
+uint32_t hevc_encoder_get_fps(const hevc_encoder_t *encoder)
+{
+    return encoder ? encoder->fps : 30;
+}
+
+void hevc_encoder_set_rc_mode(hevc_encoder_t *encoder, rc_mode_t mode)
+{
+    if (encoder) {
+        encoder->rc.mode = mode;
+        if (mode == RC_LOW_LATENCY) {
+            encoder->rc.buffer_size = encoder->rc.target_bits_per_frame * 2;
+        } else if (mode == RC_CBR || mode == RC_VBR) {
+            encoder->rc.buffer_size = encoder->rc.target_bitrate;
+        }
+        if (encoder->rc.buffer_size < 1000) encoder->rc.buffer_size = 1000;
+        encoder->rc.buffer_fullness = encoder->rc.buffer_size / 2;
+        encoder->rc.error_integral = 0;
+    }
+}
+
+rc_mode_t hevc_encoder_get_rc_mode(const hevc_encoder_t *encoder)
+{
+    return encoder ? encoder->rc.mode : RC_CQP;
 }
 
 void hevc_encoder_destroy(hevc_encoder_t *encoder)
@@ -703,6 +778,14 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
         encoder->poc = 0;
     }
 
+    /* In VBR/CBR/LOW_LATENCY mode, update QP via rate control model */
+    if (encoder->rc.mode != RC_CQP) {
+        int target_qp = rc_get_frame_qp(&encoder->rc, 0);
+        if (target_qp >= 1 && target_qp <= 51) {
+            encoder->qp = target_qp;
+        }
+    }
+
     pad_replicate(encoder->src_y, encoder->coded_width, encoder->coded_height,
                   encoder->dl_y, encoder->width, encoder->width, encoder->height);
 
@@ -721,6 +804,15 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     memset(encoder->luma_mode_map, 0, (size_t)encoder->mode_map_stride * (encoder->coded_height / HEVC_PU_SIZE));
     memset(encoder->cu_skip_map, 0, (size_t)(encoder->width_ctu * 2) * (encoder->height_ctu * 2));
 
+    bool write_param_sets = is_idr;
+    if (getenv("BC250_HEVC_REPEAT_HEADERS")) {
+        write_param_sets = true;
+    }
+    if (write_param_sets) {
+        encoder->pps_init_qp = encoder->qp;
+    }
+    int slice_qp_delta = encoder->qp - encoder->pps_init_qp;
+
     bitstream_t slice_bs;
     bs_init(&slice_bs, encoder->slice_rbsp, encoder->slice_rbsp_cap);
 
@@ -738,7 +830,7 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
         bs_write_ue(&slice_bs, 0);                      /* five_minus_max_num_merge_cand = 0 */
     }
 
-    bs_write_se(&slice_bs, 0); /* slice_qp_delta (init_qp already == encoder->qp) */
+    bs_write_se(&slice_bs, slice_qp_delta); /* slice_qp_delta relative to active PPS */
     bs_write1(&slice_bs, 1);   /* slice_loop_filter_across_slices_enabled_flag */
 
     bs_rbsp_trailing_bits(&slice_bs);
@@ -762,10 +854,6 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     bs_rbsp_trailing_bits(&slice_bs);
 
     size_t total = 0;
-    bool write_param_sets = is_idr;
-    if (getenv("BC250_HEVC_REPEAT_HEADERS")) {
-        write_param_sets = true;
-    }
     if (write_param_sets) {
         total += write_vps(encoder->scratch_out + total, encoder->scratch_out_cap - total);
         total += write_sps(encoder->scratch_out + total, encoder->scratch_out_cap - total,
@@ -787,6 +875,10 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
 
     if (total > output_size) return -1;
     memcpy(output_buf, encoder->scratch_out, total);
+
+    if (total > 0 && encoder->rc.mode != RC_CQP) {
+        rc_update_stats(&encoder->rc, (int)(total * 8));
+    }
 
     /* Update reference buffers for subsequent P-frames */
     size_t luma_size = (size_t)encoder->coded_width * encoder->coded_height;

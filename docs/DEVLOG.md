@@ -3871,6 +3871,50 @@ HEVC P-frame inter-prediction was designed and implemented per ITU-T H.265 / ISO
   - Wired full HEVC stream decode and frame count assertions into `.github/workflows/build.yml`.
   - FFmpeg decodes all 30 frames with zero bitstream warnings and zero decode errors.
 
+## 28. VA-API HEVC Configuration, Rate Control & Dynamic Parameter Routing
+
+### 28.1 Problem Statement & Architectural Scope
+While the underlying H.265/HEVC encoder (`encoder_h265.c`) was upgraded with IDR/P-frame GOP control, CABAC context initialization for both I- and P-slices, and zero-motion CU skip in §27, the VA-API backend interface (`va_backend.c`) lacked complete integration for HEVC:
+1. `bc250_QueryConfigProfiles` did not advertise `VAProfileHEVCMain`.
+2. `bc250_QueryConfigEntrypoints` rejected `VAProfileHEVCMain` as an unsupported profile.
+3. `bc250_GetConfigAttributes` did not report slice counts (advertising 16 slices intended for H.264 instead of 1 for HEVC) or HEVC feature and block size attributes (`VAConfigAttribEncHEVCFeatures` / `VAConfigAttribEncHEVCBlockSizes`).
+4. `bc250_CreateContext` instantiated `hevc_enc` but neglected to wire negotiated `VAConfigAttribRateControl` attributes (`VA_RC_CQP`, `VA_RC_VBR`, `VA_RC_CBR`).
+5. `bc250_RenderPicture` only unpacked H.264 parameter structures (`VAEncSequenceParameterBufferH264`, `VAEncPictureParameterBufferH264`, `VAEncSliceParameterBufferH264`), silently ignoring or misinterpreting HEVC parameter buffers. Consequently, `coded_buf_id` was uninitialized for HEVC pictures, and external clients (such as FFmpeg and Sunshine) could not drive GOP size, picture QP, force-IDR, or bitrate dynamically.
+
+### 28.2 Technical Implementation
+1. **Profile & Entrypoint Exposure**:
+   - In `bc250_QueryConfigProfiles`: Advertises `VAProfileHEVCMain` alongside existing H.264 profiles. Count query returns 5 supported profiles.
+   - In `bc250_QueryConfigEntrypoints`: Accepts `VAProfileHEVCMain` and advertises `VAEntrypointEncSlice`.
+2. **HEVC Config Attributes**:
+   - `VAConfigAttribEncMaxSlices`: Evaluates target profile, returning 1 slice for `VAProfileHEVCMain` and 16 for H.264.
+   - `VAConfigAttribEncHEVCFeatures` & `VAConfigAttribEncHEVCBlockSizes`: Under `VA_CHECK_VERSION(1, 13, 0)`, returns valid configuration values detailing the 16x16 CTU (`log2_max_coding_tree_block_size_minus3 = 1`), 8x8 min CB, and 4x4 min/max TB hierarchy.
+3. **Context Rate Control Negotiation**:
+   - In `bc250_CreateContext`: When creating context for `VAProfileHEVCMain`, parses `VAConfigAttribRateControl` from the active config attributes. Routes `VA_RC_CQP` to `RC_CQP`, `VA_RC_VBR` to `RC_VBR`, and `VA_RC_CBR` to `RC_LOW_LATENCY`.
+4. **HEVC Parameter Buffer Demuxing in `bc250_RenderPicture`**:
+   - `VAEncSequenceParameterBufferType`: Unpacks `VAEncSequenceParameterBufferHEVC`. Propagates `intra_period` to `hevc_encoder_set_gop_size()` and `bits_per_second` (scaled by `rc_target_percentage`) to `hevc_encoder_set_bitrate()`.
+   - `VAEncPictureParameterBufferType`: Unpacks `VAEncPictureParameterBufferHEVC`. Correctly sets `c->coded_buf_id = pic->coded_buf`. Routes `pic->pic_fields.bits.idr_pic_flag` and `pic->nal_unit_type == 19/20` to `hevc_encoder_set_force_idr()`. Routes `pic->pic_init_qp` to `hevc_encoder_set_qp()`.
+   - `VAEncSliceParameterBufferType`: Unpacks `VAEncSliceParameterBufferHEVC`. If `slice_type == 2` (I-slice), triggers `hevc_encoder_set_force_idr()`.
+   - `VAEncMiscParameterTypeRateControl` & `VAEncMiscParameterTypeFrameRate`: Dynamically forwards bitrate, target percentage, initial QP, and framerate directly into `hevc_enc`.
+5. **Rate Control Model & Slice QP Delta Adaptation (`encoder_h265.c`)**:
+   - Integrated `rate_control_t rc` into `struct hevc_encoder`, initialized at creation.
+   - Added APIs: `hevc_encoder_set_qp()`, `hevc_encoder_get_qp()`, `hevc_encoder_set_bitrate()`, `hevc_encoder_get_bitrate()`, `hevc_encoder_set_fps()`, `hevc_encoder_get_fps()`, `hevc_encoder_set_rc_mode()`, and `hevc_encoder_get_rc_mode()`.
+   - In `encode_core()`:
+     - Under `RC_VBR` / `RC_CBR` / `RC_LOW_LATENCY`, dynamically derives target frame QP via `rc_get_frame_qp()`.
+     - Maintains `pps_init_qp`. Whenever PPS is emitted (on IDRs or repeated parameter sets), updates `pps_init_qp = encoder->qp`.
+     - In the P-slice header, signals `slice_qp_delta = encoder->qp - encoder->pps_init_qp`. This guarantees compliant dequantization and CABAC initialization across QP changes without resending PPS headers.
+     - Updates leaky bucket statistics post-frame via `rc_update_stats()`.
+
+### 28.3 Verification & Unit Testing
+- **Integration Test (`test_va_api.c`)**:
+  - Validated `VAProfileHEVCMain` query in `vaQueryConfigProfiles`.
+  - Validated entrypoint `VAEntrypointEncSlice` for `VAProfileHEVCMain`.
+  - Added Step 12: Created HEVC configuration (`VA_RC_VBR`), allocated HEVC encode context, verified `hevc_enc` creation, allocated coded buffer, and called `vaBeginPicture` + `vaRenderPicture` with HEVC sequence, picture, slice, and misc rate control buffers.
+  - Asserted exact propagation of GOP size (60), picture QP (22), bitrate (10 Mbps), and coded buffer ID into the driver context and encoder.
+- **Bitstream Dynamic QP & Rate Control Test (`test_hevc_encode.c`)**:
+  - Added `test_dynamic_qp_and_rate_control()`: verified QP 18 vs QP 40 bitstream generation, confirming monotonic bitrate scaling.
+  - Verified rate control mode switching (`RC_CQP` -> `RC_VBR` -> `RC_LOW_LATENCY`) and multi-frame encoding under active feedback.
+
+
 
 
 
