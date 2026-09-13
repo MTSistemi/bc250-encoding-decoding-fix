@@ -108,9 +108,90 @@ static void test_rate_control_cqp_and_vbr(void) {
     printf("[test_encode] Rate Control CQP and VBR tests passed.\n");
 }
 
+static void test_multislice_parallel_encoding(void) {
+    printf("[test_encode] Testing Multi-threaded Multi-slice Parallel Encoding...\n");
+
+    const uint32_t width = 320;
+    const uint32_t height = 240;
+    h264_encoder_t *enc = h264_encoder_create(NULL, width, height, 30, 2000000, PROFILE_BASELINE);
+    assert(enc != NULL);
+
+    /* Test getter and setter */
+    assert(h264_encoder_get_num_slices(enc) == 1);
+    h264_encoder_set_num_slices(enc, 4);
+    assert(h264_encoder_get_num_slices(enc) == 4);
+
+    const size_t y_size = (size_t)width * height;
+    const size_t uv_size = (size_t)width * (height / 2);
+    uint8_t *y_plane = malloc(y_size);
+    uint8_t *uv_plane = malloc(uv_size);
+    assert(y_plane && uv_plane);
+
+    memset(y_plane, 128, y_size);
+    memset(uv_plane, 128, uv_size);
+
+    const size_t out_cap = width * height * 4;
+    uint8_t *out_buf = malloc(out_cap);
+    assert(out_buf != NULL);
+
+    /* Frame 0: IDR with 4 slices */
+    int written = h264_encoder_encode_raw(enc, y_plane, width, uv_plane, width, out_buf, out_cap);
+    assert(written > 0);
+
+    int idr_slice_count = 0;
+    int sps_count = 0;
+    int pps_count = 0;
+    int aud_count = 0;
+
+    for (int p = 0; p < written - 4; p++) {
+        if (out_buf[p] == 0x00 && out_buf[p+1] == 0x00 &&
+            out_buf[p+2] == 0x00 && out_buf[p+3] == 0x01) {
+            uint8_t nal_type = out_buf[p+4] & 0x1F;
+            if (nal_type == 9) aud_count++;
+            if (nal_type == 7) sps_count++;
+            if (nal_type == 8) pps_count++;
+            if (nal_type == 5) idr_slice_count++;
+        }
+    }
+
+    assert(aud_count == 1);
+    assert(sps_count == 1);
+    assert(pps_count == 1);
+    assert(idr_slice_count == 4 && "Expected exactly 4 IDR slice NALUs for 4-slice frame");
+    printf("[test_encode] Frame 0 (IDR): successfully encoded 4 slices in parallel (AUD=%d, SPS=%d, PPS=%d, IDR_slices=%d)\n",
+           aud_count, sps_count, pps_count, idr_slice_count);
+
+    /* Frame 1: P-frame with motion */
+    for (size_t i = 0; i < y_size; i++) y_plane[i] = (uint8_t)((y_plane[i] + 16) & 0xFF);
+
+    written = h264_encoder_encode_raw(enc, y_plane, width, uv_plane, width, out_buf, out_cap);
+    assert(written > 0);
+
+    int p_slice_count = 0;
+    for (int p = 0; p < written - 4; p++) {
+        if (out_buf[p] == 0x00 && out_buf[p+1] == 0x00 &&
+            out_buf[p+2] == 0x00 && out_buf[p+3] == 0x01) {
+            uint8_t nal_type = out_buf[p+4] & 0x1F;
+            if (nal_type == 1) p_slice_count++;
+        }
+    }
+
+    assert(p_slice_count == 4 && "Expected exactly 4 P slice NALUs for 4-slice frame");
+    printf("[test_encode] Frame 1 (P): successfully encoded 4 slices in parallel (P_slices=%d)\n",
+           p_slice_count);
+
+    free(y_plane);
+    free(uv_plane);
+    free(out_buf);
+    h264_encoder_destroy(enc);
+
+    printf("[test_encode] Multi-threaded multi-slice parallel encoding verified.\n");
+}
+
 int main(void) {
     test_intra16_dc_transpose();
     test_rate_control_cqp_and_vbr();
+    test_multislice_parallel_encoding();
 
     printf("[test_encode] Starting H.264 end-to-end bitstream encoding test...\n");
 

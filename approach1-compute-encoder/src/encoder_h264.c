@@ -12,6 +12,9 @@
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "bitstream.h"
 #include "cavlc.h"
@@ -124,6 +127,7 @@ struct h264_encoder {
     rate_control_t rc;
     bool cbr_intent;             /* see h264_encoder_set_cbr_intent's doc comment */
     uint64_t last_frame_sad;     /* Sum of macroblock motion SAD from previous frame */
+    int num_slices;              /* Configured slices per frame (1..16) */
 
     /* DPB */
     dpb_entry_t dpb[16];
@@ -1631,6 +1635,12 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
     encoder->gop_size = encoder->fps; /* 1-second default keyframe interval */
     encoder->dpb_max = 16;
     encoder->force_idr = false;
+    encoder->num_slices = 1;
+    const char *slice_env = getenv("BC250_SLICES_PER_FRAME");
+    if (slice_env) {
+        int s = atoi(slice_env);
+        if (s >= 1 && s <= 16) encoder->num_slices = s;
+    }
 
     /*
      * BUG FIX (found while wiring up CABAC's Main/High-profile auto-select -
@@ -1813,6 +1823,16 @@ void h264_encoder_set_gop_size(h264_encoder_t *encoder, uint32_t gop_size) {
     }
 }
 
+void h264_encoder_set_num_slices(h264_encoder_t *encoder, int num_slices) {
+    if (encoder && num_slices >= 1 && num_slices <= 16) {
+        encoder->num_slices = num_slices;
+    }
+}
+
+int h264_encoder_get_num_slices(const h264_encoder_t *encoder) {
+    return encoder ? encoder->num_slices : 1;
+}
+
 void h264_encoder_set_fps(h264_encoder_t *encoder, uint32_t fps) {
     /* h264_encoder_create() is always called with a hardcoded fps=30
      * (va_backend.c's bc250_CreateContext) regardless of what the real
@@ -1926,7 +1946,7 @@ int h264_encoder_submit_frame(h264_encoder_t *encoder,
 
     /* Kept identical to the synchronous path's own slice-count logic so that
      * submit+finish back to back is byte-for-byte the old behaviour. */
-    int num_slices = 1;
+    int num_slices = encoder->num_slices > 0 ? encoder->num_slices : 1;
     const char *slice_env = getenv("BC250_SLICES_PER_FRAME");
     if (slice_env) {
         int s = atoi(slice_env);
@@ -2469,14 +2489,26 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
     struct timespec cavlc_t0;
     if (perf_stats) clock_gettime(CLOCK_MONOTONIC, &cavlc_t0);
 
-    /* Set if any slice did not fit output_buf - see the else branch on the
-     * NAL-assembly guard below. A frame missing a slice is not a smaller
-     * frame, it is a corrupt one (with the default BC250_SLICES_PER_FRAME=4
-     * a quarter of the picture is absent, and the gap propagates through the
-     * P-frame chain), so the frame is abandoned rather than shipped. */
-    bool slice_overflow = false;
+    /* Per-slice output tracking for OpenMP parallel entropy coding */
+    typedef struct {
+        uint8_t *slice_rbsp;
+        size_t   rbsp_len;
+        bool     overflow;
+        bool     alloc_failed;
+    } slice_output_t;
 
+    slice_output_t slices[16];
+    memset(slices, 0, sizeof(slices));
+
+    int num_threads_used = 1;
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(num_slices > 1)
+#endif
     for (int s = 0; s < num_slices; s++) {
+#ifdef _OPENMP
+        if (s == 0) num_threads_used = omp_get_num_threads();
+#endif
         uint32_t start_mb = (uint32_t)(s * encoder->total_mbs / num_slices);
         uint32_t end_mb = (uint32_t)((s + 1) * encoder->total_mbs / num_slices);
 
@@ -2526,7 +2558,11 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
         size_t bytes_per_mb = encoder->use_cabac ? 768 : 2560;
         size_t rbsp_buf_size = (end_mb - start_mb) * bytes_per_mb + 4096;
         uint8_t *slice_rbsp = malloc(rbsp_buf_size);
-        if (!slice_rbsp) return -1;
+        if (!slice_rbsp) {
+            slices[s].alloc_failed = true;
+            continue;
+        }
+        slices[s].slice_rbsp = slice_rbsp;
 
         bitstream_t bs;
         bs_init(&bs, slice_rbsp, rbsp_buf_size);
@@ -2845,37 +2881,53 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
             if (cabac.overflow) {
                 fprintf(stderr, "[bc250-h264] CABAC slice buffer overflow (frame=%u slice=%d)\n",
                         encoder->frame_count, s);
+                slices[s].overflow = true;
             }
         }
 
-        /* 5. Assemble Slice NAL unit: 4-byte start code + NAL header + EBSP */
-        if (total_written + 5 + rbsp_len * 2 <= encoder->output_buf_size) {
-            uint8_t *nal_dst = encoder->output_buf + total_written;
-            nal_dst[0] = 0x00;
-            nal_dst[1] = 0x00;
-            nal_dst[2] = 0x00;
-            nal_dst[3] = 0x01;
-            nal_dst[4] = is_idr ? ((NAL_REF_IDC_HIGH << 5) | NAL_TYPE_IDR_SLICE)
-                                : ((NAL_REF_IDC_MEDIUM << 5) | NAL_TYPE_SLICE);
+        slices[s].rbsp_len = rbsp_len;
+    }
 
-            size_t ebsp_len = bs_rbsp_to_ebsp(nal_dst + 5,
-                                              encoder->output_buf_size - total_written - 5,
-                                              slice_rbsp,
-                                              rbsp_len);
-            total_written += 5 + ebsp_len;
-        } else {
-            /* Previously this guard had no else: the slice was dropped in
-             * silence, producing a frame with valid SPS/PPS/AUD and no
-             * picture data (observed as a 1,535-byte "successful" encode on
-             * pathological content). Fail the frame loudly instead. */
-            fprintf(stderr, "[bc250-h264] slice %d/%d does not fit output_buf "
-                            "(have %zu, used %zu, need %zu) - abandoning frame %u at qp=%d\n",
-                    s, num_slices, encoder->output_buf_size, total_written,
-                    (size_t)(5 + rbsp_len * 2), encoder->frame_count, qp);
+    /* 5. Assemble Slice NAL units sequentially: 4-byte start code + NAL header + EBSP */
+    bool slice_overflow = false;
+    for (int s = 0; s < num_slices; s++) {
+        if (slices[s].alloc_failed || slices[s].overflow) {
             slice_overflow = true;
         }
-        free(slice_rbsp);
-        if (slice_overflow) break;
+
+        if (!slice_overflow) {
+            size_t rbsp_len = slices[s].rbsp_len;
+            if (total_written + 5 + rbsp_len * 2 <= encoder->output_buf_size) {
+                uint8_t *nal_dst = encoder->output_buf + total_written;
+                nal_dst[0] = 0x00;
+                nal_dst[1] = 0x00;
+                nal_dst[2] = 0x00;
+                nal_dst[3] = 0x01;
+                nal_dst[4] = is_idr ? ((NAL_REF_IDC_HIGH << 5) | NAL_TYPE_IDR_SLICE)
+                                    : ((NAL_REF_IDC_MEDIUM << 5) | NAL_TYPE_SLICE);
+
+                size_t ebsp_len = bs_rbsp_to_ebsp(nal_dst + 5,
+                                                  encoder->output_buf_size - total_written - 5,
+                                                  slices[s].slice_rbsp,
+                                                  rbsp_len);
+                total_written += 5 + ebsp_len;
+            } else {
+                /* Previously this guard had no else: the slice was dropped in
+                 * silence, producing a frame with valid SPS/PPS/AUD and no
+                 * picture data (observed as a 1,535-byte "successful" encode on
+                 * pathological content). Fail the frame loudly instead. */
+                fprintf(stderr, "[bc250-h264] slice %d/%d does not fit output_buf "
+                                "(have %zu, used %zu, need %zu) - abandoning frame %u at qp=%d\n",
+                        s, num_slices, encoder->output_buf_size, total_written,
+                        (size_t)(5 + rbsp_len * 2), encoder->frame_count, qp);
+                slice_overflow = true;
+            }
+        }
+
+        if (slices[s].slice_rbsp) {
+            free(slices[s].slice_rbsp);
+            slices[s].slice_rbsp = NULL;
+        }
     }
 
     if (slice_overflow) {
@@ -2910,8 +2962,9 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
         clock_gettime(CLOCK_MONOTONIC, &cavlc_t1);
         double cavlc_ms = (double)(cavlc_t1.tv_sec - cavlc_t0.tv_sec) * 1000.0 +
                           (double)(cavlc_t1.tv_nsec - cavlc_t0.tv_nsec) / 1e6;
-        fprintf(stderr, "[BC250_PERF_CPU] frame=%u type=%s cavlc_ms=%.3f\n",
-                encoder->frame_count, is_idr ? "I" : "P", cavlc_ms);
+        fprintf(stderr, "[BC250_PERF_CPU] frame=%u type=%s cavlc_ms=%.3f slices=%d threads=%d coder=%s\n",
+                encoder->frame_count, is_idr ? "I" : "P", cavlc_ms,
+                num_slices, num_threads_used, encoder->use_cabac ? "CABAC" : "CAVLC");
     }
 
     if (output_size < total_written) {
@@ -2987,7 +3040,7 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
     }
 
     /* 3. Encode Slices (supporting multi-slice partitioning for network resilience) */
-    int num_slices = 1;
+    int num_slices = encoder->num_slices > 0 ? encoder->num_slices : 1;
     const char *slice_env = getenv("BC250_SLICES_PER_FRAME");
     if (slice_env) {
         int s = atoi(slice_env);
@@ -2999,16 +3052,31 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
     int slice_type = is_idr ? SLICE_TYPE_I : SLICE_TYPE_P;
     int poc_bits = encoder->sps.log2_max_poc_lsb + 4;
     int slice_qp_delta = qp - 26 - encoder->pps.pic_init_qp;
-    /* See h264_encoder_encode_frame()'s slice_overflow. */
-    bool raw_slice_overflow = false;
 
+    typedef struct {
+        uint8_t *slice_rbsp;
+        size_t   rbsp_len;
+        bool     overflow;
+        bool     alloc_failed;
+    } raw_slice_output_t;
+
+    raw_slice_output_t slices[16];
+    memset(slices, 0, sizeof(slices));
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(num_slices > 1)
+#endif
     for (int s = 0; s < num_slices; s++) {
         uint32_t start_mb = (uint32_t)(s * encoder->total_mbs / num_slices);
         uint32_t end_mb = (uint32_t)((s + 1) * encoder->total_mbs / num_slices);
 
         size_t rbsp_buf_size = (end_mb - start_mb) * 64 + 4096;
         uint8_t *slice_rbsp = malloc(rbsp_buf_size);
-        if (!slice_rbsp) return -1;
+        if (!slice_rbsp) {
+            slices[s].alloc_failed = true;
+            continue;
+        }
+        slices[s].slice_rbsp = slice_rbsp;
 
         bitstream_t bs;
         bs_init(&bs, slice_rbsp, rbsp_buf_size);
@@ -3144,32 +3212,46 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
         cavlc_write_slice_trailing_bits(&bs);
         bs_flush(&bs);
 
-        size_t rbsp_len = bs_bytes_written(&bs);
-        if (total_written + 5 + rbsp_len * 2 <= encoder->output_buf_size) {
-            uint8_t *nal_dst = encoder->output_buf + total_written;
-            nal_dst[0] = 0x00;
-            nal_dst[1] = 0x00;
-            nal_dst[2] = 0x00;
-            nal_dst[3] = 0x01;
-            nal_dst[4] = is_idr ? ((NAL_REF_IDC_HIGH << 5) | NAL_TYPE_IDR_SLICE)
-                                : ((NAL_REF_IDC_MEDIUM << 5) | NAL_TYPE_SLICE);
+        slices[s].rbsp_len = bs_bytes_written(&bs);
+    }
 
-            size_t ebsp_len = bs_rbsp_to_ebsp(nal_dst + 5,
-                                              encoder->output_buf_size - total_written - 5,
-                                              slice_rbsp,
-                                              rbsp_len);
-            total_written += 5 + ebsp_len;
-        } else {
-            /* Same silent-drop hazard as h264_encoder_encode_frame() - see
-             * that function's else branch. */
-            fprintf(stderr, "[bc250-h264] slice %d/%d does not fit output_buf "
-                            "(have %zu, used %zu, need %zu) - abandoning frame %u at qp=%d\n",
-                    s, num_slices, encoder->output_buf_size, total_written,
-                    (size_t)(5 + rbsp_len * 2), encoder->frame_count, qp);
+    bool raw_slice_overflow = false;
+    for (int s = 0; s < num_slices; s++) {
+        if (slices[s].alloc_failed || slices[s].overflow) {
             raw_slice_overflow = true;
         }
-        free(slice_rbsp);
-        if (raw_slice_overflow) break;
+
+        if (!raw_slice_overflow) {
+            size_t rbsp_len = slices[s].rbsp_len;
+            if (total_written + 5 + rbsp_len * 2 <= encoder->output_buf_size) {
+                uint8_t *nal_dst = encoder->output_buf + total_written;
+                nal_dst[0] = 0x00;
+                nal_dst[1] = 0x00;
+                nal_dst[2] = 0x00;
+                nal_dst[3] = 0x01;
+                nal_dst[4] = is_idr ? ((NAL_REF_IDC_HIGH << 5) | NAL_TYPE_IDR_SLICE)
+                                    : ((NAL_REF_IDC_MEDIUM << 5) | NAL_TYPE_SLICE);
+
+                size_t ebsp_len = bs_rbsp_to_ebsp(nal_dst + 5,
+                                                  encoder->output_buf_size - total_written - 5,
+                                                  slices[s].slice_rbsp,
+                                                  rbsp_len);
+                total_written += 5 + ebsp_len;
+            } else {
+                /* Same silent-drop hazard as h264_encoder_encode_frame() - see
+                 * that function's else branch. */
+                fprintf(stderr, "[bc250-h264] slice %d/%d does not fit output_buf "
+                                "(have %zu, used %zu, need %zu) - abandoning frame %u at qp=%d\n",
+                        s, num_slices, encoder->output_buf_size, total_written,
+                        (size_t)(5 + rbsp_len * 2), encoder->frame_count, qp);
+                raw_slice_overflow = true;
+            }
+        }
+
+        if (slices[s].slice_rbsp) {
+            free(slices[s].slice_rbsp);
+            slices[s].slice_rbsp = NULL;
+        }
     }
 
     if (raw_slice_overflow) {

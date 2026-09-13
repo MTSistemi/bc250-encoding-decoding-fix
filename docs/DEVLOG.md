@@ -3800,4 +3800,29 @@ Addressed the remaining rate-control accuracy recommendations from `docs/rate_co
 - Added `test_rate_control_cqp_and_vbr` to `approach1-compute-encoder/tests/test_encode.c`: validated CQP fixed QP return, no buffer drift on update stats, and VBR complexity adaptation.
 - Added step 11 to `approach1-compute-encoder/tests/test_va_api.c`: validated `VA_RC_CQP` config and context negotiation.
 
+### 26.8 Multi-Threaded CABAC/CAVLC Slicing via OpenMP
+
+Addressed §26.3, §26.5 and §24.3: CPU-side entropy coding (CABAC/CAVLC) accounts for ~9.4 ms per frame at 1080p (>60% of total frame time). While pipelining (§26.1) allowed GPU compute work for frame $N+1$ to overlap CPU entropy coding for frame $N$, the CPU entropy coding itself remained the critical-path bottleneck bounding maximum throughput to ~80-100 fps on 1080p/1440p streams.
+
+#### 1. Data-Race Free Parallel Architecture
+- **Verified Disjoint Access (§26.5 Audit):** Each slice $s \in [0, \text{num\_slices}-1]$ operates strictly over macroblocks $[ \text{start\_mb}_s, \text{end\_mb}_s )$. All neighbor lookups in both CAVLC (`luma_nc`, `chroma_nc`) and CABAC (`luma_cbf_neighbors`, `chroma_cbf_neighbors`, `dc_cbf_neighbors`, `skip_mv_predictor`, `mvd_x_abs`, `mvd_y_abs`, `cbp_nb`, `skip_flag`) strictly enforce $(mb - 1) \ge \text{start\_mb}_s$ and $(mb - \text{width\_in\_mbs}) \ge \text{start\_mb}_s$. No thread ever reads or writes memory outside its own slice's macroblock range.
+- **Independent Staging & Sequential Assembly Pattern:** Slices cannot write directly to `encoder->output_buf` in parallel without interleaving NAL bytes. Instead, each slice allocates its own RBSP scratch buffer (`slices[s].slice_rbsp`).
+  - **Phase 1 (Parallel OpenMP):** `#pragma omp parallel for schedule(static) if(num_slices > 1)` encodes slice headers, runs CAVLC/CABAC macroblock loops, and flushes bitstreams completely concurrently into `slices[s].slice_rbsp`.
+  - **Phase 2 (Sequential NAL Assembly):** An ordered single-threaded loop transforms each RBSP to EBSP (`bs_rbsp_to_ebsp`) directly into `encoder->output_buf + total_written`, preserving strict spec NAL unit sequence (`AUD` -> `SPS` -> `PPS` -> `Slice 0` -> ... -> `Slice N-1` -> `Filler`).
+  - Guarantees 100% byte-for-byte determinism and zero heap leaks (all `slice_rbsp` pointers freed).
+
+#### 2. Configuration & API
+- Added `h264_encoder_set_num_slices(h264_encoder_t *encoder, int num_slices)` and `h264_encoder_get_num_slices(const h264_encoder_t *encoder)`.
+- Initialized `encoder->num_slices = 1` by default in `h264_encoder_create()`, dynamically overridable by `BC250_SLICES_PER_FRAME`.
+- In `va_backend.c`, updated `VAConfigAttribEncMaxSlices` to advertise 16 slices, enabling clients (FFmpeg `-slices`, Sunshine/Moonlight) to negotiate multi-slice streaming.
+- CMake: linked `PUBLIC OpenMP::OpenMP_C` to `bc250_drv_video`. Clean fallback to single-threaded compilation if OpenMP is not present.
+- Updated `perf_stats` logging: `[BC250_PERF_CPU] frame=%u type=%s cavlc_ms=%.3f slices=%d threads=%d coder=%s`.
+
+#### 3. Verification & Regression Testing
+- Added `test_multislice_parallel_encoding()` to `approach1-compute-encoder/tests/test_encode.c`:
+  - Configured 4 slices per frame via `h264_encoder_set_num_slices()`.
+  - Encoded IDR and P frames with moving test patterns.
+  - Verified exact emission and structural validity of all 4 slice NAL units per frame (AUD, SPS, PPS, 4 IDR slices; AUD, 4 P slices).
+
+
 

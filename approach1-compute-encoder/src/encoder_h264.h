@@ -131,6 +131,19 @@ void h264_encoder_set_rc_mode(h264_encoder_t *encoder, rc_mode_t mode);
 void h264_encoder_set_gop_size(h264_encoder_t *encoder, uint32_t gop_size);
 
 /**
+ * h264_encoder_set_num_slices - Configure number of slices per frame (1..16)
+ *
+ * Slices are partitioned into disjoint macroblock ranges. When num_slices > 1,
+ * CPU entropy coding (CABAC/CAVLC) is parallelized across slices using OpenMP.
+ */
+void h264_encoder_set_num_slices(h264_encoder_t *encoder, int num_slices);
+
+/**
+ * h264_encoder_get_num_slices - Get configured number of slices per frame
+ */
+int h264_encoder_get_num_slices(const h264_encoder_t *encoder);
+
+/**
  * h264_encoder_set_cbr_intent - Tell the encoder whether the caller has
  * requested a genuine constant-bitrate contract (as opposed to VBR, where a
  * requested bitrate is a loose ceiling and using fewer bits than that

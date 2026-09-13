@@ -130,6 +130,7 @@ if(TARGET compile_shaders)
 endif()
 
 find_package(Threads REQUIRED)
+find_package(OpenMP)
 
 target_link_libraries(bc250_drv_video
     ${Vulkan_LIBRARIES}
@@ -138,6 +139,13 @@ target_link_libraries(bc250_drv_video
     ${CMAKE_THREAD_LIBS_INIT}
     m
 )
+
+if(TARGET OpenMP::OpenMP_C)
+    target_link_libraries(bc250_drv_video PUBLIC OpenMP::OpenMP_C)
+    message(STATUS "OpenMP C found: multi-threaded slice entropy coding enabled")
+else()
+    message(STATUS "OpenMP C not found: multi-threaded slice entropy coding disabled")
+endif()
 
 # Installation paths
 if(NOT LIBVA_DRIVERS_PATH)
