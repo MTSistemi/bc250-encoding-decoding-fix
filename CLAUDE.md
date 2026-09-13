@@ -108,6 +108,19 @@ the errors below.
 - **Ship shaders with the `.so`.** New C against old SPIR-V is silent wrong
   output, not a load error. Use `make -j12` (the `all` target);
   `make bc250_drv_video` does **not** rebuild `compile_shaders`.
+  `load_spirv_shader()` now actually implements "beside the `.so`" - it
+  resolves its own install directory with `dladdr()` + `realpath()` and looks
+  there first (after `BC250_SHADER_DIR`). The `realpath()` is required, not
+  cosmetic: libva opens this driver through the
+  `radeonsi_drv_video.so` symlink, and `dladdr()` reports the path it was
+  opened by, so the unresolved value points at the symlink's directory where
+  no shaders live. Before this, a driver installed anywhere outside the fixed
+  search list loaded, advertised H.264 encode, and could not encode - seen on
+  the dev board with all nine `.spv` sitting right next to the `.so`.
+  **Never put a second copy of the shaders in an earlier search path**
+  (`/var/lib/bc250/shaders` et al) - it will outrank the real install and go
+  stale on the next driver update, which is exactly the silent-wrong-output
+  case above. Symlink those paths at the install dir instead.
 - **Memory: ~7.95 GiB of GART/GTT** (Vulkan heaps 2.65 + 5.30 GiB), *not* the
   512 MB `mem_info_vram_total`. Unified-memory APU, no fast-VRAM tier, and the
   carve-out is neither raisable nor worth raising. Read `vulkaninfo` heaps, not

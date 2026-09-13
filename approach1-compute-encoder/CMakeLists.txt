@@ -146,6 +146,9 @@ target_link_libraries(bc250_drv_video
     ${DRM_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     m
+    # dladdr(), used to find the shaders installed beside this .so. No-op on
+    # glibc >= 2.34 where it lives in libc, still needed on older ones.
+    ${CMAKE_DL_LIBS}
     ${BC250_EXTRA_LIBS}
 )
 
