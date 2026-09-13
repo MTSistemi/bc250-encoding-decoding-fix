@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "gpu_compute.h"
+#include "rate_control.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -118,6 +119,11 @@ void h264_encoder_force_idr(h264_encoder_t *encoder);
  * h264_encoder_set_bitrate - Dynamically adjust target bitrate
  */
 void h264_encoder_set_bitrate(h264_encoder_t *encoder, uint32_t bitrate_bps);
+
+/**
+ * h264_encoder_set_rc_mode - Set rate control mode (RC_CBR, RC_VBR, RC_LOW_LATENCY, RC_CQP)
+ */
+void h264_encoder_set_rc_mode(h264_encoder_t *encoder, rc_mode_t mode);
 
 /**
  * h264_encoder_set_gop_size - Configure keyframe (IDR) interval

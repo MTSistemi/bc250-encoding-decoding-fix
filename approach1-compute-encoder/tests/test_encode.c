@@ -75,8 +75,42 @@ static void test_intra16_dc_transpose(void) {
     printf("[test_encode] Intra16x16 luma DC transpose verified (dc_out == transpose(pretranspose)).\n");
 }
 
+static void test_rate_control_cqp_and_vbr(void) {
+    printf("[test_encode] Testing Rate Control CQP and VBR modes...\n");
+
+    rate_control_t rc;
+    rc_init(&rc, RC_CQP, 5000000, 60.0, 1920, 1080);
+    rc.current_qp = 23;
+    assert(rc_get_frame_qp(&rc, 0) == 23);
+    assert(rc_get_frame_qp(&rc, 100000) == 23);
+
+    /* In CQP mode, update stats must not change buffer fullness */
+    int64_t buf = rc.buffer_fullness;
+    rc_update_stats(&rc, 50000);
+    assert(rc.buffer_fullness == buf);
+
+    /* Test VBR mode complexity adjustment */
+    rc_init(&rc, RC_VBR, 5000000, 60.0, 1920, 1080);
+    int qp1 = rc_get_frame_qp(&rc, 1000);
+    /* High motion frame (SAD ratio > 1.3): QP should increase */
+    int qp2 = rc_get_frame_qp(&rc, 5000);
+    assert(qp2 >= qp1);
+
+    /* Test h264_encoder_set_rc_mode and h264_encoder_set_qp */
+    h264_encoder_t *enc = h264_encoder_create(NULL, 1920, 1080, 60, 5000000, PROFILE_BASELINE);
+    assert(enc != NULL);
+    h264_encoder_set_rc_mode(enc, RC_CQP);
+    h264_encoder_set_qp(enc, 28);
+    h264_encoder_set_rc_mode(enc, RC_VBR);
+    h264_encoder_set_rc_mode(enc, RC_LOW_LATENCY);
+    h264_encoder_destroy(enc);
+
+    printf("[test_encode] Rate Control CQP and VBR tests passed.\n");
+}
+
 int main(void) {
     test_intra16_dc_transpose();
+    test_rate_control_cqp_and_vbr();
 
     printf("[test_encode] Starting H.264 end-to-end bitstream encoding test...\n");
 

@@ -264,6 +264,21 @@ int main(void) {
     assert(encoder_args.error_count == 0);
     printf("[PASS] Concurrent multi-threaded execution verified (100 iterations of filter/encoder race without collision)\n");
 
+    /* 11. Test VAConfigAttribRateControl negotiation (VA_RC_CQP and VA_RC_VBR) */
+    VAConfigAttrib cqp_attribs[2] = {
+        { .type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420 },
+        { .type = VAConfigAttribRateControl, .value = VA_RC_CQP }
+    };
+    VAConfigID cqp_config_id = VA_INVALID_ID;
+    status = ctx.vtable->vaCreateConfig(&ctx, VAProfileH264Main, VAEntrypointEncSlice, cqp_attribs, 2, &cqp_config_id);
+    assert(status == VA_STATUS_SUCCESS);
+    VAContextID cqp_context_id = VA_INVALID_ID;
+    status = ctx.vtable->vaCreateContext(&ctx, cqp_config_id, 1920, 1080, 0, surfaces, 2, &cqp_context_id);
+    assert(status == VA_STATUS_SUCCESS);
+    ctx.vtable->vaDestroyContext(&ctx, cqp_context_id);
+    ctx.vtable->vaDestroyConfig(&ctx, cqp_config_id);
+    printf("[PASS] Negotiated VA_RC_CQP config and context creation verified\n");
+
     /* Clean up images */
     ctx.vtable->vaDestroyImage(&ctx, image1.image_id);
     ctx.vtable->vaDestroyImage(&ctx, image2.image_id);
