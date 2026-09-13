@@ -15,6 +15,7 @@
 #include <va/va_vpp.h>
 #include <va/va_drmcommon.h>
 #include <drm_fourcc.h>
+#include <pthread.h>
 #include "gpu_compute.h"
 #include "encoder_h264.h"
 #include "encoder_h265.h"
@@ -157,6 +158,7 @@ struct bc250_image {
 };
 
 typedef struct {
+    pthread_mutex_t lock;
     gpu_context_t gpu;
 
     bc250_surface surfaces[MAX_SURFACES];
@@ -168,6 +170,9 @@ typedef struct {
     int max_width;
     int max_height;
 } bc250_driver_data;
+
+#define DRIVER_LOCK(data)   pthread_mutex_lock(&(data)->lock)
+#define DRIVER_UNLOCK(data) pthread_mutex_unlock(&(data)->lock)
 
 /* Core VA-API Driver Functions */
 VAStatus __vaDriverInit_1_0(VADriverContextP ctx);

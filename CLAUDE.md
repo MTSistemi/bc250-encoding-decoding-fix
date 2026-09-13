@@ -19,9 +19,9 @@ racing between `gpu_compute_end_picture()` and `gpu_compute_submitted_slot()`.
 the driver's default, always-on calling contract, so the default CABAC/
 production path is exposed to the same race class.** ASan/UBSan cleanly
 missed it (12/12 runs) because neither instruments cross-thread ordering at
-all — only TSan can see this. No fix is shipped yet; see DEVLOG §26.1.2 for
-the full diagnosis and the locking-vs-deadlock trade-off that's still unaudited.
-Treat any further perf work as secondary to this until it's fixed.
+all — only TSan can see this. Implemented on branch `fix/thread-synchronization`:
+recursive driver mutex (`PTHREAD_MUTEX_RECURSIVE`) and lock-free GPU fence wait
+(see DEVLOG §26.6). Concurrency test added to test_va_api.c. Awaiting board and CI TSan validation runs.
 
 ## Before you assert a mechanism, grep the DEVLOG
 

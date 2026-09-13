@@ -22,12 +22,24 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNIT_SRC="$SCRIPT_DIR/bc250-vaapi-boot-redirect.service"
 UNIT_DST=/etc/systemd/system/bc250-vaapi-boot-redirect.service
+APPLY_SRC="$SCRIPT_DIR/bc250-vaapi-redirect-apply.sh"
+APPLY_DST=/etc/bc250-vaapi-redirect-apply.sh
 
 if [ ! -f "$UNIT_SRC" ]; then
     echo "Can't find $UNIT_SRC" >&2
     exit 1
 fi
+if [ ! -f "$APPLY_SRC" ]; then
+    echo "Can't find $APPLY_SRC" >&2
+    exit 1
+fi
 
+# APPLY_DST goes in /etc, not /usr: on this ostree system /usr is reset to a
+# fresh read-only overlay every boot (the unit's own usroverlay/ln dance is
+# how it deals with that for the symlink itself) but /etc is real, persistent
+# state, so the redirect script needs to live there to survive a reboot.
+cp "$APPLY_SRC" "$APPLY_DST"
+chmod 755 "$APPLY_DST"
 cp "$UNIT_SRC" "$UNIT_DST"
 systemctl daemon-reload
 systemctl enable bc250-vaapi-boot-redirect.service

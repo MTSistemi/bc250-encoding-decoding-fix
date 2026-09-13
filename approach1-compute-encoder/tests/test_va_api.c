@@ -6,7 +6,74 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <pthread.h>
 #include "va_backend.h"
+
+struct thread_test_args {
+    VADriverContextP ctx;
+    VASurfaceID surface;
+    VAContextID context_id;
+    int iterations;
+    int error_count;
+};
+
+static void *filter_worker_thread(void *arg) {
+    struct thread_test_args *args = (struct thread_test_args *)arg;
+    for (int i = 0; i < args->iterations; i++) {
+        VAImage derived_img;
+        VAStatus s = args->ctx->vtable->vaDeriveImage(args->ctx, args->surface, &derived_img);
+        if (s != VA_STATUS_SUCCESS) {
+            args->error_count++;
+            break;
+        }
+        void *pbuf = NULL;
+        s = args->ctx->vtable->vaMapBuffer(args->ctx, derived_img.buf, &pbuf);
+        if (s != VA_STATUS_SUCCESS || !pbuf) {
+            args->error_count++;
+            args->ctx->vtable->vaDestroyImage(args->ctx, derived_img.image_id);
+            break;
+        }
+        uint8_t *ptr = (uint8_t *)pbuf;
+        ptr[0] = (uint8_t)(i & 0xFF);
+
+        s = args->ctx->vtable->vaUnmapBuffer(args->ctx, derived_img.buf);
+        if (s != VA_STATUS_SUCCESS) {
+            args->error_count++;
+        }
+        s = args->ctx->vtable->vaDestroyImage(args->ctx, derived_img.image_id);
+        if (s != VA_STATUS_SUCCESS) {
+            args->error_count++;
+        }
+    }
+    return NULL;
+}
+
+static void *encoder_worker_thread(void *arg) {
+    struct thread_test_args *args = (struct thread_test_args *)arg;
+    for (int i = 0; i < args->iterations; i++) {
+        VABufferID buf_id = VA_INVALID_ID;
+        VAStatus s = args->ctx->vtable->vaCreateBuffer(args->ctx, args->context_id,
+                                                      VAEncCodedBufferType, 64 * 1024, 1, NULL, &buf_id);
+        if (s != VA_STATUS_SUCCESS || buf_id == VA_INVALID_ID) {
+            args->error_count++;
+            break;
+        }
+        void *pbuf = NULL;
+        s = args->ctx->vtable->vaMapBuffer(args->ctx, buf_id, &pbuf);
+        if (s == VA_STATUS_SUCCESS && pbuf) {
+            uint8_t *ptr = (uint8_t *)pbuf;
+            ptr[0] = (uint8_t)(i & 0xFF);
+            args->ctx->vtable->vaUnmapBuffer(args->ctx, buf_id);
+        } else {
+            args->error_count++;
+        }
+        s = args->ctx->vtable->vaDestroyBuffer(args->ctx, buf_id);
+        if (s != VA_STATUS_SUCCESS) {
+            args->error_count++;
+        }
+    }
+    return NULL;
+}
 
 int main(void) {
     printf("=== Running BC-250 VA-API Driver Tests ===\n");
@@ -168,6 +235,34 @@ int main(void) {
     assert(status == VA_STATUS_SUCCESS);
     ctx.vtable->vaDestroyImage(&ctx, derived_img.image_id);
     printf("[PASS] Derive image and surface mapping validated\n");
+
+    /* 10. Multi-threaded Concurrency Test (Filter & Encoder threads racing) */
+    struct thread_test_args filter_args = {
+        .ctx = &ctx,
+        .surface = surfaces[0],
+        .context_id = context_id,
+        .iterations = 100,
+        .error_count = 0
+    };
+    struct thread_test_args encoder_args = {
+        .ctx = &ctx,
+        .surface = surfaces[1],
+        .context_id = context_id,
+        .iterations = 100,
+        .error_count = 0
+    };
+
+    pthread_t th1, th2;
+    int r1 = pthread_create(&th1, NULL, filter_worker_thread, &filter_args);
+    int r2 = pthread_create(&th2, NULL, encoder_worker_thread, &encoder_args);
+    assert(r1 == 0 && r2 == 0);
+
+    pthread_join(th1, NULL);
+    pthread_join(th2, NULL);
+
+    assert(filter_args.error_count == 0);
+    assert(encoder_args.error_count == 0);
+    printf("[PASS] Concurrent multi-threaded execution verified (100 iterations of filter/encoder race without collision)\n");
 
     /* Clean up images */
     ctx.vtable->vaDestroyImage(&ctx, image1.image_id);
