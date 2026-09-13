@@ -23,12 +23,12 @@ This PR introduces critical fixes, rate control enhancements, performance optimi
    - Independent slice RBSP staging with ordered sequential NAL assembly preserves exact bitstream compliance.
    - Added `h264_encoder_set_num_slices()` API, advertised 16 slices in `VAConfigAttribEncMaxSlices`, and added 4-slice parallel validation in `test_encode.c`.
 
-3. **Thread Synchronization & Deadlock-Free Fence Wait (DEVLOG §26.6)**:
+4. **Thread Synchronization & Deadlock-Free Fence Wait (DEVLOG §26.6)**:
    - Implements a recursive driver mutex (`PTHREAD_MUTEX_RECURSIVE`) across all VA-API backend entry points in `va_backend.c`, eliminating TSan data races between FFmpeg's `encoder_thread` and `filter_thread`.
    - Decouples GPU fence waits in `bc250_SyncSurface()` by querying the submitted slot under lock and executing `gpu_compute_sync_slot()` unlocked to prevent cross-thread deadlocks.
    - Added Step 10 concurrent multi-threaded stress test in `test_va_api.c`.
 
-4. **Rate Control Improvements & CQP Mode (DEVLOG §26.7, audit §4.4, §4.5)**:
+5. **Rate Control Improvements & CQP Mode (DEVLOG §26.7, audit §4.4, §4.5)**:
    - Adds `RC_CQP` (Constant QP) mode so constant QP requests are honored without buffer fullness deviation or drift.
    - Wires negotiated `VAConfigAttribRateControl` from `bc250_CreateConfig` into `bc250_CreateContext` (`VA_RC_CQP`, `VA_RC_VBR`, and `VA_RC_CBR`).
    - Honors `initial_qp` from `VAEncMiscParameterRateControl`.
