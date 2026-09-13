@@ -83,7 +83,11 @@ extern "C" {
 #define HEVC_CTX_LAST_Y      74   /* 18 contexts */
 #define HEVC_CTX_ONE_FLAG    92   /* 24 contexts: 0-15 luma, 16-23 chroma */
 #define HEVC_CTX_ABS_FLAG   116   /* 6 contexts: 0-3 luma, 4-5 chroma */
-#define HEVC_NUM_CTX        122
+#define HEVC_CTX_SKIP_FLAG  122   /* 3 contexts: cond_l + cond_a (0..2) */
+#define HEVC_CTX_PRED_MODE  125   /* 1 context: inter (0) vs intra (1) */
+#define HEVC_CTX_MERGE_FLAG 126   /* 1 context: merge_flag */
+#define HEVC_CTX_MERGE_IDX  127   /* 1 context: merge_idx bin 0 */
+#define HEVC_NUM_CTX        128
 
 typedef struct {
     /* Output sink: a plain bit-level bitstream_t (bitstream.h/.c, the same
@@ -112,9 +116,9 @@ typedef struct {
 void hevc_cabac_init(hevc_cabac_t *cb, bitstream_t *bs);
 
 /* (Re)initialize every context model this encoder uses from the real HEVC
- * I-slice init-value tables, per Rec. ITU-T H.265 9.3.2.2, for the given
- * slice QP (0-51, 8-bit, no QP offset). */
-void hevc_cabac_reset_contexts(hevc_cabac_t *cb, int slice_qp);
+ * init-value tables, per Rec. ITU-T H.265 9.3.2.2, for the given
+ * slice QP (0-51, 8-bit, no QP offset) and slice type (1 = P-slice, 2 = I-slice). */
+void hevc_cabac_reset_contexts(hevc_cabac_t *cb, int slice_qp, int slice_type);
 
 /* Reset the arithmetic coder's low/range/carry state for a new slice
  * (does NOT touch context models - call reset_contexts() separately, once,
@@ -133,6 +137,18 @@ void hevc_cabac_encode_terminate(hevc_cabac_t *cb, uint32_t bin);
  * "1" bit is emitted by hevc_cabac_encode_terminate(cb, 1) before calling
  * this - see encoder_h265.c). */
 void hevc_cabac_finish(hevc_cabac_t *cb);
+
+/* cu_skip_flag: ctx_inc = condL + condA (0, 1, or 2), per ITU-T H.265 9.3.4.2.2.
+ * In a P-slice, 1 indicates the entire 8x8 CU is skipped (reproduced from
+ * reference frame with zero motion). */
+void hevc_cabac_code_cu_skip_flag(hevc_cabac_t *cb, int skip, int ctx_inc);
+
+/* pred_mode_flag for non-skip CU in P-slice (ITU-T H.265 7.3.8.5):
+ * 1 = MODE_INTRA, 0 = MODE_INTER. */
+void hevc_cabac_code_pred_mode_flag(hevc_cabac_t *cb, int pred_mode);
+
+/* merge_idx for skip CU (ITU-T H.265 7.3.8.6): bin 0 coded with context 0. */
+void hevc_cabac_code_merge_idx(hevc_cabac_t *cb, int merge_idx);
 
 /* split_cu_flag: ctx_inc = (left neighbor CU coded at a depth greater than
  * `depth`) + (above neighbor CU coded at a depth greater than `depth`),

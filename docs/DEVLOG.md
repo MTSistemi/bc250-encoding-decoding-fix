@@ -3824,5 +3824,53 @@ Addressed §26.3, §26.5 and §24.3: CPU-side entropy coding (CABAC/CAVLC) accou
   - Encoded IDR and P frames with moving test patterns.
   - Verified exact emission and structural validity of all 4 slice NAL units per frame (AUD, SPS, PPS, 4 IDR slices; AUD, 4 P slices).
 
+## 27. H.265/HEVC Inter-Frame (P-Frame) Prediction & CU Skip Mode
+
+### 27.1 Architecture & Design Rationale
+Previously, the HEVC encoder (`encoder_h265.c`) operated strictly intra-only (all frames were IDR `NAL_UNIT_CODED_SLICE_IDR_W_RADL = 19`). While spec-compliant, transmitting full intra coding and DST/DCT transforms on every frame imposed high bitrate requirements and computational overhead on static or streaming video.
+
+HEVC P-frame inter-prediction was designed and implemented per ITU-T H.265 / ISO/IEC 23008-2:
+1. **GOP Management & Slice Structure**:
+   - `hevc_encoder_t` tracks `gop_size` (default `fps`, configurable via `hevc_encoder_set_gop_size()` and `BC250_HEVC_GOP`), `poc`, `has_ref`, and `force_idr` (via `hevc_encoder_set_force_idr()`).
+   - Frame 0 (and periodic/forced keyframes) emit parameter sets (`VPS`, `SPS`, `PPS`) followed by an IDR slice (`IDR_W_RADL`).
+   - Inter-frames emit trailing picture P-slices (`NAL_UNIT_CODED_SLICE_TRAIL_R = 1`).
+2. **SPS Reference Picture Set (RPS) & DPB Buffering**:
+   - In `write_vps()` and `write_sps()`: set `max_dec_pic_buffering_minus1 = 1` to accommodate the reference picture and current picture simultaneously.
+   - In `write_sps()`: configured `num_short_term_ref_pic_sets = 1` containing `num_negative_pics = 1`, `num_positive_pics = 0`, `delta_poc_s0_minus1[0] = 0` ($\Delta\text{POC} = -1$), and `used_by_curr_pic_s0_flag[0] = 1`.
+   - Because `num_short_term_ref_pic_sets == 1`, the P-slice header infers RPS index 0 without transmitting an explicit index syntax element.
+3. **P-Slice Header Syntax**:
+   - Emits `first_slice_segment_in_pic_flag = 1`.
+   - Omits `no_output_of_prior_pics_flag` (normative for non-IRAP NAL unit types).
+   - Signals `slice_type = 1` (`P_SLICE`).
+   - Codes `slice_pic_order_cnt_lsb` (`u(4)` with `poc & 0xF`).
+   - Sets `short_term_ref_pic_set_sps_flag = 1`, `num_ref_idx_active_override_flag = 0` (defaulting to 1 active L0 reference from PPS), and `five_minus_max_num_merge_cand = 0` (specifying 5 merge candidates).
+4. **CABAC Context Initialization for P-Slices (`initType = 1`)**:
+   - Extended `hevc_cabac.h` and `hevc_cabac.c` to support both `initType = 1` (P-slices) and `initType = 2` (I-slices).
+   - Integrated normative probability init tables from ITU-T H.265 Tables 9-5 through 9-30:
+     - `INIT_SPLIT_FLAG[2][3]`, `INIT_PART_SIZE[2]`, `INIT_INTRA_PRED_MODE[2]`, `INIT_CHROMA_PRED_MODE[2][2]`, `INIT_QT_CBF[2][7]`, `INIT_SIG_FLAG[2][42]`, `INIT_LAST[2][18]`, `INIT_ONE_FLAG[2][24]`, `INIT_ABS_FLAG[2][6]`.
+     - Added Inter/Skip contexts: `HEVC_CTX_SKIP_FLAG` (3 contexts, Table 9-7), `HEVC_CTX_PRED_MODE` (1 context, Table 9-8), `HEVC_CTX_MERGE_FLAG` (1 context, Table 9-9), and `HEVC_CTX_MERGE_IDX` (1 context, Table 9-10). Total context models: 128.
+5. **Per-CU Skip Decision & Zero-Motion Reconstruction**:
+   - For each 8x8 CU in a P-slice, evaluates temporal distortion ($SAD_{luma} + SAD_{chroma}$) against the reference frame (`prev_recon_y`, `prev_recon_cb`, `prev_recon_cr`).
+   - **Skip CU (`is_skip == true`)**:
+     - Codes `cu_skip_flag = 1` with spatial context increment `cond_l + cond_a` (ITU-T 9.3.4.2.2).
+     - Codes `merge_idx = 0` (bin 0 with context 0).
+     - Bypasses transform tree, residual coding, and intra PU modes entirely (~2 bits spent per CU).
+     - Reconstructs pixels by direct block copy from reference plane buffers and sets PU modes to `HEVC_MODE_DC` for neighboring MPM derivation.
+   - **Non-Skip CU (`is_skip == false`)**:
+     - Codes `cu_skip_flag = 0`, followed by `pred_mode_flag = 1` (`MODE_INTRA`).
+     - Codes `part_mode = PART_NxN`, intra PU modes, chroma mode, and 4x4 DST/DCT transform trees.
+6. **Reference Buffer Maintenance**:
+   - Post-frame, reconstructed planes (`recon_y`, `recon_cb`, `recon_cr`) are preserved into `prev_recon_*` buffers as the DPB reference for subsequent P-frames.
+
+### 27.2 Verification & External Oracle Testing
+- **Multi-Frame GOP Test (`test_hevc_encode.c`)**:
+  - Implemented 30-frame sequence test: Frame 0 (IDR), Frames 1..14 (Static P-frames with 100% CU skip), Frames 15..28 (Dynamic P-frames with moving pattern), Frame 29 (Explicit `force_idr` keyframe).
+  - Verified exact NAL sequences (`VPS,SPS,PPS,IDR` on keyframes; `TRAIL_R` on P-frames).
+  - Verified static P-frame bitrate reduction: static P-frame size drops from thousands of bytes to ~100-200 bytes.
+- **FFmpeg Reference Decoder Oracle**:
+  - Wired full HEVC stream decode and frame count assertions into `.github/workflows/build.yml`.
+  - FFmpeg decodes all 30 frames with zero bitstream warnings and zero decode errors.
+
+
 
 

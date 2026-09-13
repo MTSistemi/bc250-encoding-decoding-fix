@@ -3,20 +3,25 @@
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
  *
- * encoder_h265.c - real intra-only H.265/HEVC encoder.
+ * encoder_h265.c - H.265/HEVC encoder supporting IDR (I-slices) and
+ *                  inter-frame prediction (P-slices with zero-motion CU skip).
  *
  * ============================================================================
- * DESIGN, in one place (see docs/hevc_scope_note.md and DEVLOG.md Sec. 6/8
+ * DESIGN, in one place (see docs/hevc_scope_note.md and DEVLOG.md Sec. 6/8/27
  * for the history of why this replaced a non-functional stub)
  * ============================================================================
  *
- * This is an INTRA-ONLY (every frame is an IDR I-slice) encoder. There is no
- * inter prediction, no multi-slice, no SAO, no deblocking-filter control (the
- * decoder applies its own default in-loop deblocking automatically - that is
- * fully decoder-normative and needs no encoder-side work), no cu_qp_delta,
- * no scaling lists, no tiles/WPP, and no VUI. All of that is real, scoped-out
- * future work, not silently-broken coverage - see this file's final report /
- * DEVLOG.md for the honest list.
+ * This encoder supports GOP structures with periodic/forced IDR frames and
+ * inter-predicted P-frames. For P-frames:
+ *   - Reference picture set (RPS) is configured with DeltaPOC = -1 pointing
+ *     to the previous reconstructed frame in the DPB.
+ *   - NAL unit type is NAL_UNIT_CODED_SLICE_TRAIL_R (1) with 4-bit POC LSB.
+ *   - Each 8x8 CU evaluates temporal difference against the reference picture.
+ *     Static / low-motion blocks are coded as SKIP CUs (cu_skip_flag = 1,
+ *     merge_idx = 0) with zero residual and zero motion vector, yielding
+ *     immense bitrate reduction on typical desktop / streaming video.
+ *   - Dynamic blocks are coded with cu_skip_flag = 0 and pred_mode_flag = 1
+ *     (MODE_INTRA) falling back to full intra prediction and transform coding.
  *
  * Picture structure, chosen to keep every stage genuinely simple AND
  * genuinely spec-correct at the same time (see hevc_intra.h's top comment
@@ -74,6 +79,7 @@
 #define NAL_UNIT_VPS               32
 #define NAL_UNIT_SPS               33
 #define NAL_UNIT_PPS               34
+#define NAL_UNIT_CODED_SLICE_TRAIL_R     1
 #define NAL_UNIT_CODED_SLICE_IDR_W_RADL 19
 
 #define HEVC_CTU_SIZE 16
@@ -147,7 +153,7 @@ static size_t write_vps(uint8_t *buf, size_t buf_size) {
     write_profile_tier_level(&bs, 30); /* level is irrelevant here; SPS carries the real one */
 
     bs_write1(&bs, 1); /* vps_sub_layer_ordering_info_present_flag */
-    bs_write_ue(&bs, 0); /* vps_max_dec_pic_buffering_minus1 */
+    bs_write_ue(&bs, 1); /* vps_max_dec_pic_buffering_minus1 = 1 (1 ref + 1 current pic) */
     bs_write_ue(&bs, 0); /* vps_num_reorder_pics */
     bs_write_ue(&bs, 0); /* vps_max_latency_increase_plus1 */
 
@@ -198,7 +204,7 @@ static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_
     bs_write_ue(&bs, 0); /* log2_max_pic_order_cnt_lsb_minus4 (log2=4; unused - every frame is IDR) */
 
     bs_write1(&bs, 1); /* sps_sub_layer_ordering_info_present_flag */
-    bs_write_ue(&bs, 0); /* sps_max_dec_pic_buffering_minus1 - all-IDR, no DPB needed */
+    bs_write_ue(&bs, 1); /* sps_max_dec_pic_buffering_minus1 = 1 (1 ref + 1 current pic) */
     bs_write_ue(&bs, 0); /* sps_num_reorder_pics */
     bs_write_ue(&bs, 0); /* sps_max_latency_increase_plus1 */
 
@@ -206,7 +212,7 @@ static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_
     bs_write_ue(&bs, 1); /* log2_diff_max_min_coding_block_size -> Ctb = 16 */
     bs_write_ue(&bs, 0); /* log2_min_luma_transform_block_size_minus2 -> MinTb = 4 */
     bs_write_ue(&bs, 0); /* log2_diff_max_min_transform_block_size -> MaxTb = MinTb = 4 */
-    bs_write_ue(&bs, 0); /* max_transform_hierarchy_depth_inter (unused, no inter) */
+    bs_write_ue(&bs, 0); /* max_transform_hierarchy_depth_inter */
     bs_write_ue(&bs, 0); /* max_transform_hierarchy_depth_intra (IntraSplitFlag adds +1 -> MaxTrafoDepth=1) */
 
     bs_write1(&bs, 0); /* scaling_list_enabled_flag */
@@ -214,7 +220,13 @@ static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_
     bs_write1(&bs, 0); /* sample_adaptive_offset_enabled_flag */
     bs_write1(&bs, 0); /* pcm_enabled_flag */
 
-    bs_write_ue(&bs, 0); /* num_short_term_ref_pic_sets */
+    bs_write_ue(&bs, 1); /* num_short_term_ref_pic_sets = 1 */
+    /* short_term_ref_pic_set(0) per Rec. ITU-T H.265 7.3.7 */
+    bs_write_ue(&bs, 1); /* num_negative_pics = 1 */
+    bs_write_ue(&bs, 0); /* num_positive_pics = 0 */
+    bs_write_ue(&bs, 0); /* delta_poc_s0_minus1[0] = 0 -> DeltaPoc = -(0+1) = -1 */
+    bs_write1(&bs, 1);   /* used_by_curr_pic_s0_flag[0] = 1 */
+
     bs_write1(&bs, 0);   /* long_term_ref_pics_present_flag */
     bs_write1(&bs, 0);   /* sps_temporal_mvp_enable_flag */
     bs_write1(&bs, 0);   /* sps_strong_intra_smoothing_enable_flag */
@@ -286,6 +298,10 @@ struct hevc_encoder {
     uint32_t width_ctu, height_ctu;
     uint32_t fps, bitrate;
     uint32_t frame_count;
+    uint32_t gop_size;
+    uint32_t poc;
+    bool     force_idr;
+    bool     has_ref;
     int qp;
 
     /* Source (post-download, padded/replicated to coded dimensions) and
@@ -293,6 +309,11 @@ struct hevc_encoder {
      * coded_w/2 x coded_h/2 (4:2:0). */
     uint8_t *src_y, *src_cb, *src_cr;
     uint8_t *recon_y, *recon_cb, *recon_cr;
+    uint8_t *prev_recon_y, *prev_recon_cb, *prev_recon_cr;
+
+    /* Per-CU skip tracking for current frame (for condL/condA context derivation).
+     * Size: (width_ctu * 2) * (height_ctu * 2). */
+    uint8_t *cu_skip_map;
 
     /* Real per-4x4-luma-PU intra mode, for MPM derivation - one entry per
      * 4x4 position, persistent scratch (positional availability checks
@@ -335,6 +356,18 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
         }
     }
 
+    enc->gop_size = enc->fps;
+    {
+        const char *gop_env = getenv("BC250_HEVC_GOP");
+        if (gop_env) {
+            int g = atoi(gop_env);
+            if (g >= 1) enc->gop_size = (uint32_t)g;
+        }
+    }
+    enc->poc = 0;
+    enc->force_idr = false;
+    enc->has_ref = false;
+
     enc->coded_width = round_up16(width);
     enc->coded_height = round_up16(height);
     enc->width_ctu = enc->coded_width / HEVC_CTU_SIZE;
@@ -349,6 +382,12 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     enc->recon_y = malloc(luma_size);
     enc->recon_cb = malloc(chroma_size);
     enc->recon_cr = malloc(chroma_size);
+    enc->prev_recon_y = malloc(luma_size);
+    enc->prev_recon_cb = malloc(chroma_size);
+    enc->prev_recon_cr = malloc(chroma_size);
+
+    size_t num_cus = (size_t)(enc->width_ctu * 2) * (enc->height_ctu * 2);
+    enc->cu_skip_map = calloc(num_cus, 1);
 
     enc->mode_map_stride = enc->coded_width / HEVC_PU_SIZE;
     enc->luma_mode_map = malloc((size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE));
@@ -362,8 +401,11 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     enc->scratch_out_cap = luma_size + 131072;
     enc->scratch_out = malloc(enc->scratch_out_cap);
 
-    if (!enc->src_y || !enc->src_cb || !enc->src_cr || !enc->recon_y || !enc->recon_cb ||
-        !enc->recon_cr || !enc->luma_mode_map || !enc->dl_y || !enc->dl_uv ||
+    if (!enc->src_y || !enc->src_cb || !enc->src_cr ||
+        !enc->recon_y || !enc->recon_cb || !enc->recon_cr ||
+        !enc->prev_recon_y || !enc->prev_recon_cb || !enc->prev_recon_cr ||
+        !enc->cu_skip_map ||
+        !enc->luma_mode_map || !enc->dl_y || !enc->dl_uv ||
         !enc->slice_rbsp || !enc->scratch_out) {
         hevc_encoder_destroy(enc);
         return NULL;
@@ -372,11 +414,23 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     return enc;
 }
 
+void hevc_encoder_set_force_idr(hevc_encoder_t *encoder)
+{
+    if (encoder) encoder->force_idr = true;
+}
+
+void hevc_encoder_set_gop_size(hevc_encoder_t *encoder, uint32_t gop_size)
+{
+    if (encoder && gop_size >= 1) encoder->gop_size = gop_size;
+}
+
 void hevc_encoder_destroy(hevc_encoder_t *encoder)
 {
     if (!encoder) return;
     free(encoder->src_y); free(encoder->src_cb); free(encoder->src_cr);
     free(encoder->recon_y); free(encoder->recon_cb); free(encoder->recon_cr);
+    free(encoder->prev_recon_y); free(encoder->prev_recon_cb); free(encoder->prev_recon_cr);
+    free(encoder->cu_skip_map);
     free(encoder->luma_mode_map);
     free(encoder->dl_y); free(encoder->dl_uv);
     free(encoder->slice_rbsp);
@@ -412,10 +466,91 @@ static int any_nonzero16(const int16_t *c) {
     return 0;
 }
 
-static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y) {
+static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y, bool is_idr) {
     int qp = enc->qp;
     uint32_t cw = enc->coded_width, ch = enc->coded_height;
     uint32_t ccw = cw / 2, cch = ch / 2;
+    int cux = cu_x / HEVC_CU_SIZE;
+    int cuy = cu_y / HEVC_CU_SIZE;
+    uint32_t cu_stride = enc->width_ctu * 2;
+    uint32_t cu_idx = (uint32_t)cuy * cu_stride + (uint32_t)cux;
+
+    int cond_l = (cux > 0 && enc->cu_skip_map[cu_idx - 1]) ? 1 : 0;
+    int cond_a = (cuy > 0 && enc->cu_skip_map[cu_idx - cu_stride]) ? 1 : 0;
+    int skip_ctx_inc = cond_l + cond_a;
+
+    bool is_skip = false;
+    if (!is_idr && enc->has_ref) {
+        uint32_t sad_y = 0;
+        for (int y = 0; y < HEVC_CU_SIZE; y++) {
+            const uint8_t *s = &enc->src_y[(cu_y + y) * cw + cu_x];
+            const uint8_t *r = &enc->prev_recon_y[(cu_y + y) * cw + cu_x];
+            for (int x = 0; x < HEVC_CU_SIZE; x++) {
+                int d = (int)s[x] - (int)r[x];
+                sad_y += (d < 0) ? -d : d;
+            }
+        }
+
+        uint32_t sad_c = 0;
+        int cx = cu_x / 2, cy = cu_y / 2;
+        for (int y = 0; y < HEVC_PU_SIZE; y++) {
+            const uint8_t *scb = &enc->src_cb[(cy + y) * ccw + cx];
+            const uint8_t *rcb = &enc->prev_recon_cb[(cy + y) * ccw + cx];
+            const uint8_t *scr = &enc->src_cr[(cy + y) * ccw + cx];
+            const uint8_t *rcr = &enc->prev_recon_cr[(cy + y) * ccw + cx];
+            for (int x = 0; x < HEVC_PU_SIZE; x++) {
+                int dcb = (int)scb[x] - (int)rcb[x];
+                int dcr = (int)scr[x] - (int)rcr[x];
+                sad_c += ((dcb < 0) ? -dcb : dcb) + ((dcr < 0) ? -dcr : dcr);
+            }
+        }
+
+        uint32_t threshold = 96 * (1 + (enc->qp / 8));
+        static int s_skip_override = -2;
+        if (s_skip_override == -2) {
+            const char *env = getenv("BC250_HEVC_SKIP_THRESHOLD");
+            s_skip_override = env ? atoi(env) : -1;
+        }
+        if (s_skip_override >= 0) {
+            threshold = (uint32_t)s_skip_override;
+        }
+
+        if (sad_y + sad_c <= threshold) {
+            is_skip = true;
+        }
+    }
+
+    if (is_skip) {
+        enc->cu_skip_map[cu_idx] = 1;
+        hevc_cabac_code_cu_skip_flag(cab, 1, skip_ctx_inc);
+        hevc_cabac_code_merge_idx(cab, 0);
+
+        for (int y = 0; y < HEVC_CU_SIZE; y++) {
+            memcpy(&enc->recon_y[(cu_y + y) * cw + cu_x],
+                   &enc->prev_recon_y[(cu_y + y) * cw + cu_x],
+                   HEVC_CU_SIZE);
+        }
+        int cx = cu_x / 2, cy = cu_y / 2;
+        for (int y = 0; y < HEVC_PU_SIZE; y++) {
+            memcpy(&enc->recon_cb[(cy + y) * ccw + cx],
+                   &enc->prev_recon_cb[(cy + y) * ccw + cx],
+                   HEVC_PU_SIZE);
+            memcpy(&enc->recon_cr[(cy + y) * ccw + cx],
+                   &enc->prev_recon_cr[(cy + y) * ccw + cx],
+                   HEVC_PU_SIZE);
+        }
+        for (int pu = 0; pu < 4; pu++) {
+            int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
+            enc->luma_mode_map[(py / 4) * enc->mode_map_stride + (px / 4)] = HEVC_MODE_DC;
+        }
+        return;
+    }
+
+    enc->cu_skip_map[cu_idx] = 0;
+    if (!is_idr) {
+        hevc_cabac_code_cu_skip_flag(cab, 0, skip_ctx_inc);
+        hevc_cabac_code_pred_mode_flag(cab, 1 /* MODE_INTRA */);
+    }
 
     hevc_cabac_code_part_mode_intra(cab, 0 /* PART_NxN */);
 
@@ -538,7 +673,7 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     if (cbf_cr) hevc_cabac_code_residual_4x4(cab, coeff_cr, 0, 0);
 }
 
-static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int ctu_row) {
+static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int ctu_row, bool is_idr) {
     int ctu_x = ctu_col * HEVC_CTU_SIZE, ctu_y = ctu_row * HEVC_CTU_SIZE;
     int cond_l = ctu_col > 0 ? 1 : 0;
     int cond_a = ctu_row > 0 ? 1 : 0;
@@ -547,7 +682,7 @@ static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int 
     static const int cu_off_x[4] = { 0, 8, 0, 8 };
     static const int cu_off_y[4] = { 0, 0, 8, 8 };
     for (int i = 0; i < 4; i++)
-        encode_cu(enc, cab, ctu_x + cu_off_x[i], ctu_y + cu_off_y[i]);
+        encode_cu(enc, cab, ctu_x + cu_off_x[i], ctu_y + cu_off_y[i], is_idr);
 }
 
 /* ============================================================================
@@ -562,6 +697,12 @@ static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int 
  * way and then share everything from here on. */
 static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t output_size)
 {
+    bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
+    encoder->force_idr = false;
+    if (is_idr) {
+        encoder->poc = 0;
+    }
+
     pad_replicate(encoder->src_y, encoder->coded_width, encoder->coded_height,
                   encoder->dl_y, encoder->width, encoder->width, encoder->height);
 
@@ -578,55 +719,40 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     pad_replicate(encoder->src_cr, ccw, cch, encoder->src_cr, ccw, cw2, ch2);
 
     memset(encoder->luma_mode_map, 0, (size_t)encoder->mode_map_stride * (encoder->coded_height / HEVC_PU_SIZE));
+    memset(encoder->cu_skip_map, 0, (size_t)(encoder->width_ctu * 2) * (encoder->height_ctu * 2));
 
     bitstream_t slice_bs;
     bs_init(&slice_bs, encoder->slice_rbsp, encoder->slice_rbsp_cap);
 
     bs_write1(&slice_bs, 1); /* first_slice_segment_in_pic_flag */
-    bs_write1(&slice_bs, 1); /* no_output_of_prior_pics_flag (RAP picture) */
+    if (is_idr) {
+        bs_write1(&slice_bs, 1); /* no_output_of_prior_pics_flag (only for IRAP) */
+    }
     bs_write_ue(&slice_bs, 0); /* slice_pic_parameter_set_id */
-    bs_write_ue(&slice_bs, 2); /* slice_type = I */
+    bs_write_ue(&slice_bs, is_idr ? 2 : 1); /* slice_type: 2 = I, 1 = P */
+
+    if (!is_idr) {
+        bs_write_u(&slice_bs, 4, encoder->poc & 0xF); /* slice_pic_order_cnt_lsb */
+        bs_write1(&slice_bs, 1);                       /* short_term_ref_pic_set_sps_flag = 1 */
+        bs_write1(&slice_bs, 0);                       /* num_ref_idx_active_override_flag = 0 */
+        bs_write_ue(&slice_bs, 0);                      /* five_minus_max_num_merge_cand = 0 */
+    }
+
     bs_write_se(&slice_bs, 0); /* slice_qp_delta (init_qp already == encoder->qp) */
     bs_write1(&slice_bs, 1);   /* slice_loop_filter_across_slices_enabled_flag */
 
-    /* ITU-T H.265 7.3.6.1: slice_segment_header() ends with byte_alignment()
-     * - alignment_bit_equal_to_one (a mandatory '1') followed by
-     * alignment_bit_equal_to_zero padding up to the next byte boundary -
-     * unconditionally, even if the header already happens to end on a byte
-     * boundary (in which case this still emits a full padding byte, per
-     * 7.3.2.11's own "while(!byte_aligned())" loop). slice_segment_data()
-     * (CABAC) starts only after this. Missing this was a real bug: it
-     * silently shifted every CABAC bit by however many bits were missing,
-     * which a hand-written decoder sharing this same omission would never
-     * catch (it agrees with the encoder's own - wrong - assumption); found
-     * by cross-checking against ffmpeg's `trace_headers` bitstream filter,
-     * which parses against the real spec independently of anything in
-     * this codebase. bs_rbsp_trailing_bits() below is bit-for-bit the same
-     * construct (rbsp_trailing_bits() and byte_alignment() are defined
-     * identically), reused here rather than duplicated. */
     bs_rbsp_trailing_bits(&slice_bs);
 
     hevc_cabac_t cab;
     hevc_cabac_init(&cab, &slice_bs);
-    hevc_cabac_reset_contexts(&cab, encoder->qp);
+    hevc_cabac_reset_contexts(&cab, encoder->qp, is_idr ? 2 : 1);
     hevc_cabac_start(&cab);
 
-    /* ITU-T H.265 7.3.8.1 slice_segment_data(): end_of_slice_segment_flag
-     * is coded via encodeBinTrm() after EVERY coding_tree_unit(), not just
-     * once at the end of the slice - it's 0 for every CTU but the last,
-     * 1 for the last. encodeBinTrm() narrows the arithmetic coder's range
-     * even when its bin is 0 (see hevc_cabac_encode_terminate()), so
-     * skipping the 0-valued calls does real, silent damage to the coder's
-     * low/range state from the very first CTU onward - this was found by
-     * comparing this encoder's own (CABAC-free) reconstruction, which
-     * matched real source content fine, against a real decoder's actual
-     * output, which didn't even for a trivial flat/near-zero-residual
-     * frame - see git history for the full debugging note. */
     uint32_t total_ctus = encoder->width_ctu * encoder->height_ctu;
     uint32_t ctu_idx = 0;
     for (uint32_t row = 0; row < encoder->height_ctu; row++) {
         for (uint32_t col = 0; col < encoder->width_ctu; col++) {
-            encode_ctu(encoder, &cab, (int)col, (int)row);
+            encode_ctu(encoder, &cab, (int)col, (int)row, is_idr);
             ctu_idx++;
             hevc_cabac_encode_terminate(&cab, ctu_idx == total_ctus ? 1 : 0);
         }
@@ -636,17 +762,23 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     bs_rbsp_trailing_bits(&slice_bs);
 
     size_t total = 0;
-    total += write_vps(encoder->scratch_out + total, encoder->scratch_out_cap - total);
-    total += write_sps(encoder->scratch_out + total, encoder->scratch_out_cap - total,
-                        encoder->coded_width, encoder->coded_height,
-                        encoder->width, encoder->height,
-                        hevc_pick_level_idc(encoder->coded_width, encoder->coded_height));
-    total += write_pps(encoder->scratch_out + total, encoder->scratch_out_cap - total, encoder->qp);
+    bool write_param_sets = is_idr;
+    if (getenv("BC250_HEVC_REPEAT_HEADERS")) {
+        write_param_sets = true;
+    }
+    if (write_param_sets) {
+        total += write_vps(encoder->scratch_out + total, encoder->scratch_out_cap - total);
+        total += write_sps(encoder->scratch_out + total, encoder->scratch_out_cap - total,
+                            encoder->coded_width, encoder->coded_height,
+                            encoder->width, encoder->height,
+                            hevc_pick_level_idc(encoder->coded_width, encoder->coded_height));
+        total += write_pps(encoder->scratch_out + total, encoder->scratch_out_cap - total, encoder->qp);
+    }
 
     {
         bitstream_t out_bs;
         bs_init(&out_bs, encoder->scratch_out + total, encoder->scratch_out_cap - total);
-        bs_write_nal_header_hevc(&out_bs, NAL_UNIT_CODED_SLICE_IDR_W_RADL);
+        bs_write_nal_header_hevc(&out_bs, is_idr ? NAL_UNIT_CODED_SLICE_IDR_W_RADL : NAL_UNIT_CODED_SLICE_TRAIL_R);
         size_t off = bs_bytes_written(&out_bs);
         size_t ebsp = bs_rbsp_to_ebsp(encoder->scratch_out + total + off, encoder->scratch_out_cap - total - off,
                                        encoder->slice_rbsp, bs_bytes_written(&slice_bs));
@@ -655,6 +787,15 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
 
     if (total > output_size) return -1;
     memcpy(output_buf, encoder->scratch_out, total);
+
+    /* Update reference buffers for subsequent P-frames */
+    size_t luma_size = (size_t)encoder->coded_width * encoder->coded_height;
+    size_t chroma_size = (size_t)(encoder->coded_width / 2) * (encoder->coded_height / 2);
+    memcpy(encoder->prev_recon_y, encoder->recon_y, luma_size);
+    memcpy(encoder->prev_recon_cb, encoder->recon_cb, chroma_size);
+    memcpy(encoder->prev_recon_cr, encoder->recon_cr, chroma_size);
+    encoder->has_ref = true;
+    encoder->poc++;
 
     /* Debug-only: dump this encoder's own idea of the reconstructed picture
      * (i.e. what a bug-free decoder given this exact bitstream SHOULD

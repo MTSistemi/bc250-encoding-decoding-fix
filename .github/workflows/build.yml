@@ -103,6 +103,39 @@ jobs:
         rm -f decoded.yuv
         echo "✓ CONTENT ASSERTION PASSED: All $FRAME_COUNT frames decoded and verified with zero errors!"
 
+        # Validate generated H.265/HEVC stream with FFmpeg reference decoder
+        echo "Validating generated H.265/HEVC stream with FFmpeg reference decoder..."
+        HEVC_STREAM_PATH=$(find "$BUILD_DIR" -name "bc250_test_stream.hevc" 2>/dev/null | head -n 1)
+        if [ -z "$HEVC_STREAM_PATH" ]; then
+          echo "HEVC stream not found from ctest run — executing test_hevc_encode directly..."
+          HEVC_TEST_BIN=$(find "$BUILD_DIR" -name "test_hevc_encode" -type f -executable 2>/dev/null | head -n 1)
+          if [ -n "$HEVC_TEST_BIN" ]; then
+            (cd "$BUILD_DIR" && "$GITHUB_WORKSPACE/$HEVC_TEST_BIN")
+            HEVC_STREAM_PATH="$BUILD_DIR/bc250_test_stream.hevc"
+          fi
+        fi
+
+        if [ -f "$HEVC_STREAM_PATH" ]; then
+          echo "Found HEVC test stream at $HEVC_STREAM_PATH ($(wc -c < "$HEVC_STREAM_PATH") bytes)"
+          ffmpeg -v error -i "$HEVC_STREAM_PATH" -f null -
+          echo "✓ SUCCESS: FFmpeg verified and decoded all H.265/HEVC frames with ZERO errors!"
+
+          echo "Running HEVC Content Assertion: decoding stream to raw YUV420p..."
+          ffmpeg -v error -y -vsync 0 -i "$HEVC_STREAM_PATH" -f rawvideo -pix_fmt yuv420p decoded_hevc.yuv
+          HEVC_DECODED_SIZE=$(wc -c < decoded_hevc.yuv)
+          HEVC_FRAME_SIZE=$((128 * 96 * 3 / 2))
+          HEVC_FRAME_COUNT=$((HEVC_DECODED_SIZE / HEVC_FRAME_SIZE))
+          echo "Decoded raw YUV size: $HEVC_DECODED_SIZE bytes ($HEVC_FRAME_COUNT frames decoded, expected 30 frames)"
+          if [ "$HEVC_FRAME_COUNT" -lt 30 ]; then
+            echo "ERROR: HEVC decoded frames too few! Expected at least 30 frames, got $HEVC_FRAME_COUNT"
+            exit 1
+          fi
+          rm -f decoded_hevc.yuv
+          echo "✓ HEVC CONTENT ASSERTION PASSED: All $HEVC_FRAME_COUNT frames decoded and verified with zero errors!"
+        else
+          echo "WARNING: bc250_test_stream.hevc was not produced."
+        fi
+
     - name: Package Release Bundle
       run: |
         mkdir -p dist/bc250-driver/shaders

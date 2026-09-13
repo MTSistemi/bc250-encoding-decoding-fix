@@ -24,6 +24,9 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
                                     uint32_t width, uint32_t height,
                                     uint32_t fps, uint32_t bitrate);
 
+void hevc_encoder_set_force_idr(hevc_encoder_t *encoder);
+void hevc_encoder_set_gop_size(hevc_encoder_t *encoder, uint32_t gop_size);
+
 /*
  * @input_memory: backing device memory of `input_surface`, needed for the
  * real gpu_compute_download_nv12() readback this encoder does (see

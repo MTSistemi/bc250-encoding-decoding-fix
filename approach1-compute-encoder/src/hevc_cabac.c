@@ -84,29 +84,52 @@ static const uint8_t g_hevc_sig_ctx4[16] = {
 #define COEF_REMAIN_BIN_REDUCTION 3
 #define C1FLAG_NUMBER             8
 
-/* ===================== I-slice context init values ===================== */
-/* These are row index 2 ("I_SLICE") of x265's INIT_* tables in entropy.cpp -
- * this encoder only ever codes I-slices, so the other two rows (B/P) are
- * never needed and are not reproduced here. */
+/* ===================== Context init values (Rec. ITU-T H.265 9.3.2.2) ==== */
+/* Row index 0 = P-slice (initType 1), Row index 1 = I-slice (initType 2).
+ * Values match ITU-T H.265 Tables 9-5 through 9-30 and x265 entropy.cpp. */
 
-static const uint8_t INIT_SPLIT_FLAG[3]      = { 139, 141, 157 };
-static const uint8_t INIT_PART_SIZE          = 184; /* only ctx index 0 used */
-static const uint8_t INIT_INTRA_PRED_MODE    = 184;
-static const uint8_t INIT_CHROMA_PRED_MODE[2] = { 63, 139 };
-static const uint8_t INIT_QT_CBF[7]          = { 111, 141, 94, 138, 182, 154, 154 };
-static const uint8_t INIT_SIG_FLAG[42] = {
-    111, 111, 125, 110, 110,  94, 124, 108, 124, 107, 125, 141, 179, 153, 125,
-    107, 125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 140, 139, 182,
-    182, 152, 136, 152, 136, 153, 136, 139, 111, 136, 139, 111
+static const uint8_t INIT_SPLIT_FLAG[2][3] = {
+    { 107, 139, 126 }, /* P-slice */
+    { 139, 141, 157 }, /* I-slice */
 };
-static const uint8_t INIT_LAST[18] = {
-    110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108, 123, 63
+static const uint8_t INIT_PART_SIZE[2]           = { 154, 184 }; /* ctx index 0 */
+static const uint8_t INIT_INTRA_PRED_MODE[2]     = { 154, 184 };
+static const uint8_t INIT_CHROMA_PRED_MODE[2][2] = {
+    { 152, 139 }, /* P-slice */
+    {  63, 139 }, /* I-slice */
 };
-static const uint8_t INIT_ONE_FLAG[24] = {
-    140,  92, 137, 138, 140, 152, 138, 139, 153,  74, 149,  92,
-    139, 107, 122, 152, 140, 179, 166, 182, 140, 227, 122, 197
+static const uint8_t INIT_QT_CBF[2][7] = {
+    { 153, 111, 149, 107, 167, 154, 154 }, /* P-slice */
+    { 111, 141,  94, 138, 182, 154, 154 }, /* I-slice */
 };
-static const uint8_t INIT_ABS_FLAG[6] = { 138, 153, 136, 167, 152, 152 };
+static const uint8_t INIT_SIG_FLAG[2][42] = {
+    { 155, 154, 139, 153, 139, 123, 123,  63, 153, 166, 183, 140, 136, 153, 154,
+      166, 183, 140, 136, 153, 154, 166, 183, 140, 136, 153, 154, 170, 153, 123,
+      123, 107, 121, 107, 121, 167, 151, 183, 140, 151, 183, 140 }, /* P-slice */
+    { 111, 111, 125, 110, 110,  94, 124, 108, 124, 107, 125, 141, 179, 153, 125,
+      107, 125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 140, 139, 182,
+      182, 152, 136, 152, 136, 153, 136, 139, 111, 136, 139, 111 }, /* I-slice */
+};
+static const uint8_t INIT_LAST[2][18] = {
+    { 125, 110,  94, 110,  95,  79, 125, 111, 110,  78, 110, 111, 111,  95,  94, 108, 123, 108 }, /* P-slice */
+    { 110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111,  79, 108, 123,  63 }, /* I-slice */
+};
+static const uint8_t INIT_ONE_FLAG[2][24] = {
+    { 154, 196, 196, 167, 154, 152, 167, 182, 182, 134, 149, 136,
+      153, 121, 136, 137, 169, 194, 166, 167, 154, 167, 137, 182 }, /* P-slice */
+    { 140,  92, 137, 138, 140, 152, 138, 139, 153,  74, 149,  92,
+      139, 107, 122, 152, 140, 179, 166, 182, 140, 227, 122, 197 }, /* I-slice */
+};
+static const uint8_t INIT_ABS_FLAG[2][6] = {
+    { 107, 167,  91, 122, 107, 167 }, /* P-slice */
+    { 138, 153, 136, 167, 152, 152 }, /* I-slice */
+};
+
+/* Inter/Skip syntax elements (used only in P-slices, initType 1) */
+static const uint8_t INIT_SKIP_FLAG[3] = { 197, 185, 201 };
+static const uint8_t INIT_PRED_MODE    = 149;
+static const uint8_t INIT_MERGE_FLAG   = 110;
+static const uint8_t INIT_MERGE_IDX    = 122;
 
 /* ===================== context init formula (Rec. ITU-T H.265 9.3.2.2) === */
 
@@ -127,17 +150,26 @@ static void init_bank(uint8_t *ctx, const uint8_t *init_values, int count, int q
     for (int i = 0; i < count; i++) ctx[i] = hevc_sbac_init_state(qp, init_values[i]);
 }
 
-void hevc_cabac_reset_contexts(hevc_cabac_t *cb, int slice_qp) {
-    init_bank(&cb->ctx[HEVC_CTX_SPLIT_FLAG], INIT_SPLIT_FLAG, 3, slice_qp);
-    cb->ctx[HEVC_CTX_PART_SIZE] = hevc_sbac_init_state(slice_qp, INIT_PART_SIZE);
-    cb->ctx[HEVC_CTX_INTRA_PRED] = hevc_sbac_init_state(slice_qp, INIT_INTRA_PRED_MODE);
-    init_bank(&cb->ctx[HEVC_CTX_CHROMA_PRED], INIT_CHROMA_PRED_MODE, 2, slice_qp);
-    init_bank(&cb->ctx[HEVC_CTX_QT_CBF], INIT_QT_CBF, 7, slice_qp);
-    init_bank(&cb->ctx[HEVC_CTX_SIG_FLAG], INIT_SIG_FLAG, 42, slice_qp);
-    init_bank(&cb->ctx[HEVC_CTX_LAST_X], INIT_LAST, 18, slice_qp);
-    init_bank(&cb->ctx[HEVC_CTX_LAST_Y], INIT_LAST, 18, slice_qp);
-    init_bank(&cb->ctx[HEVC_CTX_ONE_FLAG], INIT_ONE_FLAG, 24, slice_qp);
-    init_bank(&cb->ctx[HEVC_CTX_ABS_FLAG], INIT_ABS_FLAG, 6, slice_qp);
+void hevc_cabac_reset_contexts(hevc_cabac_t *cb, int slice_qp, int slice_type) {
+    int type_idx = (slice_type == 1) ? 0 : 1;
+
+    init_bank(&cb->ctx[HEVC_CTX_SPLIT_FLAG], INIT_SPLIT_FLAG[type_idx], 3, slice_qp);
+    cb->ctx[HEVC_CTX_PART_SIZE] = hevc_sbac_init_state(slice_qp, INIT_PART_SIZE[type_idx]);
+    cb->ctx[HEVC_CTX_INTRA_PRED] = hevc_sbac_init_state(slice_qp, INIT_INTRA_PRED_MODE[type_idx]);
+    init_bank(&cb->ctx[HEVC_CTX_CHROMA_PRED], INIT_CHROMA_PRED_MODE[type_idx], 2, slice_qp);
+    init_bank(&cb->ctx[HEVC_CTX_QT_CBF], INIT_QT_CBF[type_idx], 7, slice_qp);
+    init_bank(&cb->ctx[HEVC_CTX_SIG_FLAG], INIT_SIG_FLAG[type_idx], 42, slice_qp);
+    init_bank(&cb->ctx[HEVC_CTX_LAST_X], INIT_LAST[type_idx], 18, slice_qp);
+    init_bank(&cb->ctx[HEVC_CTX_LAST_Y], INIT_LAST[type_idx], 18, slice_qp);
+    init_bank(&cb->ctx[HEVC_CTX_ONE_FLAG], INIT_ONE_FLAG[type_idx], 24, slice_qp);
+    init_bank(&cb->ctx[HEVC_CTX_ABS_FLAG], INIT_ABS_FLAG[type_idx], 6, slice_qp);
+
+    if (slice_type == 1) {
+        init_bank(&cb->ctx[HEVC_CTX_SKIP_FLAG], INIT_SKIP_FLAG, 3, slice_qp);
+        cb->ctx[HEVC_CTX_PRED_MODE] = hevc_sbac_init_state(slice_qp, INIT_PRED_MODE);
+        cb->ctx[HEVC_CTX_MERGE_FLAG] = hevc_sbac_init_state(slice_qp, INIT_MERGE_FLAG);
+        cb->ctx[HEVC_CTX_MERGE_IDX] = hevc_sbac_init_state(slice_qp, INIT_MERGE_IDX);
+    }
 }
 
 /* ===================== arithmetic coder core ===================== */
@@ -278,6 +310,19 @@ void hevc_cabac_finish(hevc_cabac_t *cb) {
 }
 
 /* ===================== syntax element wrappers ===================== */
+
+void hevc_cabac_code_cu_skip_flag(hevc_cabac_t *cb, int skip, int ctx_inc) {
+    hevc_cabac_encode_bin(cb, HEVC_CTX_SKIP_FLAG + ctx_inc, (uint32_t)(skip ? 1 : 0));
+}
+
+void hevc_cabac_code_pred_mode_flag(hevc_cabac_t *cb, int pred_mode) {
+    hevc_cabac_encode_bin(cb, HEVC_CTX_PRED_MODE, (uint32_t)(pred_mode ? 1 : 0));
+}
+
+void hevc_cabac_code_merge_idx(hevc_cabac_t *cb, int merge_idx) {
+    /* Truncated Unary bin string for merge_idx == 0 is bin 0 with context 0 */
+    hevc_cabac_encode_bin(cb, HEVC_CTX_MERGE_IDX, (uint32_t)(merge_idx ? 1 : 0));
+}
 
 void hevc_cabac_code_split_cu_flag(hevc_cabac_t *cb, int bin, int ctx_inc) {
     hevc_cabac_encode_bin(cb, HEVC_CTX_SPLIT_FLAG + ctx_inc, (uint32_t)(bin ? 1 : 0));

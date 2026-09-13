@@ -95,19 +95,19 @@ static int check_nal_sequence(const uint8_t *buf, size_t len, const int *expecte
     return 1;
 }
 
-int main(void) {
-    test_transform_round_trip();
-    test_mpm_derivation();
-
-    printf("[test_hevc_encode] Starting H.265 end-to-end bitstream encoding test (GPU-free)...\n");
+static void test_multi_frame_gop(void) {
+    printf("[test_hevc_encode] Testing multi-frame GOP (IDR + P-frames)...\n");
 
     const uint32_t width = 128, height = 96, fps = 30, bitrate = 2000000;
     hevc_encoder_t *enc = hevc_encoder_create(NULL, width, height, fps, bitrate);
     assert(enc != NULL);
+    hevc_encoder_set_gop_size(enc, 30);
 
     uint8_t *y_plane = malloc((size_t)width * height);
     uint8_t *uv_plane = malloc((size_t)(width / 2) * (height / 2) * 2);
     assert(y_plane && uv_plane);
+
+    /* Frame 0 pattern */
     for (uint32_t r = 0; r < height; r++)
         for (uint32_t c = 0; c < width; c++)
             y_plane[r * width + c] = (uint8_t)(((c * 255) / width) ^ ((r * 128) / height));
@@ -121,23 +121,57 @@ int main(void) {
     uint8_t *out_buf = malloc(out_cap);
     assert(out_buf != NULL);
 
-    int written = hevc_encoder_encode_raw(enc, y_plane, (int)width, uv_plane, (int)width, out_buf, out_cap);
-    printf("[test_hevc_encode] Encoded frame: %d bytes\n", written);
-    assert(written > 0);
-
-    int expected_types[] = { 32 /* VPS */, 33 /* SPS */, 34 /* PPS */, 19 /* IDR_W_RADL */ };
-    int ok = check_nal_sequence(out_buf, (size_t)written, expected_types, 4);
-    assert(ok && "expected VPS,SPS,PPS,IDR NAL sequence not found");
-    printf("[test_hevc_encode] NAL sequence (VPS,SPS,PPS,IDR slice) verified.\n");
-
     FILE *f = fopen("bc250_test_stream.hevc", "wb");
     assert(f != NULL);
-    fwrite(out_buf, 1, (size_t)written, f);
+
+    int idr_bytes = 0;
+    int static_p_bytes = 0;
+
+    for (int frame = 0; frame < 30; frame++) {
+        if (frame >= 15 && frame < 29) {
+            /* Introduce moving box pattern */
+            for (uint32_t r = 32; r < 64; r++) {
+                for (uint32_t c = (uint32_t)(frame * 2); c < (uint32_t)(frame * 2 + 32) && c < width; c++) {
+                    y_plane[r * width + c] = (uint8_t)(200 + ((frame * 5) % 55));
+                }
+            }
+        }
+        if (frame == 29) {
+            /* Test explicit force-IDR request */
+            hevc_encoder_set_force_idr(enc);
+        }
+
+        int written = hevc_encoder_encode_raw(enc, y_plane, (int)width, uv_plane, (int)width, out_buf, out_cap);
+        assert(written > 0);
+        fwrite(out_buf, 1, (size_t)written, f);
+
+        if (frame == 0 || frame == 29) {
+            int expected_types[] = { 32 /* VPS */, 33 /* SPS */, 34 /* PPS */, 19 /* IDR_W_RADL */ };
+            int ok = check_nal_sequence(out_buf, (size_t)written, expected_types, 4);
+            assert(ok && "expected VPS,SPS,PPS,IDR sequence on keyframe");
+            if (frame == 0) idr_bytes = written;
+        } else {
+            int expected_types[] = { 1 /* TRAIL_R */ };
+            int ok = check_nal_sequence(out_buf, (size_t)written, expected_types, 1);
+            assert(ok && "expected TRAIL_R P-slice NAL");
+            if (frame == 1) static_p_bytes = written;
+        }
+    }
+
     fclose(f);
-    printf("[test_hevc_encode] Wrote bc250_test_stream.hevc (%d bytes) for external ffmpeg-decode validation.\n", written);
+    printf("[test_hevc_encode] Multi-frame GOP complete: Frame 0 (IDR) = %d bytes, Frame 1 (Static P) = %d bytes\n",
+           idr_bytes, static_p_bytes);
+    assert(static_p_bytes < idr_bytes && "P-frame with static content should be smaller than IDR");
 
     free(y_plane); free(uv_plane); free(out_buf);
     hevc_encoder_destroy(enc);
+    printf("[test_hevc_encode] Multi-frame GOP OK.\n");
+}
+
+int main(void) {
+    test_transform_round_trip();
+    test_mpm_derivation();
+    test_multi_frame_gop();
 
     printf("[test_hevc_encode] ALL HEVC BITSTREAM STRUCTURE TESTS PASSED!\n");
     return 0;
