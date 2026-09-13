@@ -33,7 +33,10 @@ This PR introduces critical fixes, rate control enhancements, performance optimi
    - Wires negotiated `VAConfigAttribRateControl` from `bc250_CreateConfig` into `bc250_CreateContext` (`VA_RC_CQP`, `VA_RC_VBR`, and `VA_RC_CBR`).
    - Honors `initial_qp` from `VAEncMiscParameterRateControl`.
    - Feeds real GPU motion estimation SAD from `motion_estimation.comp` staging buffers into `rc_get_frame_qp()`, unblocking the VBR temporal complexity ratio adjustment.
-   - Added unit and integration tests in `test_encode.c` and `test_va_api.c`.
+6. **EncodeBitstreamTest Environment Isolation & Robustness Fix (DEVLOG §29)**:
+   - Root-caused `4 - EncodeBitstreamTest (Subprocess aborted)` occurring on tester machines: installer scripts (`build_and_install.sh`, `setup_bazzite.sh`, `setup_steamos.sh`) export `BC250_SLICES_PER_FRAME=4` to `/etc/environment.d/99-bc250.conf`, which previously caused `h264_encoder_create()` to initialize with 4 slices and fail `assert(h264_encoder_get_num_slices(enc) == 1)`.
+   - Made `encoder->num_slices` the authoritative source of truth across frames in `encoder_h264.c`, eliminating redundant `getenv("BC250_SLICES_PER_FRAME")` overrides that clobbered programmatic `h264_encoder_set_num_slices()` calls.
+   - Sanitized test environment in `test_encode.c`, isolated unit tests from host environment variables, added fallback to `/tmp` when the working directory is not writable, and added pre-assertion diagnostic logging.
 
 ## Type of Change
 - [x] Bug fix (non-breaking change fixing an issue)
