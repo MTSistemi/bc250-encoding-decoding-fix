@@ -122,8 +122,13 @@ the errors below.
 ## Board and repo operations
 
 - Board is `user@10.0.0.104`. Builds happen in `distrobox enter driver-build`.
-- **Never push to `origin`** (upstream `simpmix/bc250-vcn-driver`). Only
-  `fork` (`Shalasere/bc250-vulkan-encode-stopgap`), and only when asked.
+- `origin` (`simpmix/bc250-encoding-decoding-fix`, renamed from
+  `bc250-vcn-driver`) is now the shared development repo — collaborator
+  access granted 2026-09-13. Push there directly when asked. `fork`
+  (`Shalasere/bc250-vulkan-encode-stopgap`) is kept only as a personal
+  mirror/backup, not the primary remote anymore. `main` on `origin` has
+  **no branch protection** as of this writing — never force-push it, since
+  either collaborator doing so can silently erase the other's work.
 - **Repeatedly ssh'ing into the board during a long job crashes it**
   (systemd-logind exhaustion). Launch once, wait, read once.
 - `ssh -n` is mandatory (ssh in a pipeline eats stdin), and `-n` nulls stdin
