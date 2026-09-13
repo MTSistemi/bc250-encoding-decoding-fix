@@ -375,6 +375,23 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                     c->hevc_enc = hevc_encoder_create(&data->gpu, picture_width, picture_height, 30, 4000000);
                 } else {
                     c->h264_enc = h264_encoder_create(&data->gpu, picture_width, picture_height, 30, 4000000, prof);
+                    if (c->h264_enc) {
+                        for (int a = 0; a < data->configs[config_id].num_attribs; a++) {
+                            if (data->configs[config_id].attribs[a].type == VAConfigAttribRateControl) {
+                                unsigned int rc_attrib = data->configs[config_id].attribs[a].value;
+                                if (rc_attrib == VA_RC_CQP) {
+                                    h264_encoder_set_rc_mode(c->h264_enc, RC_CQP);
+                                } else if (rc_attrib & VA_RC_VBR) {
+                                    h264_encoder_set_rc_mode(c->h264_enc, RC_VBR);
+                                } else if (rc_attrib & VA_RC_CBR) {
+                                    h264_encoder_set_rc_mode(c->h264_enc, RC_LOW_LATENCY);
+                                } else if (rc_attrib & VA_RC_CQP) {
+                                    h264_encoder_set_rc_mode(c->h264_enc, RC_CQP);
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
             } else if (entry == VAEntrypointVLD) {
                 c->h264_dec = h264_decoder_create(&data->gpu, picture_width, picture_height);
@@ -747,6 +764,9 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                                             "window_size=%u initial_qp=%u min_qp=%u\n",
                                     rc->bits_per_second, rc->target_percentage,
                                     rc->window_size, rc->initial_qp, rc->min_qp);
+                        }
+                        if (rc->initial_qp > 0) {
+                            h264_encoder_set_qp(c->h264_enc, rc->initial_qp);
                         }
                         if (rc->bits_per_second > 0) {
                             /* docs/rate_control_audit.md section 2: ffmpeg's actual

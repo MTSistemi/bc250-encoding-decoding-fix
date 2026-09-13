@@ -123,6 +123,7 @@ struct h264_encoder {
     h264_pps_t pps;
     rate_control_t rc;
     bool cbr_intent;             /* see h264_encoder_set_cbr_intent's doc comment */
+    uint64_t last_frame_sad;     /* Sum of macroblock motion SAD from previous frame */
 
     /* DPB */
     dpb_entry_t dpb[16];
@@ -1703,6 +1704,7 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
      * still fundamentally a bitrate-target mode, just tuned for faster
      * reaction, not an opt-out of hitting the target the way real VBR is. */
     rc_init(&encoder->rc, RC_LOW_LATENCY, bitrate, (double)encoder->fps, width, height);
+    encoder->last_frame_sad = 0;
 
     /* 4 bytes/pixel + slack. Was 2 bytes/pixel, which is ~50x more than
      * real 1440p desktop content needs at QP 12 (measured max 148,542
@@ -1852,6 +1854,20 @@ void h264_encoder_set_fps(h264_encoder_t *encoder, uint32_t fps) {
     }
 }
 
+void h264_encoder_set_rc_mode(h264_encoder_t *encoder, rc_mode_t mode) {
+    if (encoder) {
+        encoder->rc.mode = mode;
+        if (mode == RC_LOW_LATENCY) {
+            encoder->rc.buffer_size = encoder->rc.target_bits_per_frame * 2;
+        } else if (mode == RC_CBR || mode == RC_VBR) {
+            encoder->rc.buffer_size = encoder->rc.target_bitrate;
+        }
+        if (encoder->rc.buffer_size < 1000) encoder->rc.buffer_size = 1000;
+        encoder->rc.buffer_fullness = encoder->rc.buffer_size / 2;
+        encoder->rc.error_integral = 0;
+    }
+}
+
 void h264_encoder_set_qp(h264_encoder_t *encoder, int qp) {
     if (encoder) {
         if (qp < 0) qp = 0;
@@ -1873,6 +1889,8 @@ void h264_encoder_set_qp(h264_encoder_t *encoder, int qp) {
          * uncaught all session until a real VA-API consumer (Sunshine)
          * exercised it for the first time. */
         encoder->pps.pic_init_qp = qp - 26;
+        encoder->rc.base_qp = qp;
+        encoder->rc.current_qp = qp;
     }
 }
 
@@ -1896,9 +1914,10 @@ int h264_encoder_submit_frame(h264_encoder_t *encoder,
         encoder->idr_pic_id++;
         encoder->poc = 0;
         encoder->dpb_count = 0;
+        encoder->last_frame_sad = 0;
     }
 
-    int qp = rc_get_frame_qp(&encoder->rc, 0);
+    int qp = rc_get_frame_qp(&encoder->rc, encoder->last_frame_sad);
     /* Must track rate_control.c's rc->qp_min - see the comment there for
      * why 12 is deliberate and what lowering it measured. */
     if (qp < 12) qp = 12;
@@ -2180,6 +2199,14 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
         nz_masks = (const uint32_t *)shadow_copy((void **)&encoder->nz_masks_shadow,
                                                   &encoder->nz_masks_shadow_cap,
                                                   nz_masks, nz_size);
+        }
+
+        if (mvs) {
+            uint64_t total_sad = 0;
+            for (uint32_t mb = 0; mb < encoder->total_mbs; mb++) {
+                total_sad += mvs[mb].sad;
+            }
+            encoder->last_frame_sad = total_sad;
         }
 
         if (perf_stats) {
@@ -2932,9 +2959,10 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
         encoder->idr_pic_id++;
         encoder->poc = 0;
         encoder->dpb_count = 0;
+        encoder->last_frame_sad = 0;
     }
 
-    int qp = rc_get_frame_qp(&encoder->rc, 0);
+    int qp = rc_get_frame_qp(&encoder->rc, encoder->last_frame_sad);
     /* Must track rate_control.c's rc->qp_min - see the comment there for
      * why 12 is deliberate and what lowering it measured. */
     if (qp < 12) qp = 12;

@@ -3768,3 +3768,36 @@ Addressed the top priority open defect identified in §26.1.2 and `CLAUDE.md`: z
   - Thread 2 (Encoder thread): 100 iterations of `vaCreateBuffer` -> `vaMapBuffer` -> write -> `vaUnmapBuffer` -> `vaDestroyBuffer`.
 - Verifies 0 data races, 0 memory collisions, and 100% clean thread termination.
 
+### 26.7 Rate Control: CQP Mode, VAConfigAttribRateControl Negotiation, and Real GPU Motion SAD
+
+Addressed the remaining rate-control accuracy recommendations from `docs/rate_control_audit.md` (§4 points 4 and 5) and implemented Constant QP (CQP) mode:
+
+#### 1. Constant QP (RC_CQP) Mode Support
+- Added `RC_CQP` to `rc_mode_t` (`rate_control.h`).
+- In `rate_control.c`:
+  - `rc_get_frame_qp()`: immediately returns `rc->current_qp` without buffer fullness deviation or proportional/integral feedback drift.
+  - `rc_update_stats()`: bypasses buffer fullness and drain tracking.
+  - `rc_init()`: preserves explicit caller-set constant QP if already configured in `RC_CQP` mode.
+- In `encoder_h264.c`:
+  - Implemented `h264_encoder_set_rc_mode(encoder, mode)`.
+  - Updated `h264_encoder_set_qp()` to synchronize `pps.pic_init_qp`, `rc.base_qp`, and `rc.current_qp`.
+
+#### 2. VAConfigAttribRateControl Wiring in VA Backend
+- `bc250_GetConfigAttributes` advertised `VA_RC_CBR | VA_RC_VBR | VA_RC_CQP`, but `bc250_CreateContext` previously ignored the config's attributes and defaulted solely to `RC_LOW_LATENCY`.
+- In `bc250_CreateContext`, inspected `data->configs[config_id].attribs` for `VAConfigAttribRateControl`:
+  - `VA_RC_CQP` maps to `h264_encoder_set_rc_mode(c->h264_enc, RC_CQP)`.
+  - `VA_RC_VBR` maps to `h264_encoder_set_rc_mode(c->h264_enc, RC_VBR)`.
+  - `VA_RC_CBR` maps to `h264_encoder_set_rc_mode(c->h264_enc, RC_LOW_LATENCY)`.
+- In `bc250_RenderPicture`: applied `rc->initial_qp` from `VAEncMiscParameterRateControl` via `h264_encoder_set_qp()` when provided.
+
+#### 3. Real GPU Motion Estimation SAD Feeding
+- Previously, `rc_get_frame_qp()` was invoked with a hardcoded `est_sad = 0` at all call sites, completely starving `rate_control.c`'s VBR temporal complexity ratio adjustment (`complexity_ratio = est_sad / prev_frame_sad`).
+- Added `uint64_t last_frame_sad` to `struct h264_encoder`.
+- In `h264_encoder_finish_frame`: when staging/shadow-copy motion vectors (`mvs`) are retrieved from `motion_estimation.comp`, summed `mvs[mb].sad` across all `total_mbs` into `encoder->last_frame_sad`.
+- In `h264_encoder_submit_frame` and `h264_encoder_encode_raw`: fed `encoder->last_frame_sad` to `rc_get_frame_qp()`, resetting to 0 on IDR frames to prevent cross-GOP distortion.
+
+#### 4. Verification & Regression Testing
+- Added `test_rate_control_cqp_and_vbr` to `approach1-compute-encoder/tests/test_encode.c`: validated CQP fixed QP return, no buffer drift on update stats, and VBR complexity adaptation.
+- Added step 11 to `approach1-compute-encoder/tests/test_va_api.c`: validated `VA_RC_CQP` config and context negotiation.
+
+

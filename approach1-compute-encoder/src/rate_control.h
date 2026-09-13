@@ -13,7 +13,8 @@
 typedef enum {
     RC_CBR,
     RC_VBR,
-    RC_LOW_LATENCY  /* Low latency mode for Sunshine / Moonlight streaming */
+    RC_LOW_LATENCY, /* Low latency mode for Sunshine / Moonlight streaming */
+    RC_CQP          /* Constant QP mode */
 } rc_mode_t;
 
 typedef struct {

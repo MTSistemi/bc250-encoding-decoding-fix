@@ -101,6 +101,9 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
     rc->buffer_fullness = rc->buffer_size / 2;
 
     int base_qp = rc_estimate_base_qp(rc->target_bitrate, rc->framerate, width, height);
+    if (mode == RC_CQP && rc->current_qp >= 12 && rc->current_qp <= 51) {
+        base_qp = rc->current_qp;
+    }
     rc->base_qp = base_qp;
     rc->current_qp = base_qp;
     rc->prev_frame_sad = 0;
@@ -149,6 +152,11 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
 
 int rc_get_frame_qp(rate_control_t *rc, uint64_t est_sad) {
     if (!rc) return 26;
+
+    /* Constant QP mode: no buffer accounting or rate adjustment */
+    if (rc->mode == RC_CQP) {
+        return rc->current_qp;
+    }
 
     /* Compute buffer fullness deviation from 50% target */
     int64_t target_level = rc->buffer_size / 2;
@@ -201,6 +209,7 @@ int rc_get_frame_qp(rate_control_t *rc, uint64_t est_sad) {
 
 void rc_update_stats(rate_control_t *rc, int bits_used) {
     if (!rc) return;
+    if (rc->mode == RC_CQP) return;
 
     rc->buffer_fullness += bits_used;
 
