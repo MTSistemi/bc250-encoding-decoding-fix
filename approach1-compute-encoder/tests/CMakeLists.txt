@@ -31,6 +31,9 @@ target_include_directories(test_cavlc PRIVATE ../src)
 add_executable(test_encode test_encode.c)
 target_include_directories(test_encode PRIVATE ../src ${Vulkan_INCLUDE_DIRS} ${LIBVA_INCLUDE_DIRS} ${DRM_INCLUDE_DIRS})
 target_link_libraries(test_encode PRIVATE bc250_drv_video ${Vulkan_LIBRARIES} ${LIBVA_LIBRARIES} ${DRM_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} m)
+if(TARGET OpenMP::OpenMP_C)
+    target_link_libraries(test_encode PRIVATE OpenMP::OpenMP_C)
+endif()
 
 # HEVC bitstream structure test - GPU-free (hevc_encoder_encode_raw(), see
 # encoder_h265.h), same "no Vulkan context needed" pattern as test_encode's

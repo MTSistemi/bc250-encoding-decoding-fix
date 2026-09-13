@@ -132,20 +132,22 @@ endif()
 find_package(Threads REQUIRED)
 find_package(OpenMP)
 
+set(BC250_EXTRA_LIBS "")
+if(TARGET OpenMP::OpenMP_C)
+    list(APPEND BC250_EXTRA_LIBS OpenMP::OpenMP_C)
+    message(STATUS "OpenMP C found: multi-threaded slice entropy coding enabled")
+else()
+    message(STATUS "OpenMP C not found: multi-threaded slice entropy coding disabled")
+endif()
+
 target_link_libraries(bc250_drv_video
     ${Vulkan_LIBRARIES}
     ${LIBVA_LIBRARIES}
     ${DRM_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     m
+    ${BC250_EXTRA_LIBS}
 )
-
-if(TARGET OpenMP::OpenMP_C)
-    target_link_libraries(bc250_drv_video PUBLIC OpenMP::OpenMP_C)
-    message(STATUS "OpenMP C found: multi-threaded slice entropy coding enabled")
-else()
-    message(STATUS "OpenMP C not found: multi-threaded slice entropy coding disabled")
-endif()
 
 # Installation paths
 if(NOT LIBVA_DRIVERS_PATH)
