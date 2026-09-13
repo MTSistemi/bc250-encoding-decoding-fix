@@ -141,5 +141,14 @@ the errors below.
 
 ## Scope
 
-H.264 is real and validated. **H.265/HEVC is a non-functional stub** — do not
-enable it or extend it without reading `docs/hevc_scope_note.md`.
+H.264 is real and validated. **H.265/HEVC is no longer a stub** — it now has
+a real CABAC-coded encoder with GOP/P-frame prediction and zero-motion CU
+skip, wired into the VA-API backend (`VAProfileHEVCMain` advertised,
+config/rate-control attributes, CI decode-oracle test in
+`.github/workflows/build.yml`; DEVLOG §27–§28). It is still **not verified
+correct on generic content** — the last documented correctness pass found
+real, busy, multi-directional luma content still mismatches ffmpeg's decoder
+in ways not yet root-caused (`docs/hevc_scope_note.md`). Do not point real
+streaming clients at it, and read `docs/hevc_scope_note.md` in full before
+touching it further — it has the itemized bug list and the exact open
+failure mode.
