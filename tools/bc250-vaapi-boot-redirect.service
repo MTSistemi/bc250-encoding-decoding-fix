@@ -1,6 +1,6 @@
 [Unit]
 Description=Redirect the system radeonsi VA-API driver slot to bc250_drv_video.so
-Documentation=file:///opt/bc250-driver
+Documentation=file:///etc/bc250-vaapi-redirect-apply.sh
 DefaultDependencies=no
 Before=sysinit.target sddm.service
 After=local-fs.target
@@ -18,7 +18,12 @@ RemainAfterExit=yes
 # something else already unlocked it. The "-" tells systemd not to treat
 # that as a failure of this unit.
 ExecStart=-/usr/bin/rpm-ostree usroverlay
-ExecStart=/usr/bin/ln -sfn /opt/bc250-driver/bc250_drv_video.so /usr/lib64/dri/radeonsi_drv_video.so
+# The actual driver location varies by which installer was used
+# (build_and_install.sh / setup_bazzite.sh / setup_steamos.sh each pick a
+# different directory) - this script searches for it rather than assuming
+# one path. It lives in /etc, not /usr, because /etc survives the ostree
+# /usr-overlay reset above and /usr does not.
+ExecStart=/etc/bc250-vaapi-redirect-apply.sh
 
 [Install]
 WantedBy=sysinit.target
