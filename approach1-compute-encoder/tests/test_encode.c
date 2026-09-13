@@ -108,18 +108,52 @@ static void test_rate_control_cqp_and_vbr(void) {
     printf("[test_encode] Rate Control CQP and VBR tests passed.\n");
 }
 
+static void test_setenv(const char *name, const char *val) {
+#ifdef _WIN32
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s=%s", name, val ? val : "");
+    _putenv(buf);
+#else
+    if (val) {
+        setenv(name, val, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
 static void test_multislice_parallel_encoding(void) {
     printf("[test_encode] Testing Multi-threaded Multi-slice Parallel Encoding...\n");
+
+    /* Save host environment variable if present so unit tests run cleanly isolated */
+    const char *orig_slice_env = getenv("BC250_SLICES_PER_FRAME");
+    char saved_slice_env[64] = {0};
+    if (orig_slice_env) {
+        strncpy(saved_slice_env, orig_slice_env, sizeof(saved_slice_env) - 1);
+    }
+    test_setenv("BC250_SLICES_PER_FRAME", NULL);
 
     const uint32_t width = 320;
     const uint32_t height = 240;
     h264_encoder_t *enc = h264_encoder_create(NULL, width, height, 30, 2000000, PROFILE_BASELINE);
+    if (!enc) {
+        fprintf(stderr, "[test_encode] ERROR: h264_encoder_create failed in multislice test\n");
+    }
     assert(enc != NULL);
 
     /* Test getter and setter */
-    assert(h264_encoder_get_num_slices(enc) == 1);
+    int def_slices = h264_encoder_get_num_slices(enc);
+    if (def_slices != 1) {
+        fprintf(stderr, "[test_encode] ERROR: expected default num_slices == 1, got %d\n", def_slices);
+    }
+    assert(def_slices == 1);
+
     h264_encoder_set_num_slices(enc, 4);
-    assert(h264_encoder_get_num_slices(enc) == 4);
+    int set_slices = h264_encoder_get_num_slices(enc);
+    if (set_slices != 4) {
+        fprintf(stderr, "[test_encode] ERROR: expected set num_slices == 4, got %d\n", set_slices);
+    }
+    assert(set_slices == 4);
 
     const size_t y_size = (size_t)width * height;
     const size_t uv_size = (size_t)width * (height / 2);
@@ -136,6 +170,9 @@ static void test_multislice_parallel_encoding(void) {
 
     /* Frame 0: IDR with 4 slices */
     int written = h264_encoder_encode_raw(enc, y_plane, width, uv_plane, width, out_buf, out_cap);
+    if (written <= 0) {
+        fprintf(stderr, "[test_encode] ERROR: Frame 0 multi-slice encode failed (written=%d)\n", written);
+    }
     assert(written > 0);
 
     int idr_slice_count = 0;
@@ -154,6 +191,10 @@ static void test_multislice_parallel_encoding(void) {
         }
     }
 
+    if (aud_count != 1 || sps_count != 1 || pps_count != 1 || idr_slice_count != 4) {
+        fprintf(stderr, "[test_encode] ERROR: Frame 0 NAL counts: AUD=%d (exp 1), SPS=%d (exp 1), PPS=%d (exp 1), IDR=%d (exp 4)\n",
+                aud_count, sps_count, pps_count, idr_slice_count);
+    }
     assert(aud_count == 1);
     assert(sps_count == 1);
     assert(pps_count == 1);
@@ -165,6 +206,9 @@ static void test_multislice_parallel_encoding(void) {
     for (size_t i = 0; i < y_size; i++) y_plane[i] = (uint8_t)((y_plane[i] + 16) & 0xFF);
 
     written = h264_encoder_encode_raw(enc, y_plane, width, uv_plane, width, out_buf, out_cap);
+    if (written <= 0) {
+        fprintf(stderr, "[test_encode] ERROR: Frame 1 multi-slice encode failed (written=%d)\n", written);
+    }
     assert(written > 0);
 
     int p_slice_count = 0;
@@ -176,9 +220,42 @@ static void test_multislice_parallel_encoding(void) {
         }
     }
 
+    if (p_slice_count != 4) {
+        fprintf(stderr, "[test_encode] ERROR: Frame 1 NAL counts: P_slices=%d (exp 4)\n", p_slice_count);
+    }
     assert(p_slice_count == 4 && "Expected exactly 4 P slice NALUs for 4-slice frame");
     printf("[test_encode] Frame 1 (P): successfully encoded 4 slices in parallel (P_slices=%d)\n",
            p_slice_count);
+
+    /* Test programmatic reduction back to 1 slice */
+    h264_encoder_set_num_slices(enc, 1);
+    assert(h264_encoder_get_num_slices(enc) == 1);
+    for (size_t i = 0; i < y_size; i++) y_plane[i] = (uint8_t)((y_plane[i] + 8) & 0xFF);
+    written = h264_encoder_encode_raw(enc, y_plane, width, uv_plane, width, out_buf, out_cap);
+    assert(written > 0);
+    int p_slice_single = 0;
+    for (int p = 0; p < written - 4; p++) {
+        if (out_buf[p] == 0x00 && out_buf[p+1] == 0x00 &&
+            out_buf[p+2] == 0x00 && out_buf[p+3] == 0x01) {
+            uint8_t nal_type = out_buf[p+4] & 0x1F;
+            if (nal_type == 1) p_slice_single++;
+        }
+    }
+    assert(p_slice_single == 1 && "Expected exactly 1 P slice NALU after resetting num_slices to 1");
+
+    /* Test BC250_SLICES_PER_FRAME environment variable override on creation */
+    test_setenv("BC250_SLICES_PER_FRAME", "2");
+    h264_encoder_t *enc_env = h264_encoder_create(NULL, width, height, 30, 2000000, PROFILE_BASELINE);
+    assert(enc_env != NULL);
+    assert(h264_encoder_get_num_slices(enc_env) == 2);
+    h264_encoder_destroy(enc_env);
+
+    /* Restore host environment */
+    if (orig_slice_env) {
+        test_setenv("BC250_SLICES_PER_FRAME", saved_slice_env);
+    } else {
+        test_setenv("BC250_SLICES_PER_FRAME", NULL);
+    }
 
     free(y_plane);
     free(uv_plane);
@@ -189,6 +266,17 @@ static void test_multislice_parallel_encoding(void) {
 }
 
 int main(void) {
+    /* Isolate test execution from host environment variables */
+    const char *orig_slices = getenv("BC250_SLICES_PER_FRAME");
+    char saved_slices[64] = {0};
+    if (orig_slices) strncpy(saved_slices, orig_slices, sizeof(saved_slices) - 1);
+    const char *orig_cabac = getenv("BC250_USE_CABAC");
+    char saved_cabac[64] = {0};
+    if (orig_cabac) strncpy(saved_cabac, orig_cabac, sizeof(saved_cabac) - 1);
+
+    test_setenv("BC250_SLICES_PER_FRAME", NULL);
+    test_setenv("BC250_USE_CABAC", NULL);
+
     test_intra16_dc_transpose();
     test_rate_control_cqp_and_vbr();
     test_multislice_parallel_encoding();
@@ -209,7 +297,12 @@ int main(void) {
     assert(out_buf != NULL);
 
     FILE *f_stream = fopen("bc250_test_stream.h264", "wb");
-    assert(f_stream != NULL);
+    if (!f_stream) {
+        f_stream = fopen("/tmp/bc250_test_stream.h264", "wb");
+    }
+    if (!f_stream) {
+        fprintf(stderr, "[test_encode] Warning: could not open output stream file for writing, running in-memory checks\n");
+    }
 
     uint8_t *y_plane = malloc(width * height);
     uint8_t *uv_plane = malloc(width * height / 2);
@@ -234,6 +327,9 @@ int main(void) {
         }
 
         int written = h264_encoder_encode_raw(enc, y_plane, width, uv_plane, width, out_buf, out_cap);
+        if (written <= 0) {
+            fprintf(stderr, "[test_encode] ERROR: Frame %02d failed to encode (written=%d)\n", i, written);
+        }
         assert(written > 0);
 
         /* Verify 4-byte start code at the beginning of each frame (AUD) */
@@ -258,6 +354,10 @@ int main(void) {
                     if (nal_type == 5) has_idr_slice = true;
                 }
             }
+            if (!has_sps || !has_pps || !has_idr_slice) {
+                fprintf(stderr, "[test_encode] ERROR: Frame 0 NAL check failed: SPS=%d, PPS=%d, IDR=%d, written=%d\n",
+                        has_sps, has_pps, has_idr_slice, written);
+            }
             assert(has_sps && "Frame 0 missing SPS NAL unit");
             assert(has_pps && "Frame 0 missing PPS NAL unit");
             assert(has_idr_slice && "Frame 0 missing IDR Slice NAL unit");
@@ -272,21 +372,32 @@ int main(void) {
                     if (nal_type == 1) has_p_slice = true;
                 }
             }
+            if (!has_p_slice) {
+                fprintf(stderr, "[test_encode] ERROR: Frame %02d missing P-slice, written=%d\n", i, written);
+            }
             assert(has_p_slice && "P-frame missing Slice NAL unit");
             if (i < 5 || i == num_frames - 1) {
                 printf("[test_encode] Frame %02d (P):   %d bytes (AUD, P-Slice verified)\n", i, written);
             }
         }
 
-        fwrite(out_buf, 1, (size_t)written, f_stream);
+        if (f_stream) {
+            fwrite(out_buf, 1, (size_t)written, f_stream);
+        }
         total_bytes += (size_t)written;
     }
 
-    fclose(f_stream);
+    if (f_stream) {
+        fclose(f_stream);
+    }
     free(y_plane);
     free(uv_plane);
     free(out_buf);
     h264_encoder_destroy(enc);
+
+    /* Restore host environment variables */
+    if (orig_slices) test_setenv("BC250_SLICES_PER_FRAME", saved_slices);
+    if (orig_cabac) test_setenv("BC250_USE_CABAC", saved_cabac);
 
     printf("[test_encode] Successfully encoded %d frames (%zu total bytes) to bc250_test_stream.h264!\n",
            num_frames, total_bytes);

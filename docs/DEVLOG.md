@@ -3914,7 +3914,38 @@ While the underlying H.265/HEVC encoder (`encoder_h265.c`) was upgraded with IDR
   - Added `test_dynamic_qp_and_rate_control()`: verified QP 18 vs QP 40 bitstream generation, confirming monotonic bitrate scaling.
   - Verified rate control mode switching (`RC_CQP` -> `RC_VBR` -> `RC_LOW_LATENCY`) and multi-frame encoding under active feedback.
 
+## 29. Bug Fix: Root-Cause Diagnosis and Resolution of `4 - EncodeBitstreamTest (Subprocess aborted)`
 
+### 29.1 Symptom & Problem Statement
+On hardware test systems (and machines configured via the driver's setup scripts), running `ctest` produced:
+```
+The following tests FAILED:
+	  4 - EncodeBitstreamTest (Subprocess aborted)
+```
+While Test 1 (`BitstreamTest`), Test 2 (`CavlcUnitTest`), Test 3 (`VaApiDriverTest`), and Test 5 (`HevcEncodeBitstreamTest`) passed cleanly, Test 4 terminated with `SIGABRT` (`Subprocess aborted`).
 
+### 29.2 Root Cause Analysis
+1. **Environment Variable Collision (`BC250_SLICES_PER_FRAME`)**:
+   - The driver's installer and deployment scripts (`build_and_install.sh` line 177, `tools/setup_bazzite.sh` line 153/166, and `tools/setup_steamos.sh` line 174/187) populate `/etc/environment.d/99-bc250.conf` or user shell environments with `BC250_SLICES_PER_FRAME=4` to optimize game streaming throughput with 4 slices.
+   - In `encoder_h264.c`: `h264_encoder_create()` reads `getenv("BC250_SLICES_PER_FRAME")` and sets `encoder->num_slices = 4`.
+   - In `test_encode.c`: `test_multislice_parallel_encoding()` created an encoder and immediately executed:
+     ```c
+     assert(h264_encoder_get_num_slices(enc) == 1);
+     ```
+     Because `BC250_SLICES_PER_FRAME=4` was exported in the host environment, `h264_encoder_get_num_slices(enc)` returned `4`, causing the assertion `4 == 1` to fail and abort with `SIGABRT`.
+   - Furthermore, if `BC250_SLICES_PER_FRAME=1` was set, `h264_encoder_set_num_slices(enc, 4)` was called, but `h264_encoder_encode_raw()` and `h264_encoder_encode_frame()` re-read `getenv("BC250_SLICES_PER_FRAME")` on every frame, overriding `num_slices` back to 1 and failing `assert(idr_slice_count == 4)`.
+2. **Missing CWD Write Permissiveness**:
+   - `test_encode.c` and `test_hevc_encode.c` opened `bc250_test_stream.*` in the current working directory with `assert(f != NULL)`. When tests were executed in restricted directories or unprivileged containers where CWD was read-only, `fopen` failed and aborted.
+3. **Lack of Pre-Assertion Diagnostics**:
+   - Assertions in `test_encode.c` lacked diagnostic prints, obscuring the exact mismatched count or return code upon abort.
 
-
+### 29.3 Technical Resolution
+1. **Authoritative Slice State in `encoder_h264.c`**:
+   - `encoder->num_slices` is initialized during `h264_encoder_create()` (defaulting to 1, or `BC250_SLICES_PER_FRAME` if present in environment upon creation).
+   - Removed redundant, clobbering `getenv("BC250_SLICES_PER_FRAME")` calls from `h264_encoder_encode_frame()` and `h264_encoder_encode_raw()`. Both functions now directly respect `(encoder->num_slices >= 1 && encoder->num_slices <= 16) ? encoder->num_slices : 1`, preserving programmatic settings via `h264_encoder_set_num_slices()` across all frames.
+2. **Environment Sanitization & Comprehensive Testing in `test_encode.c`**:
+   - Added portable `test_setenv()` helper to isolate test execution from host environment variables (`BC250_SLICES_PER_FRAME`, `BC250_USE_CABAC`).
+   - `test_multislice_parallel_encoding()` unsets `BC250_SLICES_PER_FRAME`, asserts default `num_slices == 1`, tests setting `num_slices = 4` with full multi-slice IDR (4 slices) and P-frame (4 slices) generation, tests resetting back to `num_slices = 1`, tests environment variable override (`BC250_SLICES_PER_FRAME=2`), and restores the host environment.
+   - Added rich diagnostic printfs before every assertion to log exact NAL counts (`AUD`, `SPS`, `PPS`, `IDR`, `P`) and return codes on failure.
+3. **File Output Fallback**:
+   - Added fallback to `/tmp/bc250_test_stream.*` if CWD is not writable in both `test_encode.c` and `test_hevc_encode.c`, logging a warning and safely validating bitstreams in-memory if disk access is prohibited.

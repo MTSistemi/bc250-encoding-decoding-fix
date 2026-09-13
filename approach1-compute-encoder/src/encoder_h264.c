@@ -1946,12 +1946,7 @@ int h264_encoder_submit_frame(h264_encoder_t *encoder,
 
     /* Kept identical to the synchronous path's own slice-count logic so that
      * submit+finish back to back is byte-for-byte the old behaviour. */
-    int num_slices = encoder->num_slices > 0 ? encoder->num_slices : 1;
-    const char *slice_env = getenv("BC250_SLICES_PER_FRAME");
-    if (slice_env) {
-        int s = atoi(slice_env);
-        if (s >= 1 && s <= 16) num_slices = s;
-    }
+    int num_slices = (encoder->num_slices >= 1 && encoder->num_slices <= 16) ? encoder->num_slices : 1;
 
     pending->valid      = true;
     pending->is_idr     = is_idr;
@@ -3040,12 +3035,7 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
     }
 
     /* 3. Encode Slices (supporting multi-slice partitioning for network resilience) */
-    int num_slices = encoder->num_slices > 0 ? encoder->num_slices : 1;
-    const char *slice_env = getenv("BC250_SLICES_PER_FRAME");
-    if (slice_env) {
-        int s = atoi(slice_env);
-        if (s >= 1 && s <= 16) num_slices = s;
-    }
+    int num_slices = (encoder->num_slices >= 1 && encoder->num_slices <= 16) ? encoder->num_slices : 1;
 
     const char *fm = getenv("BC250_FAST_MODE");
     int deblock_idc = (fm && (strcmp(fm, "1") == 0 || strcmp(fm, "true") == 0)) ? 1 : 0;

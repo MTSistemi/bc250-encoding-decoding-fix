@@ -122,7 +122,12 @@ static void test_multi_frame_gop(void) {
     assert(out_buf != NULL);
 
     FILE *f = fopen("bc250_test_stream.hevc", "wb");
-    assert(f != NULL);
+    if (!f) {
+        f = fopen("/tmp/bc250_test_stream.hevc", "wb");
+    }
+    if (!f) {
+        fprintf(stderr, "[test_hevc_encode] Warning: could not open output stream file for writing, proceeding in memory\n");
+    }
 
     int idr_bytes = 0;
     int static_p_bytes = 0;
@@ -143,7 +148,7 @@ static void test_multi_frame_gop(void) {
 
         int written = hevc_encoder_encode_raw(enc, y_plane, (int)width, uv_plane, (int)width, out_buf, out_cap);
         assert(written > 0);
-        fwrite(out_buf, 1, (size_t)written, f);
+        if (f) fwrite(out_buf, 1, (size_t)written, f);
 
         if (frame == 0 || frame == 29) {
             int expected_types[] = { 32 /* VPS */, 33 /* SPS */, 34 /* PPS */, 19 /* IDR_W_RADL */ };
@@ -158,7 +163,7 @@ static void test_multi_frame_gop(void) {
         }
     }
 
-    fclose(f);
+    if (f) fclose(f);
     printf("[test_hevc_encode] Multi-frame GOP complete: Frame 0 (IDR) = %d bytes, Frame 1 (Static P) = %d bytes\n",
            idr_bytes, static_p_bytes);
     assert(static_p_bytes < idr_bytes && "P-frame with static content should be smaller than IDR");
