@@ -144,6 +144,7 @@ VAStatus bc250_CreateConfig(VADriverContextP ctx, VAProfile profile, VAEntrypoin
         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
     }
 
+    DRIVER_LOCK(data);
     for (int i = 0; i < MAX_CONFIGS; i++) {
         if (!data->configs[i].allocated) {
             data->configs[i].allocated = 1;
@@ -154,22 +155,35 @@ VAStatus bc250_CreateConfig(VADriverContextP ctx, VAProfile profile, VAEntrypoin
                 memcpy(data->configs[i].attribs, attrib_list, num_attribs * sizeof(VAConfigAttrib));
             }
             *config_id = i;
+            DRIVER_UNLOCK(data);
             return VA_STATUS_SUCCESS;
         }
     }
+    DRIVER_UNLOCK(data);
     return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 }
 
 VAStatus bc250_DestroyConfig(VADriverContextP ctx, VAConfigID config_id) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!VALID_ID(config_id, MAX_CONFIGS) || !data->configs[config_id].allocated) return VA_STATUS_ERROR_INVALID_CONFIG;
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(config_id, MAX_CONFIGS) || !data->configs[config_id].allocated) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_CONFIG;
+    }
     data->configs[config_id].allocated = 0;
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
 VAStatus bc250_QueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id, VAProfile *profile, VAEntrypoint *entrypoint, VAConfigAttrib *attrib_list, int *num_attribs) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!VALID_ID(config_id, MAX_CONFIGS) || !data->configs[config_id].allocated) return VA_STATUS_ERROR_INVALID_CONFIG;
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(config_id, MAX_CONFIGS) || !data->configs[config_id].allocated) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_CONFIG;
+    }
 
     if (profile) *profile = data->configs[config_id].profile;
     if (entrypoint) *entrypoint = data->configs[config_id].entrypoint;
@@ -177,6 +191,7 @@ VAStatus bc250_QueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id,
     if (attrib_list && data->configs[config_id].num_attribs > 0) {
         memcpy(attrib_list, data->configs[config_id].attribs, data->configs[config_id].num_attribs * sizeof(VAConfigAttrib));
     }
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
@@ -217,6 +232,7 @@ VAStatus bc250_CreateSurfaces(VADriverContextP ctx, int width, int height, int f
     if (!data || !surfaces) return VA_STATUS_ERROR_INVALID_PARAMETER;
     if (width > data->max_width || height > data->max_height) return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
 
+    DRIVER_LOCK(data);
     int allocated = 0;
     for (int i = 0; i < MAX_SURFACES && allocated < num_surfaces; i++) {
         if (!data->surfaces[i].allocated) {
@@ -263,8 +279,10 @@ VAStatus bc250_CreateSurfaces(VADriverContextP ctx, int width, int height, int f
 
     if (allocated < num_surfaces) {
         bc250_DestroySurfaces(ctx, surfaces, allocated);
+        DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
     }
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
@@ -299,6 +317,7 @@ VAStatus bc250_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list, 
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data || !surface_list) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
+    DRIVER_LOCK(data);
     for (int i = 0; i < num_surfaces; i++) {
         VASurfaceID id = surface_list[i];
         if (!VALID_ID(id, MAX_SURFACES) || !data->surfaces[id].allocated) continue;
@@ -319,6 +338,7 @@ VAStatus bc250_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list, 
         surf->pending_destroy = 1;
         bc250_surface_unref(data, id);
     }
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
@@ -328,6 +348,7 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
         return VA_STATUS_ERROR_INVALID_CONFIG;
     }
 
+    DRIVER_LOCK(data);
     for (int i = 0; i < MAX_CONTEXTS; i++) {
         if (!data->contexts[i].allocated) {
             bc250_context *c = &data->contexts[i];
@@ -360,15 +381,20 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
             }
 
             *context = i;
+            DRIVER_UNLOCK(data);
             return VA_STATUS_SUCCESS;
         }
     }
+    DRIVER_UNLOCK(data);
     return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 }
 
 VAStatus bc250_DestroyContext(VADriverContextP ctx, VAContextID context) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(context, MAX_CONTEXTS) || !data->contexts[context].allocated) {
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(context, MAX_CONTEXTS) || !data->contexts[context].allocated) {
+        DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
     bc250_context *c = &data->contexts[context];
@@ -395,6 +421,7 @@ VAStatus bc250_DestroyContext(VADriverContextP ctx, VAContextID context) {
         c->render_targets = NULL;
     }
     c->allocated = 0;
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
@@ -403,6 +430,7 @@ VAStatus bc250_CreateBuffer(VADriverContextP ctx, VAContextID context, VABufferT
     if (!data || !buf_id) return VA_STATUS_ERROR_INVALID_PARAMETER;
     (void)context;
 
+    DRIVER_LOCK(data);
     for (int i = 0; i < MAX_BUFFERS; i++) {
         if (!data->buffers[i].allocated) {
             bc250_buffer *b = &data->buffers[i];
@@ -427,6 +455,7 @@ VAStatus bc250_CreateBuffer(VADriverContextP ctx, VAContextID context, VABufferT
                  * vaMapBuffer/vaDestroyBuffer on buf_id would otherwise
                  * dereference/free a NULL data pointer or operate on a slot
                  * that looks valid but never had memory. */
+                DRIVER_UNLOCK(data);
                 return VA_STATUS_ERROR_ALLOCATION_FAILED;
             }
             b->allocated = 1;
@@ -442,16 +471,24 @@ VAStatus bc250_CreateBuffer(VADriverContextP ctx, VAContextID context, VABufferT
                 seg->next = NULL;
             }
             *buf_id = i;
+            DRIVER_UNLOCK(data);
             return VA_STATUS_SUCCESS;
         }
     }
+    DRIVER_UNLOCK(data);
     return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 }
 
 VAStatus bc250_BufferSetNumElements(VADriverContextP ctx, VABufferID buf_id, unsigned int num_elements) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated) return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
     data->buffers[buf_id].num_elements = num_elements;
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
@@ -461,7 +498,10 @@ static void bc250_finish_pending_frame(bc250_driver_data *data, bc250_context *c
 
 VAStatus bc250_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated || !pbuf) {
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated || !pbuf) {
+        DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_INVALID_BUFFER;
     }
     /* If this is the coded buffer of a frame still in flight, its bitstream
@@ -478,12 +518,18 @@ VAStatus bc250_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf) {
     }
     data->buffers[buf_id].mapped = 1;
     *pbuf = data->buffers[buf_id].data;
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
 VAStatus bc250_UnmapBuffer(VADriverContextP ctx, VABufferID buf_id) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated) return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
 
     /* Test-harness instrumentation (tools/quality_test.sh): a derived-image
      * buffer (see bc250_DeriveImage) is a direct mapping of GPU surface
@@ -512,12 +558,14 @@ VAStatus bc250_UnmapBuffer(VADriverContextP ctx, VABufferID buf_id) {
     }
 
     data->buffers[buf_id].mapped = 0;
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
 VAStatus bc250_DestroyBuffer(VADriverContextP ctx, VABufferID buffer_id) {
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data) return VA_STATUS_ERROR_INVALID_BUFFER;
+    DRIVER_LOCK(data);
     /* A genuinely out-of-range ID is a real caller bug - keep erroring on
      * that. An in-range ID that's simply not currently allocated (already
      * destroyed, or never allocated) is treated as a harmless no-op instead
@@ -533,8 +581,14 @@ VAStatus bc250_DestroyBuffer(VADriverContextP ctx, VABufferID buffer_id) {
      * Several real VA-API drivers (including Mesa's) treat a destroy-again
      * on an already-gone buffer as success for the same reason - the
      * resource the caller wanted gone is, in fact, gone. */
-    if (!VALID_ID(buffer_id, MAX_BUFFERS)) return VA_STATUS_ERROR_INVALID_BUFFER;
-    if (!data->buffers[buffer_id].allocated) return VA_STATUS_SUCCESS;
+    if (!VALID_ID(buffer_id, MAX_BUFFERS)) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    if (!data->buffers[buffer_id].allocated) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_SUCCESS;
+    }
     bc250_buffer *b = &data->buffers[buffer_id];
     if (b->is_derived) {
         if (b->gpu_mem) {
@@ -558,14 +612,23 @@ VAStatus bc250_DestroyBuffer(VADriverContextP ctx, VABufferID buffer_id) {
     }
     b->data = NULL;
     b->allocated = 0;
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
 VAStatus bc250_BeginPicture(VADriverContextP ctx, VAContextID context, VASurfaceID render_target) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(context, MAX_CONTEXTS) || !data->contexts[context].allocated) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(context, MAX_CONTEXTS) || !data->contexts[context].allocated) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
     if (!VALID_ID(render_target, MAX_SURFACES) || !data->surfaces[render_target].allocated ||
-        data->surfaces[render_target].pending_destroy) return VA_STATUS_ERROR_INVALID_SURFACE;
+        data->surfaces[render_target].pending_destroy) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
 
     bc250_context *c = &data->contexts[context];
     c->current_render_target = render_target;
@@ -575,12 +638,16 @@ VAStatus bc250_BeginPicture(VADriverContextP ctx, VAContextID context, VASurface
     c->h264_state.has_pic = 0;
     c->h264_state.has_slice = 0;
 
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
 VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABufferID *buffers, int num_buffers) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(context, MAX_CONTEXTS) || !data->contexts[context].allocated || !buffers) {
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(context, MAX_CONTEXTS) || !data->contexts[context].allocated || !buffers) {
+        DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
     bc250_context *c = &data->contexts[context];
@@ -756,15 +823,15 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                 break;
             case VAEncPackedHeaderParameterBufferType:
             case VAEncPackedHeaderDataBufferType:
-                /* Packed headers passed by Sunshine / OBS / FFmpeg - handled gracefully */
+                /* Explicitly ignored: see bc250_GetConfigAttributes comment on
+                 * VA_ENC_PACKED_HEADER_NONE. We emit our own headers. */
                 break;
-            case VAEncCodedBufferType:
-                c->coded_buf_id = buf_id;
-                break;
+
             default:
                 break;
         }
     }
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
@@ -835,11 +902,17 @@ static void bc250_finish_pending_frame(bc250_driver_data *data, bc250_context *c
 
 VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(context, MAX_CONTEXTS) || !data->contexts[context].allocated) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(context, MAX_CONTEXTS) || !data->contexts[context].allocated) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
 
     bc250_context *c = &data->contexts[context];
     if (!VALID_ID(c->current_render_target, MAX_SURFACES) || !data->surfaces[c->current_render_target].allocated ||
         data->surfaces[c->current_render_target].pending_destroy) {
+        DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     bc250_surface *surf = &data->surfaces[c->current_render_target];
@@ -920,13 +993,18 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
      * and spec-incorrect UNDEFINED) into gpu_compute_dispatch_encode(). */
     surf->image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
 
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
 VAStatus bc250_SyncSurface(VADriverContextP ctx, VASurfaceID render_target) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(render_target, MAX_SURFACES) || !data->surfaces[render_target].allocated ||
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    DRIVER_LOCK(data);
+    if (!VALID_ID(render_target, MAX_SURFACES) || !data->surfaces[render_target].allocated ||
         data->surfaces[render_target].pending_destroy) {
+        DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     /* A sync is a promise that this surface is done being read and its coded
@@ -939,8 +1017,13 @@ VAStatus bc250_SyncSurface(VADriverContextP ctx, VASurfaceID render_target) {
                 bc250_finish_pending_frame(data, &data->contexts[i]);
         }
     }
-    gpu_compute_sync(&data->gpu);
-    return VA_STATUS_SUCCESS;
+    int slot = gpu_compute_submitted_slot(&data->gpu);
+    DRIVER_UNLOCK(data);
+
+    /* Unlocked wait for GPU fence: prevents blocking concurrent encoder_thread
+     * actions while filter_thread waits on GPU completion. */
+    int sync_res = gpu_compute_sync_slot(&data->gpu, slot);
+    return (sync_res == 0) ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_OPERATION_FAILED;
 }
 
 VAStatus bc250_QuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target, VASurfaceStatus *status) {
@@ -978,6 +1061,7 @@ VAStatus bc250_CreateImage(VADriverContextP ctx, VAImageFormat *format, int widt
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data || !format || !image) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
+    DRIVER_LOCK(data);
     for (int i = 0; i < MAX_IMAGES; i++) {
         if (!data->images[i].allocated) {
             bc250_image *img = &data->images[i];
@@ -1018,36 +1102,48 @@ VAStatus bc250_CreateImage(VADriverContextP ctx, VAImageFormat *format, int widt
                  * and alias a live, unrelated buffer slot - would corrupt or
                  * free memory that belongs to something else entirely. */
                 img->allocated = 0;
+                DRIVER_UNLOCK(data);
                 return buf_status;
             }
             image->buf = buf_id;
             img->image = *image;
             img->buffer_id = buf_id;
 
+            DRIVER_UNLOCK(data);
             return VA_STATUS_SUCCESS;
         }
     }
+    DRIVER_UNLOCK(data);
     return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
 }
 
 VAStatus bc250_DestroyImage(VADriverContextP ctx, VAImageID image) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(image, MAX_IMAGES) || !data->images[image].allocated) return VA_STATUS_ERROR_INVALID_IMAGE;
+    if (!data) return VA_STATUS_ERROR_INVALID_IMAGE;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(image, MAX_IMAGES) || !data->images[image].allocated) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_IMAGE;
+    }
 
     bc250_DestroyBuffer(ctx, data->images[image].buffer_id);
     data->images[image].allocated = 0;
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
 VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image) {
     bc250_driver_data *data = get_driver_data(ctx);
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
     /* A surface with pending_destroy set has already been handed back to
      * vaDestroySurfaces() by the application - it must be rejected here
      * exactly like any other invalid surface, even if its Vulkan
      * resources happen to still be alive internally pending an earlier
      * derived image's teardown (see bc250_surface.pending_destroy). */
-    if (!data || !VALID_ID(surface, MAX_SURFACES) || !data->surfaces[surface].allocated ||
+    DRIVER_LOCK(data);
+    if (!VALID_ID(surface, MAX_SURFACES) || !data->surfaces[surface].allocated ||
         data->surfaces[surface].pending_destroy || !image) {
+        DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     bc250_surface *surf = &data->surfaces[surface];
@@ -1058,7 +1154,10 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
         .bits_per_pixel = 12
     };
     VAStatus status = bc250_CreateImage(ctx, &fmt, surf->width, surf->height, image);
-    if (status != VA_STATUS_SUCCESS) return status;
+    if (status != VA_STATUS_SUCCESS) {
+        DRIVER_UNLOCK(data);
+        return status;
+    }
 
     bc250_image *img = &data->images[image->image_id];
     bc250_buffer *buf = &data->buffers[img->buffer_id];
@@ -1124,15 +1223,24 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
             img->surface_id = surface;
         }
     }
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
 VAStatus bc250_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y, unsigned int width, unsigned int height, VAImageID image) {
     (void)x; (void)y; (void)width; (void)height;
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(surface, MAX_SURFACES) || !data->surfaces[surface].allocated ||
-        data->surfaces[surface].pending_destroy) return VA_STATUS_ERROR_INVALID_SURFACE;
-    if (!VALID_ID(image, MAX_IMAGES) || !data->images[image].allocated) return VA_STATUS_ERROR_INVALID_IMAGE;
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(surface, MAX_SURFACES) || !data->surfaces[surface].allocated ||
+        data->surfaces[surface].pending_destroy) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (!VALID_ID(image, MAX_IMAGES) || !data->images[image].allocated) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_IMAGE;
+    }
 
     bc250_surface *surf = &data->surfaces[surface];
     bc250_image *img = &data->images[image];
@@ -1168,6 +1276,7 @@ VAStatus bc250_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
                                   dst_uv, uv_pitch,
                                   copy_width, copy_height);
     }
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1175,9 +1284,17 @@ VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID ima
     (void)src_x; (void)src_y; (void)src_width; (void)src_height;
     (void)dest_x; (void)dest_y; (void)dest_width; (void)dest_height;
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(surface, MAX_SURFACES) || !data->surfaces[surface].allocated ||
-        data->surfaces[surface].pending_destroy) return VA_STATUS_ERROR_INVALID_SURFACE;
-    if (!VALID_ID(image, MAX_IMAGES) || !data->images[image].allocated) return VA_STATUS_ERROR_INVALID_IMAGE;
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(surface, MAX_SURFACES) || !data->surfaces[surface].allocated ||
+        data->surfaces[surface].pending_destroy) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (!VALID_ID(image, MAX_IMAGES) || !data->images[image].allocated) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_ERROR_INVALID_IMAGE;
+    }
 
     bc250_surface *surf = &data->surfaces[surface];
     bc250_image *img = &data->images[image];
@@ -1205,6 +1322,7 @@ VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID ima
                                 src_uv, uv_pitch,
                                 copy_width, copy_height);
     }
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1226,17 +1344,22 @@ VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID ima
  * own radeonsi VAAPI driver) use for this same choice. */
 VAStatus bc250_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id, uint32_t mem_type, uint32_t flags, void *descriptor) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(surface_id, MAX_SURFACES) || !data->surfaces[surface_id].allocated ||
+    if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    DRIVER_LOCK(data);
+    if (!VALID_ID(surface_id, MAX_SURFACES) || !data->surfaces[surface_id].allocated ||
         data->surfaces[surface_id].pending_destroy || !descriptor) {
+        DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) {
+        DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
     }
     bc250_surface *surf = &data->surfaces[surface_id];
 
     gpu_nv12_layout_t layout;
     if (gpu_compute_get_nv12_layout(&data->gpu, &surf->image, surf->memory, &layout) != 0) {
+        DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
@@ -1244,6 +1367,7 @@ VAStatus bc250_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
     if (gpu_compute_export_nv12_dmabuf(&data->gpu, surf->memory, &fd) != 0) {
         /* Most likely VK_KHR_external_memory_fd/VK_EXT_external_memory_dma_buf
          * weren't available at device creation - see bc250_gpu_init(). */
+        DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_UNIMPLEMENTED;
     }
 
@@ -1282,6 +1406,7 @@ VAStatus bc250_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         desc->layers[0].pitch[1] = layout.uv_pitch;
     }
 
+    DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1388,6 +1513,7 @@ VAStatus bc250_QueryVideoProcPipelineCaps(VADriverContextP ctx, VAContextID cont
 VAStatus bc250_Terminate(VADriverContextP ctx) {
     bc250_driver_data *data = get_driver_data(ctx);
     if (data) {
+        DRIVER_LOCK(data);
         /* The VA-API contract expects callers to have destroyed every
          * config/context/buffer/image/surface before vaTerminate(), but a
          * driver should not silently leak GPU memory and heap allocations
@@ -1422,8 +1548,10 @@ VAStatus bc250_Terminate(VADriverContextP ctx) {
         }
 
         gpu_compute_terminate(&data->gpu);
-        free(data);
         ctx->pDriverData = NULL;
+        DRIVER_UNLOCK(data);
+        pthread_mutex_destroy(&data->lock);
+        free(data);
     }
     return VA_STATUS_SUCCESS;
 }
@@ -1434,8 +1562,15 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
     bc250_driver_data *data = calloc(1, sizeof(bc250_driver_data));
     if (!data) return VA_STATUS_ERROR_ALLOCATION_FAILED;
 
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&data->lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+
     if (gpu_compute_init(&data->gpu) != 0) {
         fprintf(stderr, "[bc250-drv] Failed to initialize Vulkan compute backend!\n");
+        pthread_mutex_destroy(&data->lock);
         free(data);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
