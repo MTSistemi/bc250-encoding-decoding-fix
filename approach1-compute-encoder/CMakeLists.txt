@@ -43,6 +43,12 @@ if(BUILD_32BIT)
     # easily-missed ld warning. -z text promotes that to a hard link error.
     # If it fires, install the shared libgomp for your distro (listed above)
     # rather than removing this flag.
+    #
+    # Both directions verified on real 32-bit builds, not assumed: with shared
+    # libgomp present the driver links clean under this flag and carries no
+    # DT_TEXTREL (NEEDED libgomp.so.1, i.e. dynamic); and the flag genuinely
+    # rejects a text-relocating object rather than passing it through
+    # ("read-only segment has dynamic relocations").
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,text")
 
     # pkg-config must be pointed at the 32-bit .pc files. Left alone it
