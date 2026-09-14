@@ -77,6 +77,37 @@ cd bc250-vulkan-encode-stopgap
 
 **C — Pre-built release**: download `bc250_drv_video.so` + `shaders/*.spv` from [Releases](../../releases) (`v0.2.1`+), place both at the repo root, then run the A or B installer. The installers verify shaders actually landed and fail rather than silently reporting success.
 
+### 32-bit driver (Steam Link)
+
+Steam Link's runtime is 32-bit and `dlopen()`s a 32-bit VA-API driver, so a 64-bit
+`bc250_drv_video.so` is invisible to it and it silently falls back to software
+encoding. Build an i386 driver **alongside** the 64-bit one — same sources, same
+filename, different install directory, so both can coexist:
+
+```bash
+cmake -B build32 -S approach1-compute-encoder -DBUILD_32BIT=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build32 --parallel
+sudo cmake --install build32          # -> /usr/lib32/dri (or /usr/lib/i386-linux-gnu/dri)
+```
+
+Needs 32-bit development packages, **including a shared `libgomp`**:
+
+| Distro | Packages |
+|---|---|
+| Arch / CachyOS | `lib32-libva lib32-libdrm lib32-vulkan-icd-loader lib32-gcc-libs` |
+| Fedora | `libva-devel.i686 libdrm-devel.i686 vulkan-loader-devel.i686 glibc-devel.i686 libgomp.i686` |
+| Debian / Ubuntu | `gcc-multilib libva-dev:i386 libdrm-dev:i386 libvulkan-dev:i386 libgomp1:i386` |
+
+The shared `libgomp` matters: without it, `-fopenmp` statically links `libgomp.a`,
+whose non-PIC objects produce a library with `DT_TEXTREL` — which SELinux's
+`deny_execmod` refuses to `dlopen()`, i.e. it would build and install cleanly and
+then fail to load in Steam Link specifically. The build links with `-Wl,-z,text`
+so that becomes a hard error instead of a silent one; if it fires, install the
+shared `libgomp` rather than removing the flag.
+
+Shaders are architecture-independent SPIR-V and are shared with the 64-bit
+install — no second copy, nothing to drift out of sync.
+
 ---
 
 ## Verifying Setup
