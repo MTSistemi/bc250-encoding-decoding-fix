@@ -173,13 +173,36 @@ with SSH available throughout. The machine always reaches
 ## Board and repo operations
 
 - Board is `user@10.0.0.104`. Builds happen in `distrobox enter driver-build`.
-- `origin` (`simpmix/bc250-encoding-decoding-fix`, renamed from
-  `bc250-vcn-driver`) is now the shared development repo — collaborator
-  access granted 2026-09-13. Push there directly when asked. `fork`
-  (`Shalasere/bc250-vulkan-encode-stopgap`) is kept only as a personal
-  mirror/backup, not the primary remote anymore. `main` on `origin` has
-  **no branch protection** as of this writing — never force-push it, since
-  either collaborator doing so can silently erase the other's work.
+- **All work happens on `origin/shalasere`.** `origin` is
+  `simpmix/bc250-encoding-decoding-fix` (Mix's, renamed from
+  `bc250-vcn-driver`); collaborator access granted 2026-09-13, so this
+  branch lives in his repo, not in a fork. It is long-lived and personal —
+  the counterpart to Mix's own `simpmix` branch — not a per-change feature
+  branch, so **don't delete it after a merge**. Work accumulates here and
+  reaches `main` when Mix merges it.
+
+  Chosen over a fork 2026-09-13: Mix can push directly onto this branch to
+  help or take over, there's one source of truth, and there's no fork to
+  drift (the fork silently fell 17 commits behind while this file described
+  it as a backup). `fork` (`Shalasere/bc250-vulkan-encode-stopgap`) is now
+  only a backup mirror and the home of Shalasere's own release artifacts
+  (v0.2.1 through v0.3.2); `origin` carries no releases — Mix owns the real
+  release process.
+
+  - **Never commit to local `main`.** It is a clean mirror of `origin/main`.
+    With `remote.pushDefault=origin`, a stray `git push` while on `main`
+    lands straight in the shared tree.
+  - Keep `shalasere` current with `main`: `git fetch origin && git merge
+    origin/main` (or rebase while nothing is published on top). Mix pushes
+    to `origin/main` directly and often — every push this session needed a
+    fetch first.
+  - CI (`.github/workflows/build.yml`) runs on `pull_request` into `main`,
+    and on pushes to `main` only — so pushes to this branch are NOT
+    validated by CI. Open a PR when you want the full build, ctest, and
+    ffmpeg decode oracle to run against the work.
+  - `main` on `origin` has **no branch protection** as of this writing, so
+    nothing mechanically enforces any of the above. Never force-push `main`
+    — either collaborator doing so can silently erase the other's work.
 - **Repeatedly ssh'ing into the board during a long job crashes it**
   (systemd-logind exhaustion). Launch once, wait, read once.
 - `ssh -n` is mandatory (ssh in a pipeline eats stdin), and `-n` nulls stdin

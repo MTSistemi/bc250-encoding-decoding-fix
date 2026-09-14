@@ -10,6 +10,73 @@ if(ENABLE_DEBUG)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -fsanitize=address,undefined")
 endif()
 
+# 32-bit (i386) build, for 32-bit VA-API clients. Steam Link's runtime is
+# 32-bit and dlopen()s a 32-bit VA-API driver; a 64-bit bc250_drv_video.so is
+# simply invisible to it, so it falls back to software encoding with no useful
+# error (see issue #8). This produces the same driver, same filename, from the
+# same sources - only the architecture and the install directory differ, so a
+# machine can carry both side by side.
+#
+# Needs 32-bit libva/libdrm/vulkan-loader development packages present, AND a
+# SHARED 32-bit libgomp (see the -z text note below):
+#   Arch/CachyOS : lib32-libva lib32-libdrm lib32-vulkan-icd-loader lib32-gcc-libs
+#   Fedora       : libva-devel.i686 libdrm-devel.i686 vulkan-loader-devel.i686 glibc-devel.i686 libgomp.i686
+#   Debian/Ubuntu: gcc-multilib libva-dev:i386 libdrm-dev:i386 libvulkan-dev:i386 libgomp1:i386
+option(BUILD_32BIT "Build a 32-bit (i386) driver for 32-bit VA-API clients such as Steam Link" OFF)
+if(BUILD_32BIT)
+    # Must be set BEFORE any check_c_compiler_flag() below, so those probes
+    # test the combination actually being built rather than the 64-bit one.
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -m32")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -m32")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -m32")
+
+    # Refuse to produce a driver with text relocations. This is not pedantry:
+    # the whole point of the 32-bit build is Steam Link, which reaches this
+    # driver through dlopen(), and SELinux's deny_execmod denies dlopen() of a
+    # library carrying DT_TEXTREL. Such a build succeeds, installs, and then
+    # fails to load on exactly the target it was built for - a silent failure
+    # of the worst kind.
+    #
+    # Observed for real while adding this: on a multilib box with no SHARED
+    # 32-bit libgomp, -fopenmp quietly links the static libgomp.a, whose
+    # non-PIC objects drag in text relocations, and the only complaint is an
+    # easily-missed ld warning. -z text promotes that to a hard link error.
+    # If it fires, install the shared libgomp for your distro (listed above)
+    # rather than removing this flag.
+    #
+    # Both directions verified on real 32-bit builds, not assumed: with shared
+    # libgomp present the driver links clean under this flag and carries no
+    # DT_TEXTREL (NEEDED libgomp.so.1, i.e. dynamic); and the flag genuinely
+    # rejects a text-relocating object rather than passing it through
+    # ("read-only segment has dynamic relocations").
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,text")
+
+    # pkg-config must be pointed at the 32-bit .pc files. Left alone it
+    # cheerfully returns the 64-bit -L paths and the link then fails with
+    # "skipping incompatible ..." noise that doesn't name the real problem.
+    if(IS_DIRECTORY "/usr/lib32/pkgconfig")
+        set(ENV{PKG_CONFIG_LIBDIR} "/usr/lib32/pkgconfig:/usr/share/pkgconfig")
+    elseif(IS_DIRECTORY "/usr/lib/i386-linux-gnu/pkgconfig")
+        set(ENV{PKG_CONFIG_LIBDIR} "/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig")
+    elseif(IS_DIRECTORY "/usr/lib/pkgconfig" AND IS_DIRECTORY "/usr/lib64")
+        # Fedora/RHEL multilib: on a lib64-style distro /usr/lib IS the 32-bit
+        # tree (64-bit lives in /usr/lib64), so i686 .pc files land in
+        # /usr/lib/pkgconfig. Testing for /usr/lib64 rather than /usr/lib32 is
+        # the point - Fedora has no /usr/lib32 at all, and requiring one here
+        # rejected a working multilib container outright.
+        # Debian-multiarch is already handled above, so reaching this branch
+        # means we're not on one.
+        set(ENV{PKG_CONFIG_LIBDIR} "/usr/lib/pkgconfig:/usr/share/pkgconfig")
+    else()
+        message(FATAL_ERROR
+            "BUILD_32BIT=ON but no 32-bit pkgconfig directory was found "
+            "(looked for /usr/lib32/pkgconfig, /usr/lib/i386-linux-gnu/pkgconfig, "
+            "/usr/lib/pkgconfig). Install the 32-bit libva/libdrm/vulkan development "
+            "packages for your distro - see the comment above this check in CMakeLists.txt.")
+    endif()
+    message(STATUS "BUILD_32BIT: building i386 driver, PKG_CONFIG_LIBDIR=$ENV{PKG_CONFIG_LIBDIR}")
+endif()
+
 # Target-CPU codegen: this driver only ever runs on one exact piece of
 # silicon, the AMD BC-250 ("Cyan Skillfish", Zen 2) - see README. The
 # documented `-DCMAKE_BUILD_TYPE=Release` build leaves CMake's default
@@ -55,10 +122,22 @@ if(BC250_IS_TARGET_HW EQUAL 0)
 endif()
 
 # Find dependencies
-find_package(Vulkan REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBVA REQUIRED libva)
 pkg_check_modules(DRM REQUIRED libdrm)
+
+# Vulkan via pkg-config on a 32-bit build: CMake's FindVulkan searches the
+# host's 64-bit library paths (and $VULKAN_SDK) and will happily hand back
+# /usr/lib/libvulkan.so for an -m32 link. pkg-config is already pointed at the
+# 32-bit .pc files above, so it resolves the right one.
+if(BUILD_32BIT)
+    pkg_check_modules(VULKAN REQUIRED vulkan)
+    set(Vulkan_INCLUDE_DIRS ${VULKAN_INCLUDE_DIRS})
+    set(Vulkan_LIBRARIES ${VULKAN_LIBRARIES})
+    message(STATUS "BUILD_32BIT: Vulkan via pkg-config: ${VULKAN_LIBRARIES}")
+else()
+    find_package(Vulkan REQUIRED)
+endif()
 
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -154,7 +233,16 @@ target_link_libraries(bc250_drv_video
 
 # Installation paths
 if(NOT LIBVA_DRIVERS_PATH)
-    if(EXISTS "/usr/lib/x86_64-linux-gnu/dri")
+    if(BUILD_32BIT)
+        # A 32-bit driver MUST NOT land in the 64-bit DRI directory: libva
+        # picks by filename, so a wrong-arch bc250_drv_video.so there would
+        # shadow the working 64-bit one and break every 64-bit client.
+        if(EXISTS "/usr/lib/i386-linux-gnu/dri")
+            set(LIBVA_DRIVERS_PATH "/usr/lib/i386-linux-gnu/dri/")
+        else()
+            set(LIBVA_DRIVERS_PATH "/usr/lib32/dri/")
+        endif()
+    elseif(EXISTS "/usr/lib/x86_64-linux-gnu/dri")
         set(LIBVA_DRIVERS_PATH "/usr/lib/x86_64-linux-gnu/dri/")
     elseif(EXISTS "/usr/lib64/dri")
         set(LIBVA_DRIVERS_PATH "/usr/lib64/dri/")
@@ -163,6 +251,9 @@ if(NOT LIBVA_DRIVERS_PATH)
     endif()
 endif()
 
+# Architecture-independent: SPIR-V is the same bytes for both builds, so a
+# 32-bit and a 64-bit install share this one directory rather than each
+# shipping a copy that could drift out of sync with the other's .so.
 set(SHADER_INSTALL_PATH "${CMAKE_INSTALL_PREFIX}/share/bc250/shaders")
 
 install(TARGETS bc250_drv_video DESTINATION ${LIBVA_DRIVERS_PATH})
