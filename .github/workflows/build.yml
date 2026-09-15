@@ -188,3 +188,122 @@ jobs:
         files: bc250-driver-linux-x86_64.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 32-bit (i386) companion driver, for 32-bit VA-API clients - Steam Link's
+  # runtime is 32-bit and dlopen()s a 32-bit driver, so the x86_64 build above
+  # is invisible to it (issue #8). Installs alongside the 64-bit driver in a
+  # separate DRI directory; it is a companion, not a standalone install.
+  #
+  # needs: build is deliberate, not an oversight. Both jobs call
+  # action-gh-release on the same tag, and running them concurrently races on
+  # creating/updating that one release. Serializing costs ~1 minute on a
+  # workflow that takes under two, which is cheaper than a flaky release.
+  build32:
+    runs-on: ubuntu-22.04
+    needs: build
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install 32-bit build dependencies
+      run: |
+        sudo dpkg --add-architecture i386
+        sudo apt-get update
+        # libgomp1:i386 is not optional. Without a SHARED 32-bit libgomp,
+        # -fopenmp links the static libgomp.a, whose non-PIC objects leave the
+        # driver with DT_TEXTREL - which SELinux deny_execmod refuses to
+        # dlopen(), i.e. it would break in Steam Link specifically and nowhere
+        # else. CMake links -Wl,-z,text so that fails the build instead.
+        sudo apt-get install -y \
+          build-essential \
+          gcc-multilib \
+          cmake \
+          pkg-config \
+          glslang-tools \
+          libva-dev:i386 \
+          libdrm-dev:i386 \
+          libvulkan-dev:i386 \
+          libgomp1:i386
+
+    - name: Configure CMake (32-bit)
+      # Tests stay off here: the 64-bit job above already runs the full ctest
+      # suite and the ffmpeg decode oracle against identical sources, and the
+      # oracle would additionally need a 32-bit ffmpeg. This job exists to
+      # prove the i386 driver builds, links, and is loadable.
+      run: |
+        cmake -B build32 -S approach1-compute-encoder \
+              -DBUILD_32BIT=ON \
+              -DBUILD_TESTS=OFF \
+              -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build 32-bit Driver
+      run: cmake --build build32 --parallel $(nproc)
+
+    - name: Verify the artifact is actually i386 and loadable
+      # Asserting these rather than trusting the build: a 64-bit .so, or one
+      # carrying DT_TEXTREL, would both package and upload perfectly happily
+      # and then fail for the one consumer this job exists to serve.
+      run: |
+        SO=$(find build32 -name 'bc250_drv_video.so' | head -n 1)
+        if [ -z "$SO" ]; then echo "ERROR: no bc250_drv_video.so produced"; exit 1; fi
+        file "$SO"
+        readelf -h "$SO" | grep -E 'Class|Machine'
+
+        readelf -h "$SO" | grep -q 'ELF32' \
+          || { echo "ERROR: not ELF32 - a 64-bit driver here is useless to Steam Link"; exit 1; }
+        readelf -h "$SO" | grep -qi '80386' \
+          || { echo "ERROR: not i386"; exit 1; }
+
+        if readelf -d "$SO" | grep -q TEXTREL; then
+          echo "ERROR: DT_TEXTREL present - SELinux deny_execmod will refuse to dlopen() this."
+          echo "Cause is almost always a statically linked libgomp (missing libgomp1:i386)."
+          exit 1
+        fi
+        echo "OK: ELF32 i386, no text relocations"
+        objdump -p "$SO" | grep NEEDED
+
+    - name: Package 32-bit Bundle
+      run: |
+        mkdir -p dist32/bc250-driver-i386
+        SO=$(find build32 -name 'bc250_drv_video.so' | head -n 1)
+        cp "$SO" dist32/bc250-driver-i386/
+        cat > dist32/bc250-driver-i386/README-i386.txt <<'EOF'
+        32-bit (i386) BC-250 VA-API driver — companion to the 64-bit build.
+
+        For 32-bit VA-API clients; Steam Link is the reason this exists. Its
+        runtime is 32-bit and dlopen()s a 32-bit driver, so the x86_64 driver
+        is invisible to it and it silently falls back to software encoding.
+
+        This does NOT replace the 64-bit driver — install it alongside, into
+        the 32-bit DRI directory:
+
+            sudo install -Dm755 bc250_drv_video.so /usr/lib32/dri/bc250_drv_video.so
+            # Debian/Ubuntu multiarch: /usr/lib/i386-linux-gnu/dri/
+
+        Do NOT put it in the 64-bit DRI directory. libva selects by filename,
+        so a wrong-arch bc250_drv_video.so there shadows the working 64-bit
+        one and breaks every 64-bit client.
+
+        No shaders in this bundle on purpose: the SPIR-V is
+        architecture-independent and shared with the 64-bit install
+        (/usr/share/bc250/shaders). Install the x86_64 package first, or take
+        the shaders from it. A second copy here would only create something
+        that can drift against the other .so.
+        EOF
+        cd dist32
+        tar -czvf ../bc250-driver-linux-i386.tar.gz bc250-driver-i386/
+
+    - name: Upload 32-bit Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: bc250-driver-linux-i386
+        path: bc250-driver-linux-i386.tar.gz
+
+    - name: Publish 32-bit Driver to GitHub Release (Tags only)
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: bc250-driver-linux-i386.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
