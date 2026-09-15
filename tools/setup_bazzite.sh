@@ -148,7 +148,7 @@ $SUDO mkdir -p /etc/environment.d
 cat << 'EOF' | $SUDO tee /etc/environment.d/99-bc250.conf > /dev/null
 # AMD BC-250 VA-API Compute Driver Configuration (Bazzite)
 LIBVA_DRIVER_NAME=bc250
-LIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib64/dri:/usr/lib/dri
+LIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib64/dri:/usr/lib/dri:/usr/lib32/dri:/usr/lib/i386-linux-gnu/dri
 BC250_FAST_MODE=1
 BC250_SLICES_PER_FRAME=4
 BC250_SHADER_DIR=/usr/local/share/bc250/shaders
@@ -161,7 +161,7 @@ $SUDO mkdir -p /etc/profile.d
 cat << 'EOF' | $SUDO tee /etc/profile.d/bc250.sh > /dev/null
 # AMD BC-250 Driver Profile Settings
 export LIBVA_DRIVER_NAME=bc250
-export LIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib64/dri:/usr/lib/dri
+export LIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib64/dri:/usr/lib/dri:/usr/lib32/dri:/usr/lib/i386-linux-gnu/dri
 export BC250_FAST_MODE=1
 export BC250_SLICES_PER_FRAME=4
 export BC250_SHADER_DIR=/usr/local/share/bc250/shaders

@@ -257,6 +257,47 @@ endif()
 set(SHADER_INSTALL_PATH "${CMAKE_INSTALL_PREFIX}/share/bc250/shaders")
 
 install(TARGETS bc250_drv_video DESTINATION ${LIBVA_DRIVERS_PATH})
+
+# Refuse to leave a wrong-architecture driver in a DRI directory. libva selects
+# by filename, so an ELF64 bc250_drv_video.so sitting in a 32-bit DRI path (or
+# the reverse) produces no error anyone can see - it silently shadows the
+# correct driver and the client falls back to software encoding. Issue #14 was
+# reported as exactly that shape: "the install script seems to copy the 64bit
+# version to /usr/lib32/dri".
+#
+# Checked at install time rather than build time on purpose. The case that
+# actually goes wrong is a build tree whose configured architecture no longer
+# matches the binary in it, and a POST_BUILD check inside the BUILD_32BIT
+# branch cannot see that - if the cache says 64-bit, the check never runs.
+#
+# Reads the ELF class byte directly (offset 4: 01 = ELF32, 02 = ELF64) instead
+# of shelling out to readelf or file. Neither is guaranteed present - this
+# project's own Fedora build container ships without `file`.
+if(BUILD_32BIT)
+    set(BC250_EXPECT_ELF_CLASS "01")
+    set(BC250_EXPECT_ARCH_NAME "32-bit (ELF32)")
+else()
+    set(BC250_EXPECT_ELF_CLASS "02")
+    set(BC250_EXPECT_ARCH_NAME "64-bit (ELF64)")
+endif()
+
+install(CODE "
+    set(_bc250_so \"\$ENV{DESTDIR}${LIBVA_DRIVERS_PATH}/bc250_drv_video.so\")
+    if(EXISTS \"\${_bc250_so}\")
+        file(READ \"\${_bc250_so}\" _bc250_hdr HEX LIMIT 5)
+        string(SUBSTRING \"\${_bc250_hdr}\" 8 2 _bc250_class)
+        if(NOT _bc250_class STREQUAL \"${BC250_EXPECT_ELF_CLASS}\")
+            message(FATAL_ERROR
+                \"Refusing this install: \${_bc250_so} is not ${BC250_EXPECT_ARCH_NAME} \"
+                \"(ELF class byte 0x\${_bc250_class}). libva selects drivers by filename, so a \"
+                \"wrong-architecture driver in this directory silently shadows the correct one \"
+                \"and clients fall back to software encoding with no visible error. This almost \"
+                \"always means the build directory was configured for the other architecture - \"
+                \"delete it and reconfigure instead of reusing its CMake cache.\")
+        endif()
+        message(STATUS \"bc250: verified installed driver is ${BC250_EXPECT_ARCH_NAME}\")
+    endif()
+")
 if(SPV_OUTPUTS)
     install(FILES ${SPV_OUTPUTS} DESTINATION ${SHADER_INSTALL_PATH})
 endif()

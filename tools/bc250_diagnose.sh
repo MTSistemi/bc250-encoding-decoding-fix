@@ -111,7 +111,13 @@ fi
 # 4. VA-API Capabilities & Benchmark
 echo -e "\n${BOLD}[4/5] Testing VA-API Driver & Running Encode Benchmark...${NC}"
 export LIBVA_DRIVER_NAME=bc250
-export LIBVA_DRIVERS_PATH="/var/lib/bc250/dri:/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri"
+# 32-bit paths are at the END on purpose. A 64-bit client walks the list and
+# hits its driver in an early entry; a 32-bit client (Steam Link) fails to
+# dlopen the 64-bit ones - wrong ELF class, which libva skips silently - and
+# carries on to these. Mixed-arch lists are how multiarch distros ship this,
+# and omitting the 32-bit entries is what made the driver unfindable in
+# issue #14 even though it was installed.
+export LIBVA_DRIVERS_PATH="/var/lib/bc250/dri:/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri:/usr/lib32/dri:/usr/lib/i386-linux-gnu/dri"
 
 if command -v vainfo &> /dev/null; then
     if LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$LIBVA_DRIVERS_PATH" vainfo --display drm > /tmp/bc250_vainfo.log 2>&1; then
