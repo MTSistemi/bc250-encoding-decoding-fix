@@ -113,6 +113,58 @@ install — no second copy, nothing to drift out of sync.
 
 ---
 
+## What the installers change, and how to undo it
+
+Worth reading before you install, so nothing is a surprise afterwards.
+
+| What | Where | Why |
+|---|---|---|
+| `bc250_drv_video.so` | up to 8 DRI dirs (`/usr/lib64/dri`, `/usr/local/lib*/dri`, `/var/lib/bc250/dri`, `/usr/lib32/dri` …) | libva finds a driver by filename, and which dir it searches differs per distro |
+| `*.spv` shaders | `/usr/share/bc250/shaders`, `/usr/local/share/bc250/shaders`, `/var/lib/bc250/shaders` | the driver is useless without them; arch-independent, so shared by both builds |
+| `LIBVA_DRIVER_NAME=bc250`, `LIBVA_DRIVERS_PATH=…` | `/etc/environment.d/99-bc250.conf`, sometimes `/etc/profile.d/bc250.sh` or `/etc/environment` | how clients are told to use this driver at all |
+| `bc250-vaapi-boot-redirect.service` + `/etc/bc250-vaapi-redirect-apply.sh` | `/etc/systemd/system/` | **optional.** Re-points the system radeonsi VA-API slot at this driver each boot, for clients whose environment libva ignores |
+
+Nothing here touches GRUB, kernel arguments, the initramfs, `modprobe.d`, or
+`ld.so.conf` — **this project cannot stop a machine from booting.** The worst
+case from the optional boot unit is a display manager up to 45s late, with SSH
+available throughout; it is ordered late, capped by `TimeoutStartSec`, and
+wanted by `multi-user.target` rather than any early target.
+
+### The one tradeoff to know about
+
+`LIBVA_DRIVER_NAME=bc250` is written **system-wide**, and this driver
+advertises **encode only** — no decode entrypoints at all. So every VA-API
+client on the box (Firefox, Chromium, mpv, VLC) stops getting hardware video
+*decode* and silently falls back to software. Nothing errors; video just gets
+more expensive.
+
+If you'd rather not pay that, skip the system-wide file and set
+`LIBVA_DRIVER_NAME=bc250` only in the environment of the one app you want
+encoding — e.g. `systemctl --user edit <sunshine-unit>` and an
+`Environment=` line. You get the encoder without taking decode away from the
+whole desktop.
+
+### Undoing all of it
+
+```bash
+sudo ./tools/bc250_uninstall.sh --dry-run   # show exactly what would go, change nothing
+sudo ./tools/bc250_uninstall.sh             # remove it
+```
+
+It searches for what is actually present rather than trusting a manifest, so
+it also cleans up installs made before it existed, and it explains each item
+as it goes. It only removes what the installers create — a driver you placed
+by hand in `/opt/bc250-driver`, the `audio-fix` DKMS module (own uninstaller:
+`sudo ./audio-fix/uninstall_dkms.sh`), and anything you configured yourself
+are reported but left alone.
+
+If something goes wrong mid-install and you just want the encoder to stop
+being involved, the fastest single step is removing the env file and logging
+out — `sudo rm /etc/environment.d/99-bc250.conf`. Environment changes only
+affect newly started processes, so a re-login or reboot is needed either way.
+
+---
+
 ## Verifying Setup
 
 ```bash

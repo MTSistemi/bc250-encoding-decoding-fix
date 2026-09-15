@@ -208,3 +208,13 @@ echo -e "Run this once instead:"
 echo -e "  ${BOLD}sudo ./tools/install_vaapi_boot_redirect.sh${NC}"
 echo -e "(persists across reboots; ${GREEN}./tools/bc250_diagnose.sh${NC} will tell you"
 echo -e "explicitly if your running Sunshine needs this.)"
+
+echo
+echo -e "${BOLD}This changed your system in a few places.${NC} What, and how to undo it:"
+echo -e "  ${BOLD}sudo ./tools/bc250_uninstall.sh --dry-run${NC}   # list it, change nothing"
+echo -e "  ${BOLD}sudo ./tools/bc250_uninstall.sh${NC}             # remove it"
+echo -e "Note: LIBVA_DRIVER_NAME=bc250 was set ${BOLD}system-wide${NC}, and this driver is"
+echo -e "encode-only - so other apps lose hardware video ${BOLD}decode${NC} until it is removed."
+echo -e "To avoid that, delete /etc/environment.d/99-bc250.conf and set the variable"
+echo -e "only in the environment of the one app you want encoding. See README.md"
+echo -e "(\"What the installers change, and how to undo it\")."
