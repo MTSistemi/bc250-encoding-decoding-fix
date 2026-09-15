@@ -4014,3 +4014,12 @@ In §27 and §28, the HEVC encoder was equipped with P-frame RPS, leaky-bucket r
 - Added Step 13 validating runtime adaptation:
   - H.264 context: switched to 12 Mbps (100%), verified 12,000,000 bps; switched to 4 Mbps (75%), verified 3,000,000 bps; switched framerate to 120 fps and 60 fps.
   - HEVC context: switched to 15 Mbps (100%), verified 15,000,000 bps; switched to 5 Mbps (100%), verified 5,000,000 bps; switched framerate to 120 fps and 60 fps.
+
+### 30.3 Rate Control Precedence & Temporal Quantization Calibration
+1. **VA-API Parameter Application Precedence (`va_backend.c`)**:
+   - In `bc250_RenderPicture()`, when receiving `VAEncMiscParameterTypeRateControl`, `set_bitrate` is invoked before `set_qp`.
+   - `h264_encoder_set_bitrate()` triggers `rc_init()`, which initializes `rc.current_qp = rc_estimate_base_qp(...)`. Calling `set_bitrate` first ensures that an explicitly supplied `rc->initial_qp` directly sets `rc.current_qp` and `rc.base_qp` without being overwritten.
+2. **Temporal Quantization SAD Baseline Calibration (`test_hevc_encode.c`)**:
+   - Under lossy quantization (e.g., QP 27), unquantized source pixels differ slightly from reconstructed reference pixels (`prev_recon_y`), establishing a non-zero baseline temporal quantization distortion SAD even on static frames ($static\_sad > 0$).
+   - Calibrated test assertions in `test_multi_frame_gop()` to verify that static frames establish baseline quantization SAD and moving frames reliably produce higher motion SAD ($moving\_sad > static\_sad$).
+
