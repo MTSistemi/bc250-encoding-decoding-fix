@@ -131,6 +131,7 @@ static void test_multi_frame_gop(void) {
 
     int idr_bytes = 0;
     int static_p_bytes = 0;
+    uint32_t static_sad = 0;
 
     for (int frame = 0; frame < 30; frame++) {
         if (frame >= 15 && frame < 29) {
@@ -159,7 +160,14 @@ static void test_multi_frame_gop(void) {
             int expected_types[] = { 1 /* TRAIL_R */ };
             int ok = check_nal_sequence(out_buf, (size_t)written, expected_types, 1);
             assert(ok && "expected TRAIL_R P-slice NAL");
-            if (frame == 1) static_p_bytes = written;
+            if (frame == 1) {
+                static_p_bytes = written;
+                static_sad = hevc_encoder_get_last_frame_sad(enc);
+                assert(static_sad > 0 && "Static P-frame should measure baseline temporal quantization SAD");
+            } else if (frame == 16) {
+                uint32_t moving_sad = hevc_encoder_get_last_frame_sad(enc);
+                assert(moving_sad > static_sad && "Moving frame should have higher motion SAD than static baseline");
+            }
         }
     }
 

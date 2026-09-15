@@ -380,6 +380,139 @@ int main(void) {
     assert(hevc_c->coded_buf_id == hevc_coded_buf_id);
     printf("[PASS] HEVC VA-API parameter buffer passing and rate control verified\n");
 
+    /* 13. Test Dynamic Bitrate & Framerate Switching (H.264 & HEVC runtime adaptation) */
+    bc250_context *h264_c = &drv_data->contexts[context_id];
+    assert(h264_c->h264_enc != NULL);
+
+    /* (a) H.264 dynamic bitrate switching via VAEncMiscParameterTypeRateControl */
+    {
+        uint8_t h264_misc_mem[sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl)];
+        memset(h264_misc_mem, 0, sizeof(h264_misc_mem));
+        VAEncMiscParameterBuffer *m = (VAEncMiscParameterBuffer *)h264_misc_mem;
+        m->type = VAEncMiscParameterTypeRateControl;
+        VAEncMiscParameterRateControl *rc = (VAEncMiscParameterRateControl *)m->data;
+        rc->bits_per_second = 12000000;
+        rc->target_percentage = 100;
+        rc->initial_qp = 28;
+
+        VABufferID h264_rc_buf = VA_INVALID_ID;
+        status = ctx.vtable->vaCreateBuffer(&ctx, context_id, VAEncMiscParameterBufferType,
+                                            sizeof(h264_misc_mem), 1, h264_misc_mem, &h264_rc_buf);
+        assert(status == VA_STATUS_SUCCESS);
+        status = ctx.vtable->vaRenderPicture(&ctx, context_id, &h264_rc_buf, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(h264_encoder_get_bitrate(h264_c->h264_enc) == 12000000);
+        assert(h264_encoder_get_qp(h264_c->h264_enc) == 28);
+        ctx.vtable->vaDestroyBuffer(&ctx, h264_rc_buf);
+
+        /* Switch bitrate down to 4 Mbps with 75% target percentage -> 3,000,000 bps */
+        rc->bits_per_second = 4000000;
+        rc->target_percentage = 75;
+        rc->initial_qp = 32;
+        status = ctx.vtable->vaCreateBuffer(&ctx, context_id, VAEncMiscParameterBufferType,
+                                            sizeof(h264_misc_mem), 1, h264_misc_mem, &h264_rc_buf);
+        assert(status == VA_STATUS_SUCCESS);
+        status = ctx.vtable->vaRenderPicture(&ctx, context_id, &h264_rc_buf, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(h264_encoder_get_bitrate(h264_c->h264_enc) == 3000000);
+        assert(h264_encoder_get_qp(h264_c->h264_enc) == 32);
+        ctx.vtable->vaDestroyBuffer(&ctx, h264_rc_buf);
+    }
+
+    /* (b) H.264 dynamic framerate switching via VAEncMiscParameterTypeFrameRate */
+    {
+        uint8_t h264_fps_mem[sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterFrameRate)];
+        memset(h264_fps_mem, 0, sizeof(h264_fps_mem));
+        VAEncMiscParameterBuffer *m = (VAEncMiscParameterBuffer *)h264_fps_mem;
+        m->type = VAEncMiscParameterTypeFrameRate;
+        VAEncMiscParameterFrameRate *fr = (VAEncMiscParameterFrameRate *)m->data;
+        fr->framerate = (1 << 16) | 120; /* 120 / 1 = 120 fps */
+
+        VABufferID h264_fps_buf = VA_INVALID_ID;
+        status = ctx.vtable->vaCreateBuffer(&ctx, context_id, VAEncMiscParameterBufferType,
+                                            sizeof(h264_fps_mem), 1, h264_fps_mem, &h264_fps_buf);
+        assert(status == VA_STATUS_SUCCESS);
+        status = ctx.vtable->vaRenderPicture(&ctx, context_id, &h264_fps_buf, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(h264_encoder_get_fps(h264_c->h264_enc) == 120);
+        ctx.vtable->vaDestroyBuffer(&ctx, h264_fps_buf);
+
+        /* Switch back to 60 fps */
+        fr->framerate = (1 << 16) | 60;
+        status = ctx.vtable->vaCreateBuffer(&ctx, context_id, VAEncMiscParameterBufferType,
+                                            sizeof(h264_fps_mem), 1, h264_fps_mem, &h264_fps_buf);
+        assert(status == VA_STATUS_SUCCESS);
+        status = ctx.vtable->vaRenderPicture(&ctx, context_id, &h264_fps_buf, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(h264_encoder_get_fps(h264_c->h264_enc) == 60);
+        ctx.vtable->vaDestroyBuffer(&ctx, h264_fps_buf);
+    }
+
+    /* (c) HEVC dynamic bitrate switching via VAEncMiscParameterTypeRateControl */
+    {
+        uint8_t hevc_misc_mem[sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl)];
+        memset(hevc_misc_mem, 0, sizeof(hevc_misc_mem));
+        VAEncMiscParameterBuffer *m = (VAEncMiscParameterBuffer *)hevc_misc_mem;
+        m->type = VAEncMiscParameterTypeRateControl;
+        VAEncMiscParameterRateControl *rc = (VAEncMiscParameterRateControl *)m->data;
+        rc->bits_per_second = 15000000;
+        rc->target_percentage = 100;
+        rc->initial_qp = 20;
+
+        VABufferID hevc_rc_buf = VA_INVALID_ID;
+        status = ctx.vtable->vaCreateBuffer(&ctx, hevc_context_id, VAEncMiscParameterBufferType,
+                                            sizeof(hevc_misc_mem), 1, hevc_misc_mem, &hevc_rc_buf);
+        assert(status == VA_STATUS_SUCCESS);
+        status = ctx.vtable->vaRenderPicture(&ctx, hevc_context_id, &hevc_rc_buf, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(hevc_encoder_get_bitrate(hevc_c->hevc_enc) == 15000000);
+        assert(hevc_encoder_get_qp(hevc_c->hevc_enc) == 20);
+        ctx.vtable->vaDestroyBuffer(&ctx, hevc_rc_buf);
+
+        /* Switch bitrate to 5 Mbps */
+        rc->bits_per_second = 5000000;
+        rc->target_percentage = 100;
+        rc->initial_qp = 26;
+        status = ctx.vtable->vaCreateBuffer(&ctx, hevc_context_id, VAEncMiscParameterBufferType,
+                                            sizeof(hevc_misc_mem), 1, hevc_misc_mem, &hevc_rc_buf);
+        assert(status == VA_STATUS_SUCCESS);
+        status = ctx.vtable->vaRenderPicture(&ctx, hevc_context_id, &hevc_rc_buf, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(hevc_encoder_get_bitrate(hevc_c->hevc_enc) == 5000000);
+        assert(hevc_encoder_get_qp(hevc_c->hevc_enc) == 26);
+        ctx.vtable->vaDestroyBuffer(&ctx, hevc_rc_buf);
+    }
+
+    /* (d) HEVC dynamic framerate switching via VAEncMiscParameterTypeFrameRate */
+    {
+        uint8_t hevc_fps_mem[sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterFrameRate)];
+        memset(hevc_fps_mem, 0, sizeof(hevc_fps_mem));
+        VAEncMiscParameterBuffer *m = (VAEncMiscParameterBuffer *)hevc_fps_mem;
+        m->type = VAEncMiscParameterTypeFrameRate;
+        VAEncMiscParameterFrameRate *fr = (VAEncMiscParameterFrameRate *)m->data;
+        fr->framerate = (1 << 16) | 120;
+
+        VABufferID hevc_fps_buf = VA_INVALID_ID;
+        status = ctx.vtable->vaCreateBuffer(&ctx, hevc_context_id, VAEncMiscParameterBufferType,
+                                            sizeof(hevc_fps_mem), 1, hevc_fps_mem, &hevc_fps_buf);
+        assert(status == VA_STATUS_SUCCESS);
+        status = ctx.vtable->vaRenderPicture(&ctx, hevc_context_id, &hevc_fps_buf, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(hevc_encoder_get_fps(hevc_c->hevc_enc) == 120);
+        ctx.vtable->vaDestroyBuffer(&ctx, hevc_fps_buf);
+
+        /* Switch back to 60 fps */
+        fr->framerate = (1 << 16) | 60;
+        status = ctx.vtable->vaCreateBuffer(&ctx, hevc_context_id, VAEncMiscParameterBufferType,
+                                            sizeof(hevc_fps_mem), 1, hevc_fps_mem, &hevc_fps_buf);
+        assert(status == VA_STATUS_SUCCESS);
+        status = ctx.vtable->vaRenderPicture(&ctx, hevc_context_id, &hevc_fps_buf, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(hevc_encoder_get_fps(hevc_c->hevc_enc) == 60);
+        ctx.vtable->vaDestroyBuffer(&ctx, hevc_fps_buf);
+    }
+    printf("[PASS] Dynamic bitrate and framerate switching verified for H.264 and HEVC\n");
+
     /* Destroy HEVC parameter buffers and context */
     ctx.vtable->vaDestroyBuffer(&ctx, seq_buf_id);
     ctx.vtable->vaDestroyBuffer(&ctx, pic_buf_id);

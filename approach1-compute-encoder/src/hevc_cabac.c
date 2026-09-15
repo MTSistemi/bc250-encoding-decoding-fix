@@ -320,8 +320,21 @@ void hevc_cabac_code_pred_mode_flag(hevc_cabac_t *cb, int pred_mode) {
 }
 
 void hevc_cabac_code_merge_idx(hevc_cabac_t *cb, int merge_idx) {
-    /* Truncated Unary bin string for merge_idx == 0 is bin 0 with context 0 */
-    hevc_cabac_encode_bin(cb, HEVC_CTX_MERGE_IDX, (uint32_t)(merge_idx ? 1 : 0));
+    /* Truncated Unary (TU) binarization for merge_idx with cMax = 4:
+     * - bin 0 is context-coded with HEVC_CTX_MERGE_IDX (0 if merge_idx == 0, else 1)
+     * - bins 1..3 (if merge_idx > 0) are bypass-coded:
+     *   (merge_idx - 1) bypass 1s, followed by terminating bypass 0 if merge_idx < 4. */
+    if (merge_idx <= 0) {
+        hevc_cabac_encode_bin(cb, HEVC_CTX_MERGE_IDX, 0);
+        return;
+    }
+    hevc_cabac_encode_bin(cb, HEVC_CTX_MERGE_IDX, 1);
+    for (int i = 0; i < merge_idx - 1; i++) {
+        hevc_cabac_encode_bypass(cb, 1);
+    }
+    if (merge_idx < 4) {
+        hevc_cabac_encode_bypass(cb, 0);
+    }
 }
 
 void hevc_cabac_code_split_cu_flag(hevc_cabac_t *cb, int bin, int ctx_inc) {

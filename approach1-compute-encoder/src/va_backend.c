@@ -835,21 +835,21 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                         if (target_bps == 0) target_bps = rc->bits_per_second;
 
                         if (c->h264_enc) {
-                            if (rc->initial_qp > 0) {
-                                h264_encoder_set_qp(c->h264_enc, rc->initial_qp);
-                            }
                             if (rc->bits_per_second > 0) {
                                 h264_encoder_set_bitrate(c->h264_enc, target_bps);
                                 bool cbr_intent = (rc->target_percentage == 100) &&
                                                   !rc->rc_flags.bits.disable_bit_stuffing;
                                 h264_encoder_set_cbr_intent(c->h264_enc, cbr_intent);
                             }
-                        } else if (c->hevc_enc) {
                             if (rc->initial_qp > 0) {
-                                hevc_encoder_set_qp(c->hevc_enc, rc->initial_qp);
+                                h264_encoder_set_qp(c->h264_enc, rc->initial_qp);
                             }
+                        } else if (c->hevc_enc) {
                             if (rc->bits_per_second > 0) {
                                 hevc_encoder_set_bitrate(c->hevc_enc, target_bps);
+                            }
+                            if (rc->initial_qp > 0) {
+                                hevc_encoder_set_qp(c->hevc_enc, rc->initial_qp);
                             }
                         }
                     } else if (misc->type == VAEncMiscParameterTypeFrameRate && (c->h264_enc || c->hevc_enc)) {

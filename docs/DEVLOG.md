@@ -3949,3 +3949,77 @@ While Test 1 (`BitstreamTest`), Test 2 (`CavlcUnitTest`), Test 3 (`VaApiDriverTe
    - Added rich diagnostic printfs before every assertion to log exact NAL counts (`AUD`, `SPS`, `PPS`, `IDR`, `P`) and return codes on failure.
 3. **File Output Fallback**:
    - Added fallback to `/tmp/bc250_test_stream.*` if CWD is not writable in both `test_encode.c` and `test_hevc_encode.c`, logging a warning and safely validating bitstreams in-memory if disk access is prohibited.
+
+## 30. HEVC Integer-Pel Diamond Search, Spatial Merge Mode & Dynamic Bitrate Adaptation
+
+### 30.1 Problem Statement & Architectural Scope
+In §27 and §28, the HEVC encoder was equipped with P-frame RPS, leaky-bucket rate control, and zero-motion CU skip. However, two critical capabilities remained incomplete:
+1. **Zero-Motion Limitation on Fast-Motion Content**:
+   - The P-frame decision in `encoder_h265.c` only evaluated $(0, 0)$ SAD against the previous frame. Any block with real motion (camera pans, UI movements, gaming action) exceeded the skip threshold and fell back to full intra prediction (`MODE_INTRA`) with 4x4 intra DST/DCT transforms. This produced bitrate spikes and lost the compression benefits of temporal prediction on moving scenes.
+   - The rate control model in `encode_core()` passed `0` for temporal motion distortion (`rc_get_frame_qp(&encoder->rc, 0)`), depriving the rate controller of scene motion activity feedback.
+2. **Incomplete CABAC Merge Index Binarization**:
+   - `hevc_cabac_code_merge_idx()` only encoded bin 0 with context `HEVC_CTX_MERGE_IDX`. For `merge_idx > 0`, it emitted an invalid single-bin bitstream instead of the ITU-T H.265 Section 9.3.2.5 Truncated Unary (TU) binarization.
+3. **Lack of Runtime VA-API Bitrate & Framerate Dynamic Adaptation Testing**:
+   - While `va_backend.c` accepted `VAEncMiscParameterTypeRateControl` and `VAEncMiscParameterTypeFrameRate`, no integration test verified runtime parameter adaptation (mid-stream bitrate switches and framerate adjustments) across both H.264 and HEVC contexts.
+
+### 30.2 Technical Implementation
+
+#### A. Zero Chroma Drift Mathematical Invariant
+- In HEVC YUV 4:2:0:
+  - Luma motion vectors are in 1/4-pel units.
+  - Chroma motion vectors are in 1/8-pel units.
+  - Per ITU-T H.265 Section 8.5.3.2.9, $mvCL = mvL$.
+- For any even integer luma motion displacement $(dx, dy) = (2k_x, 2k_y)$:
+  - Luma displacement is $2k$ full pixels (no fractional interpolation error).
+  - Chroma displacement is $(2k \times 4) / 8 = k$ full chroma pixels.
+  - Fractional chroma phase is $(2k \times 4) \pmod 8 = 0$.
+  - The 4-tap HEVC chroma filter at phase 0 has coefficients $\{64, 0, 0, 0\}$ (ITU-T Table 8-2), which computes $(64 \times ref[x] + 32) \gg 6 = ref[x]$ with zero rounding error.
+- Restricting searched displacements to even integers guarantees **bit-identical** reconstruction between the encoder and standard HEVC decoders (such as FFmpeg) without drift over arbitrary GOP lengths.
+
+#### B. Hierarchical Integer-Pel Diamond Search (`encoder_h265.c`)
+- Implemented `compute_sad_8x8_luma()` and `compute_sad_4x4_chroma()`.
+- Implemented `hevc_motion_search_diamond_8x8()`:
+  - Evaluates $(0, 0)$ SAD first with early exit if $SAD \le 32$ (stationary background).
+  - Evaluates spatial predictors from Left ($A_1$) and Above ($B_1$) neighbors.
+  - Executes multi-step cross diamond search with steps 8, 4, 2 across $[-16, 16]$, clamped to frame bounds.
+  - Performs fine 8-point refinement around the best center at step 2.
+  - Accumulates `best_sad` into `encoder->last_frame_sad`.
+
+#### C. HEVC Spatial Merge Candidate Derivation & Skip Propagation
+- Implemented `derive_merge_candidates()` matching ITU-T H.265 Section 8.5.3.2.2:
+  - Candidate 0: $A_1$ (Left neighbor `cu_x - 1, cu_y + 7`).
+  - Candidate 1: $B_1$ (Above neighbor `cu_x + 7, cu_y - 1`), spatially pruned against $A_1$.
+  - Candidate 2: $B_0$ (Above-Right `cu_x + 8, cu_y - 1`), spatially pruned against $B_1$.
+  - Candidate 3: $A_0$ (Below-Left `cu_x - 1, cu_y + 8`), spatially pruned against $A_1$.
+  - Candidate 4: $B_2$ (Above-Left `cu_x - 1, cu_y - 1`), checked if spatial candidates $< 4$ and pruned against $A_1, B_1$.
+  - Appends zero motion vectors $(0, 0)$ to fill the 5-candidate list.
+- In `encode_cu()`:
+  - Evaluates candidate MVs in `cand_mvs`.
+  - If a candidate satisfies $SAD \le threshold$, the CU is coded as a **Skip CU** (`cu_skip_flag = 1`) with `hevc_cabac_code_merge_idx(cab, chosen_merge_idx)`.
+  - Reconstructs pixels from `prev_recon_*` using candidate displacement $(dx, dy)$ and records `cu_is_inter = 1`, `mv_x_map = dx * 4`, `mv_y_map = dy * 4`.
+  - Propagates spatial motion vectors to adjacent CUs covering moving objects.
+
+#### D. Truncated Unary Binarization in CABAC (`hevc_cabac.c`)
+- Updated `hevc_cabac_code_merge_idx()`:
+  - For `merge_idx == 0`: emits bin 0 (context-coded with `HEVC_CTX_MERGE_IDX`).
+  - For `merge_idx > 0`: emits bin 0 as 1 (context-coded), followed by $(merge\_idx - 1)$ bypass 1s, and a terminating bypass 0 if $merge\_idx < 4$.
+
+#### E. Rate Control Feedback & Getters
+- In `encode_core()`:
+  - Passes `is_idr ? 0 : encoder->last_frame_sad` to `rc_get_frame_qp()`, dynamically adjusting QP based on frame motion complexity.
+  - Added `hevc_encoder_get_last_frame_sad()`.
+  - Added `h264_encoder_get_bitrate()`, `h264_encoder_get_fps()`, and `h264_encoder_get_qp()`.
+
+#### F. VA-API Dynamic Bitrate & Framerate Test (`test_va_api.c`)
+- Added Step 13 validating runtime adaptation:
+  - H.264 context: switched to 12 Mbps (100%), verified 12,000,000 bps; switched to 4 Mbps (75%), verified 3,000,000 bps; switched framerate to 120 fps and 60 fps.
+  - HEVC context: switched to 15 Mbps (100%), verified 15,000,000 bps; switched to 5 Mbps (100%), verified 5,000,000 bps; switched framerate to 120 fps and 60 fps.
+
+### 30.3 Rate Control Precedence & Temporal Quantization Calibration
+1. **VA-API Parameter Application Precedence (`va_backend.c`)**:
+   - In `bc250_RenderPicture()`, when receiving `VAEncMiscParameterTypeRateControl`, `set_bitrate` is invoked before `set_qp`.
+   - `h264_encoder_set_bitrate()` triggers `rc_init()`, which initializes `rc.current_qp = rc_estimate_base_qp(...)`. Calling `set_bitrate` first ensures that an explicitly supplied `rc->initial_qp` directly sets `rc.current_qp` and `rc.base_qp` without being overwritten.
+2. **Temporal Quantization SAD Baseline Calibration (`test_hevc_encode.c`)**:
+   - Under lossy quantization (e.g., QP 27), unquantized source pixels differ slightly from reconstructed reference pixels (`prev_recon_y`), establishing a non-zero baseline temporal quantization distortion SAD even on static frames ($static\_sad > 0$).
+   - Calibrated test assertions in `test_multi_frame_gop()` to verify that static frames establish baseline quantization SAD and moving frames reliably produce higher motion SAD ($moving\_sad > static\_sad$).
+
