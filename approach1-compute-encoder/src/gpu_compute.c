@@ -5,6 +5,11 @@
  *
  * gpu_compute.c - Vulkan compute backend for AMD BC-250 encoding
  */
+/* Required for dladdr()/Dl_info (glibc guards both behind __USE_GNU), used by
+ * driver_install_dir() to find the shaders installed beside this .so. Must
+ * precede every include. Safe project-wide-inconsistent because nothing in
+ * src/ uses the functions _GNU_SOURCE redefines (strerror_r, basename). */
+#define _GNU_SOURCE
 #include "gpu_compute.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +17,8 @@
 #include <errno.h>
 #include <time.h>
 #include <unistd.h>
+#include <limits.h>
+#include <dlfcn.h>
 #include <sys/ioctl.h>
 #include <linux/dma-buf.h>
 
@@ -502,6 +509,53 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     return 0;
 }
 
+/* Address anchor: any symbol inside this .so works for dladdr(). */
+static const char bc250_module_anchor = 0;
+
+/*
+ * Absolute directory this driver .so was actually installed into, resolved
+ * once on first use. Empty string if it can't be determined.
+ *
+ * Every install script ships the .spv shaders next to bc250_drv_video.so,
+ * but the fixed search list in load_spirv_shader() can't know where a given
+ * system put that - and when none of those fixed paths exist, the driver
+ * loads, advertises H.264 encode, and then cannot encode anything. That is
+ * not hypothetical: observed on the dev board with the driver at
+ * /opt/bc250-driver, all nine shaders sitting right beside it, every fixed
+ * search path absent, and BC250_SHADER_DIR unset.
+ *
+ * realpath() here is load-bearing, not tidiness. libva dlopen()s this
+ * driver through /usr/lib64/dri/radeonsi_drv_video.so, which on every
+ * install is a SYMLINK to the real install directory, and dladdr() reports
+ * the path the object was opened by - not the link target. Using dli_fname
+ * unresolved yields /usr/lib64/dri, where the shaders are not, silently
+ * defeating the entire point of looking here.
+ */
+static const char *driver_install_dir(void)
+{
+    static char dir[PATH_MAX];
+    static int resolved;
+
+    if (!resolved) {
+        Dl_info info;
+        char real_path[PATH_MAX];
+
+        resolved = 1;
+        dir[0] = '\0';
+
+        if (dladdr(&bc250_module_anchor, &info) && info.dli_fname &&
+            realpath(info.dli_fname, real_path)) {
+            char *slash = strrchr(real_path, '/');
+            if (slash && slash != real_path) {
+                *slash = '\0';
+                snprintf(dir, sizeof(dir), "%s", real_path);
+            }
+        }
+    }
+
+    return dir;
+}
+
 static VkShaderModule load_spirv_shader(VkDevice device, const char *filename) {
     const char *search_paths[] = {
         "/var/lib/bc250/shaders",
@@ -516,12 +570,26 @@ static VkShaderModule load_spirv_shader(VkDevice device, const char *filename) {
     };
 
     FILE *f = NULL;
-    char full_path[512];
+    char full_path[PATH_MAX];
 
     const char *env_dir = getenv("BC250_SHADER_DIR");
     if (env_dir && env_dir[0] != '\0') {
         snprintf(full_path, sizeof(full_path), "%s/%s", env_dir, filename);
         f = fopen(full_path, "rb");
+    }
+
+    /* Beside the .so itself, before the fixed list: this is where every
+     * install script actually puts the shaders. See driver_install_dir(). */
+    if (!f) {
+        const char *own_dir = driver_install_dir();
+        if (own_dir[0] != '\0') {
+            snprintf(full_path, sizeof(full_path), "%s/%s", own_dir, filename);
+            f = fopen(full_path, "rb");
+            if (!f) {
+                snprintf(full_path, sizeof(full_path), "%s/shaders/%s", own_dir, filename);
+                f = fopen(full_path, "rb");
+            }
+        }
     }
 
     if (!f) {

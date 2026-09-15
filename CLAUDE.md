@@ -108,6 +108,19 @@ the errors below.
 - **Ship shaders with the `.so`.** New C against old SPIR-V is silent wrong
   output, not a load error. Use `make -j12` (the `all` target);
   `make bc250_drv_video` does **not** rebuild `compile_shaders`.
+  `load_spirv_shader()` now actually implements "beside the `.so`" - it
+  resolves its own install directory with `dladdr()` + `realpath()` and looks
+  there first (after `BC250_SHADER_DIR`). The `realpath()` is required, not
+  cosmetic: libva opens this driver through the
+  `radeonsi_drv_video.so` symlink, and `dladdr()` reports the path it was
+  opened by, so the unresolved value points at the symlink's directory where
+  no shaders live. Before this, a driver installed anywhere outside the fixed
+  search list loaded, advertised H.264 encode, and could not encode - seen on
+  the dev board with all nine `.spv` sitting right next to the `.so`.
+  **Never put a second copy of the shaders in an earlier search path**
+  (`/var/lib/bc250/shaders` et al) - it will outrank the real install and go
+  stale on the next driver update, which is exactly the silent-wrong-output
+  case above. Symlink those paths at the install dir instead.
 - **Memory: ~7.95 GiB of GART/GTT** (Vulkan heaps 2.65 + 5.30 GiB), *not* the
   512 MB `mem_info_vram_total`. Unified-memory APU, no fast-VRAM tier, and the
   carve-out is neither raisable nor worth raising. Read `vulkaninfo` heaps, not
@@ -119,11 +132,77 @@ the errors below.
   `LD_PRELOAD`-into-`AT_SECURE` technique only; it costs ~40% of frame rate.
   §17
 
+## Boot safety — this project must never be able to brick a boot
+
+This repo installs exactly one systemd unit
+(`tools/bc250-vaapi-boot-redirect.service`) and touches **no** grub config,
+kernel args, dracut/initramfs, `modprobe.d`, or `ld.so.conf` — deliberately.
+Everything else it writes is `/etc/environment.d/99-bc250.conf` (plain env
+vars) and one symlink in `/usr/lib64/dri`, neither of which is boot-critical.
+**Keep it that way.** If a change would add a second unit or touch any of the
+above, that is a different class of risk and needs to be justified explicitly.
+
+The unit follows rules learned from a real incident on the dev board — a
+sibling unit from the separate VCN-hardware project (`amdgpu-vcn-early.
+service`) used `DefaultDependencies=no` + `Before=<early target>`, hung
+`local-fs-pre.target` for 45s every boot, and needed a live USB to recover.
+Our unit had the same shape and was masked alongside it. The rules:
+
+- **Never `DefaultDependencies=no`** — it also drops `Before=shutdown.target`,
+  so the unit can hang shutdown too.
+- **Never order `Before=` an early target** (`sysinit.target`,
+  `basic.target`, `local-fs-pre.target`, `systemd-udevd.service`). This unit's
+  work calls `rpm-ostree`, which is a D-Bus client; ordering a unit that can
+  block ahead of the target that brings up the thing it blocks on is how a
+  machine becomes unbootable. `WantedBy=multi-user.target`, ordered only
+  `Before=display-manager.service graphical.target`.
+- **Always set `TimeoutStartSec=`**, and wrap any command that talks to a
+  daemon in `timeout`. Unbounded blocking at boot is the actual failure mode;
+  a failed unit is harmless, a hung one is not.
+- **Validate before enabling.** `install_vaapi_boot_redirect.sh` runs
+  `systemd-analyze verify` and test-starts the unit before `systemctl enable`,
+  so a broken unit is an error message rather than a surprise at next boot.
+- **`tools/uninstall_vaapi_boot_redirect.sh` is the documented escape hatch**;
+  `systemctl mask bc250-vaapi-boot-redirect.service` is the fast one from a
+  rescue shell.
+
+Worst case by construction: the display manager starts up to 45s late, once,
+with SSH available throughout. The machine always reaches
+`multi-user.target`.
+
 ## Board and repo operations
 
 - Board is `user@10.0.0.104`. Builds happen in `distrobox enter driver-build`.
-- **Never push to `origin`** (upstream `simpmix/bc250-vcn-driver`). Only
-  `fork` (`Shalasere/bc250-vulkan-encode-stopgap`), and only when asked.
+- **All work happens on `origin/shalasere`.** `origin` is
+  `simpmix/bc250-encoding-decoding-fix` (Mix's, renamed from
+  `bc250-vcn-driver`); collaborator access granted 2026-09-13, so this
+  branch lives in his repo, not in a fork. It is long-lived and personal —
+  the counterpart to Mix's own `simpmix` branch — not a per-change feature
+  branch, so **don't delete it after a merge**. Work accumulates here and
+  reaches `main` when Mix merges it.
+
+  Chosen over a fork 2026-09-13: Mix can push directly onto this branch to
+  help or take over, there's one source of truth, and there's no fork to
+  drift (the fork silently fell 17 commits behind while this file described
+  it as a backup). `fork` (`Shalasere/bc250-vulkan-encode-stopgap`) is now
+  only a backup mirror and the home of Shalasere's own release artifacts
+  (v0.2.1 through v0.3.2); `origin` carries no releases — Mix owns the real
+  release process.
+
+  - **Never commit to local `main`.** It is a clean mirror of `origin/main`.
+    With `remote.pushDefault=origin`, a stray `git push` while on `main`
+    lands straight in the shared tree.
+  - Keep `shalasere` current with `main`: `git fetch origin && git merge
+    origin/main` (or rebase while nothing is published on top). Mix pushes
+    to `origin/main` directly and often — every push this session needed a
+    fetch first.
+  - CI (`.github/workflows/build.yml`) runs on `pull_request` into `main`,
+    and on pushes to `main` only — so pushes to this branch are NOT
+    validated by CI. Open a PR when you want the full build, ctest, and
+    ffmpeg decode oracle to run against the work.
+  - `main` on `origin` has **no branch protection** as of this writing, so
+    nothing mechanically enforces any of the above. Never force-push `main`
+    — either collaborator doing so can silently erase the other's work.
 - **Repeatedly ssh'ing into the board during a long job crashes it**
   (systemd-logind exhaustion). Launch once, wait, read once.
 - `ssh -n` is mandatory (ssh in a pipeline eats stdin), and `-n` nulls stdin
@@ -136,5 +215,14 @@ the errors below.
 
 ## Scope
 
-H.264 is real and validated. **H.265/HEVC is a non-functional stub** — do not
-enable it or extend it without reading `docs/hevc_scope_note.md`.
+H.264 is real and validated. **H.265/HEVC is no longer a stub** — it now has
+a real CABAC-coded encoder with GOP/P-frame prediction and zero-motion CU
+skip, wired into the VA-API backend (`VAProfileHEVCMain` advertised,
+config/rate-control attributes, CI decode-oracle test in
+`.github/workflows/build.yml`; DEVLOG §27–§28). It is still **not verified
+correct on generic content** — the last documented correctness pass found
+real, busy, multi-directional luma content still mismatches ffmpeg's decoder
+in ways not yet root-caused (`docs/hevc_scope_note.md`). Do not point real
+streaming clients at it, and read `docs/hevc_scope_note.md` in full before
+touching it further — it has the itemized bug list and the exact open
+failure mode.

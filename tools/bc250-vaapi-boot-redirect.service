@@ -1,29 +1,79 @@
 [Unit]
 Description=Redirect the system radeonsi VA-API driver slot to bc250_drv_video.so
 Documentation=file:///etc/bc250-vaapi-redirect-apply.sh
-DefaultDependencies=no
-Before=sysinit.target sddm.service
+
+# ===================================================================
+# BOOT SAFETY - read this before changing ANY line in this [Unit] block.
+#
+# An earlier version of this unit read:
+#
+#     DefaultDependencies=no
+#     Before=sysinit.target sddm.service
+#     After=local-fs.target
+#     ...
+#     [Install]
+#     WantedBy=sysinit.target
+#
+# That is a boot-hang pattern, and it is the same shape as a sibling unit
+# on the BC-250 dev board (amdgpu-vcn-early.service, from the separate
+# VCN-hardware project) which hung local-fs-pre.target for 45s on every
+# boot and eventually needed a live USB to recover. Three things were
+# wrong with it, and all three are deliberately fixed below:
+#
+#   1. DefaultDependencies=no opted this unit out of systemd's automatic
+#      ordering safety net - including Before=shutdown.target, so it could
+#      hang shutdown too. It is GONE. This unit takes the normal implicit
+#      After=sysinit.target/basic.target and Before=shutdown.target.
+#
+#   2. Before=sysinit.target meant sysinit.target could not complete until
+#      this unit finished - while this unit's own work calls rpm-ostree,
+#      which is a D-Bus client, and D-Bus is not reliably up that early.
+#      A unit that can block, ordered before the target that brings up the
+#      thing it blocks on, is how a machine becomes unbootable. This unit
+#      now runs late (after basic.target) and is ordered only before the
+#      display manager, which is all that was ever actually required -
+#      Sunshine lives in the graphical session, nothing in early boot
+#      needs a VA-API driver.
+#
+#   3. There was no timeout, so a block was unbounded. See TimeoutStartSec
+#      below.
+#
+# Worst case with the settings below: the display manager starts up to 45s
+# late, exactly once, and the machine is reachable over SSH the entire
+# time. The machine always reaches multi-user.target. It cannot hang boot.
+# ===================================================================
 After=local-fs.target
+Before=display-manager.service graphical.target
 
 [Service]
-# /usr on this ostree system is a fresh, read-only overlay every boot, so
-# both the usroverlay (to get a writable /usr at all) and the symlink swap
-# itself have to be redone here on every single boot - neither survives
-# from the previous one. See docs/DEVLOG.md ("boot persistence") for why
-# this can't just be a one-time fix.
 Type=oneshot
 RemainAfterExit=yes
-# usroverlay fails loudly (nonzero exit) if /usr is already unlocked -
-# expected and harmless if this unit ever runs twice in one boot, or if
-# something else already unlocked it. The "-" tells systemd not to treat
-# that as a failure of this unit.
-ExecStart=-/usr/bin/rpm-ostree usroverlay
-# The actual driver location varies by which installer was used
-# (build_and_install.sh / setup_bazzite.sh / setup_steamos.sh each pick a
-# different directory) - this script searches for it rather than assuming
-# one path. It lives in /etc, not /usr, because /etc survives the ostree
-# /usr-overlay reset above and /usr does not.
+
+# /usr on an ostree system is a fresh read-only overlay every boot, so the
+# symlink swap has to be redone on every single boot - it does not survive
+# from the previous one. The apply script handles getting a writable /usr
+# (and puts its own hard timeout around that rpm-ostree call). It also
+# searches for wherever the driver was actually installed rather than
+# assuming one path; see the script for why.
+#
+# It lives in /etc, not /usr, precisely because /usr is reset every boot.
 ExecStart=/etc/bc250-vaapi-redirect-apply.sh
 
+# Hard ceiling on how long this unit can delay anything, ever. Nothing it
+# does should take more than a second (a few stat() calls and one symlink);
+# the only call that can realistically block is rpm-ostree usroverlay, which
+# the script already wraps in `timeout 30`. 45s here leaves the script's own
+# inner timeout room to fire first and exit cleanly with a useful message,
+# rather than this unit being SIGTERMed mid-run.
+TimeoutStartSec=45
+
+# If this fails, it fails alone. It must never take anything else with it.
+SuccessExitStatus=0
+Restart=no
+
 [Install]
-WantedBy=sysinit.target
+# multi-user.target, NOT sysinit.target: this is late-boot cosmetic setup
+# for the graphical session, not early-boot infrastructure. A failure here
+# is a "VA-API encode doesn't work" problem, never a "machine won't boot"
+# problem, and this is the line that guarantees that distinction.
+WantedBy=multi-user.target
