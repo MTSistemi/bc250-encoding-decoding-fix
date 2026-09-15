@@ -21,6 +21,22 @@
 #include "encoder_h265.h"
 #include "decoder_h264.h"
 
+#ifndef VAConfigAttribEncQualityRange
+#define VAConfigAttribEncQualityRange 21
+#endif
+
+#ifndef VAEncMiscParameterTypeQualityLevel
+#define VAEncMiscParameterTypeQualityLevel 6
+#endif
+
+#ifndef VAEncMiscParameterTypeMaxFrameSize
+#define VAEncMiscParameterTypeMaxFrameSize 4
+#endif
+
+#ifndef VA_CODED_BUF_STATUS_FRAME_SIZE_OVERFLOW
+#define VA_CODED_BUF_STATUS_FRAME_SIZE_OVERFLOW (1 << 1)
+#endif
+
 #define MAX_PROFILES 16
 #define MAX_ENTRYPOINTS 16
 #define MAX_CONFIG_ATTRIBUTES 16

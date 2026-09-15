@@ -47,11 +47,20 @@ typedef struct {
      * See docs/DEVLOG.md §16. */
     uint64_t last_frame_ns;   /* CLOCK_MONOTONIC of previous rc_update_stats; 0 = none yet */
     double   measured_fps;    /* EMA of achieved frame rate, diagnostics only */
+
+    /* Max frame size constraint (bits) and Quality/Speed preset level (1..7) */
+    uint32_t max_frame_bits;  /* 0 = unconstrained */
+    uint32_t quality_level;   /* 1 = Highest quality, 4 = Balanced, 7 = Highest speed */
 } rate_control_t;
 
 void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
              uint32_t width, uint32_t height);
 int rc_get_frame_qp(rate_control_t *rc, uint64_t est_sad);
 void rc_update_stats(rate_control_t *rc, int bits_used);
+
+void rc_set_max_frame_size(rate_control_t *rc, uint32_t max_frame_bits);
+uint32_t rc_get_max_frame_size(const rate_control_t *rc);
+void rc_set_quality_level(rate_control_t *rc, uint32_t quality_level);
+uint32_t rc_get_quality_level(const rate_control_t *rc);
 
 #endif

@@ -305,6 +305,8 @@ struct hevc_encoder {
     int qp;
     int pps_init_qp;
     rate_control_t rc;
+    uint32_t quality_level;      /* 1..7 (1 = Quality, 4 = Balanced, 7 = Speed) */
+    uint32_t max_frame_bits;     /* Maximum frame size in bits (0 = unlimited) */
 
     /* Source (post-download, padded/replicated to coded dimensions) and
      * reconstructed planes. Luma at coded_w x coded_h; chroma at
@@ -368,6 +370,8 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     rc_init(&enc->rc, RC_CQP, bitrate, (double)enc->fps, width, height);
     enc->rc.current_qp = enc->qp;
     enc->rc.base_qp = enc->qp;
+    enc->quality_level = 4;
+    enc->max_frame_bits = 0;
 
     enc->gop_size = enc->fps;
     {
@@ -512,6 +516,34 @@ rc_mode_t hevc_encoder_get_rc_mode(const hevc_encoder_t *encoder)
 uint32_t hevc_encoder_get_last_frame_sad(const hevc_encoder_t *encoder)
 {
     return encoder ? encoder->last_frame_sad : 0;
+}
+
+void hevc_encoder_set_quality_level(hevc_encoder_t *encoder, uint32_t quality_level)
+{
+    if (encoder) {
+        if (quality_level < 1) quality_level = 1;
+        if (quality_level > 7) quality_level = 7;
+        encoder->quality_level = quality_level;
+        rc_set_quality_level(&encoder->rc, quality_level);
+    }
+}
+
+uint32_t hevc_encoder_get_quality_level(const hevc_encoder_t *encoder)
+{
+    return encoder ? encoder->quality_level : 4;
+}
+
+void hevc_encoder_set_max_frame_size(hevc_encoder_t *encoder, uint32_t max_frame_bits)
+{
+    if (encoder) {
+        encoder->max_frame_bits = max_frame_bits;
+        rc_set_max_frame_size(&encoder->rc, max_frame_bits);
+    }
+}
+
+uint32_t hevc_encoder_get_max_frame_size(const hevc_encoder_t *encoder)
+{
+    return encoder ? encoder->max_frame_bits : 0;
 }
 
 void hevc_encoder_destroy(hevc_encoder_t *encoder)
@@ -762,7 +794,8 @@ static void hevc_motion_search_diamond_8x8(const hevc_encoder_t *enc,
     uint32_t best_sad = sad0;
 
     /* Early exit if stationary background */
-    if (best_sad <= 32) {
+    uint32_t early_exit_sad = (enc && enc->quality_level >= 5) ? 64 : 32;
+    if (best_sad <= early_exit_sad) {
         *out_best_dx = 0;
         *out_best_dy = 0;
         *out_best_sad = best_sad;
@@ -820,23 +853,25 @@ static void hevc_motion_search_diamond_8x8(const hevc_encoder_t *enc,
     }
 
     /* 4. Fine 8-point refinement around best center at step 2 */
-    static const int refine_offsets[8][2] = {
-        { -2, -2 }, {  0, -2 }, {  2, -2 },
-        { -2,  0 },             {  2,  0 },
-        { -2,  2 }, {  0,  2 }, {  2,  2 }
-    };
-    for (int r = 0; r < 8; r++) {
-        int rx = best_dx + refine_offsets[r][0];
-        int ry = best_dy + refine_offsets[r][1];
-        if (rx >= min_dx && rx <= max_dx && ry >= min_dy && ry <= max_dy) {
-            uint32_t sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, rx, ry) +
-                           compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                  enc->prev_recon_cb, enc->prev_recon_cr,
-                                                  ccw, cx, cy, rx / 2, ry / 2);
-            if (sad < best_sad) {
-                best_sad = sad;
-                best_dx = rx;
-                best_dy = ry;
+    if (!(enc && enc->quality_level >= 5 && best_sad <= 96)) {
+        static const int refine_offsets[8][2] = {
+            { -2, -2 }, {  0, -2 }, {  2, -2 },
+            { -2,  0 },             {  2,  0 },
+            { -2,  2 }, {  0,  2 }, {  2,  2 }
+        };
+        for (int r = 0; r < 8; r++) {
+            int rx = best_dx + refine_offsets[r][0];
+            int ry = best_dy + refine_offsets[r][1];
+            if (rx >= min_dx && rx <= max_dx && ry >= min_dy && ry <= max_dy) {
+                uint32_t sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, rx, ry) +
+                               compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
+                                                      enc->prev_recon_cb, enc->prev_recon_cr,
+                                                      ccw, cx, cy, rx / 2, ry / 2);
+                if (sad < best_sad) {
+                    best_sad = sad;
+                    best_dx = rx;
+                    best_dy = ry;
+                }
             }
         }
     }
@@ -875,6 +910,9 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
         enc->last_frame_sad += best_sad;
 
         uint32_t threshold = 96 * (1 + (enc->qp / 8));
+        if (enc->quality_level >= 5) {
+            threshold = threshold * 3 / 2;
+        }
         static int s_skip_override = -2;
         if (s_skip_override == -2) {
             const char *env = getenv("BC250_HEVC_SKIP_THRESHOLD");

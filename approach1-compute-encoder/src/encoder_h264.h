@@ -188,6 +188,19 @@ void h264_encoder_set_qp(h264_encoder_t *encoder, int qp);
 int h264_encoder_get_qp(const h264_encoder_t *encoder);
 
 /**
+ * h264_encoder_set_quality_level - Set encoding quality/speed preset (1..7)
+ * 1 = Highest quality/slowest, 4 = Balanced, 7 = Highest speed/fastest
+ */
+void h264_encoder_set_quality_level(h264_encoder_t *encoder, uint32_t quality_level);
+uint32_t h264_encoder_get_quality_level(const h264_encoder_t *encoder);
+
+/**
+ * h264_encoder_set_max_frame_size - Set maximum frame size in bits (0 = unlimited)
+ */
+void h264_encoder_set_max_frame_size(h264_encoder_t *encoder, uint32_t max_frame_bits);
+uint32_t h264_encoder_get_max_frame_size(const h264_encoder_t *encoder);
+
+/**
  * h264_encoder_encode_raw - Encodes a raw NV12 image frame with pattern/content analysis
  * @encoder: Encoder context
  * @y_plane: Host pointer to Y plane data

@@ -108,6 +108,8 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
     rc->current_qp = base_qp;
     rc->prev_frame_sad = 0;
     rc->error_integral = 0;
+    rc->max_frame_bits = 0;
+    rc->quality_level = 4; /* Default: balanced */
     /* Wall-clock drain state: a re-init is a fresh bucket, so forget the
      * previous frame's timestamp rather than charging this frame for the
      * gap across the re-init (see rc_update_stats). */
@@ -192,8 +194,19 @@ int rc_get_frame_qp(rate_control_t *rc, uint64_t est_sad) {
         else if (complexity_ratio < 0.7) qp_adjust -= 2;
     }
 
-    /* Clamp maximum single-frame QP delta to prevent visual pulsation */
-    int max_step = (rc->mode == RC_LOW_LATENCY) ? 3 : 2;
+    /* Max frame size constraint: if per-frame budget is close to or exceeds max_frame_bits, bias QP higher */
+    if (rc->max_frame_bits > 0 && rc->target_bits_per_frame > 0) {
+        if (rc->target_bits_per_frame > rc->max_frame_bits) {
+            qp_adjust += 2;
+        } else if (rc->max_frame_bits < (rc->target_bits_per_frame * 3 / 2)) {
+            qp_adjust += 1;
+        }
+    }
+
+    /* Clamp maximum single-frame QP delta to prevent visual pulsation.
+     * In low latency mode or high-speed preset (quality_level >= 5), allow step of 3
+     * so rate control adapts promptly to high-motion scene bursts. */
+    int max_step = (rc->mode == RC_LOW_LATENCY || rc->quality_level >= 5) ? 3 : 2;
     int delta = (rc->base_qp + qp_adjust) - rc->current_qp;
     if (delta > max_step) delta = max_step;
     if (delta < -max_step) delta = -max_step;
@@ -283,3 +296,26 @@ void rc_update_stats(rate_control_t *rc, int bits_used) {
         rc->buffer_fullness = rc->buffer_size;
     }
 }
+
+void rc_set_max_frame_size(rate_control_t *rc, uint32_t max_frame_bits) {
+    if (rc) {
+        rc->max_frame_bits = max_frame_bits;
+    }
+}
+
+uint32_t rc_get_max_frame_size(const rate_control_t *rc) {
+    return rc ? rc->max_frame_bits : 0;
+}
+
+void rc_set_quality_level(rate_control_t *rc, uint32_t quality_level) {
+    if (rc) {
+        if (quality_level < 1) quality_level = 1;
+        if (quality_level > 7) quality_level = 7;
+        rc->quality_level = quality_level;
+    }
+}
+
+uint32_t rc_get_quality_level(const rate_control_t *rc) {
+    return rc ? rc->quality_level : 4;
+}
+

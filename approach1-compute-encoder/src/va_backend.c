@@ -115,6 +115,10 @@ VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEn
                  * HEVC uses 1 slice per picture. */
                 attrib_list[i].value = (profile == VAProfileHEVCMain) ? 1 : 16;
                 break;
+            case VAConfigAttribEncQualityRange:
+                /* Quality levels 1..7 (1 = High Quality, 4 = Balanced, 7 = High Speed) */
+                attrib_list[i].value = 7;
+                break;
 #if defined(VA_CHECK_VERSION)
 #if VA_CHECK_VERSION(1, 13, 0)
             case VAConfigAttribEncHEVCFeatures:
@@ -864,6 +868,23 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                                 hevc_encoder_set_fps(c->hevc_enc, num / den);
                             }
                         }
+                    } else if (misc->type == VAEncMiscParameterTypeQualityLevel && (c->h264_enc || c->hevc_enc)) {
+                        VAEncMiscParameterBufferQualityLevel *ql = (VAEncMiscParameterBufferQualityLevel*)misc->data;
+                        uint32_t level = ql->quality_level;
+                        if (level < 1) level = 1;
+                        if (level > 7) level = 7;
+                        if (c->h264_enc) {
+                            h264_encoder_set_quality_level(c->h264_enc, level);
+                        } else if (c->hevc_enc) {
+                            hevc_encoder_set_quality_level(c->hevc_enc, level);
+                        }
+                    } else if (misc->type == VAEncMiscParameterTypeMaxFrameSize && (c->h264_enc || c->hevc_enc)) {
+                        VAEncMiscParameterBufferMaxFrameSize *mfs = (VAEncMiscParameterBufferMaxFrameSize*)misc->data;
+                        if (c->h264_enc) {
+                            h264_encoder_set_max_frame_size(c->h264_enc, mfs->max_frame_size);
+                        } else if (c->hevc_enc) {
+                            hevc_encoder_set_max_frame_size(c->hevc_enc, mfs->max_frame_size);
+                        }
                     }
                 }
                 break;
@@ -953,6 +974,10 @@ static void bc250_finish_pending_frame(bc250_driver_data *data, bc250_context *c
         seg->size = (unsigned int)written;
         seg->bit_offset = 0;
         seg->status = 0;
+        uint32_t max_bits = h264_encoder_get_max_frame_size(c->h264_enc);
+        if (max_bits > 0 && ((uint64_t)written * 8) > max_bits) {
+            seg->status |= VA_CODED_BUF_STATUS_FRAME_SIZE_OVERFLOW;
+        }
         seg->reserved = 0;
         seg->buf = dest;
         seg->next = NULL;
@@ -1030,6 +1055,12 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
             seg->size = (unsigned int)written;
             seg->bit_offset = 0;
             seg->status = 0;
+            uint32_t max_bits = 0;
+            if (c->h264_enc) max_bits = h264_encoder_get_max_frame_size(c->h264_enc);
+            else if (c->hevc_enc) max_bits = hevc_encoder_get_max_frame_size(c->hevc_enc);
+            if (max_bits > 0 && ((uint64_t)written * 8) > max_bits) {
+                seg->status |= VA_CODED_BUF_STATUS_FRAME_SIZE_OVERFLOW;
+            }
             seg->reserved = 0;
             seg->buf = dest;
             seg->next = NULL;

@@ -4023,3 +4023,31 @@ In §27 and §28, the HEVC encoder was equipped with P-frame RPS, leaky-bucket r
    - Under lossy quantization (e.g., QP 27), unquantized source pixels differ slightly from reconstructed reference pixels (`prev_recon_y`), establishing a non-zero baseline temporal quantization distortion SAD even on static frames ($static\_sad > 0$).
    - Calibrated test assertions in `test_multi_frame_gop()` to verify that static frames establish baseline quantization SAD and moving frames reliably produce higher motion SAD ($moving\_sad > static\_sad$).
 
+## 31. Streaming Performance Optimization: Quality Presets & Max Frame Size Enforcement
+
+### 31.1 Field Feedback & Root Cause Analysis (Issue #10)
+Real-world hardware testing on AMD BC-250 (Sunshine host + Moonlight client streaming Red Dead Redemption 2 at 1080p60) yielded excellent baseline performance (0.00% frame drops, 0.00% jitter, ~10ms average host latency). However, three specific observations were recorded in Issue #10:
+1. **High-Motion Latency Peaks (>20ms)**:
+   - In scenes with dense foliage and cobblestones (Saint Denis), host processing latency peaked at 27-31ms under 100% GPU utilization.
+   - Root cause: GPU queue contention between 3D rendering and compute shaders, combined with every macroblock having non-zero residual coefficients requiring full transform and CAVLC/CABAC entropy coding.
+2. **"max_bitrate appears to be more of a guideline"**:
+   - Sunshine transmits `VAEncMiscParameterTypeMaxFrameSize` to enforce strict frame size bounds on network bursts. `va_backend.c` previously ignored this buffer.
+3. **"Hard pressed to tell the difference between any of the vaapi settings"**:
+   - Sunshine's `vaapi_quality = speed` queries `VAConfigAttribEncQualityRange`. The driver returned `VA_ATTRIB_NOT_SUPPORTED`, causing Sunshine/FFmpeg to fall back to default behavior with no preset differentiation.
+
+### 31.2 Technical Implementation
+1. **Quality Range Query & Presets (`va_backend.c`, `va_backend.h`)**:
+   - Advertised `VAConfigAttribEncQualityRange` returning 7 (levels 1..7: 1 = Quality, 4 = Balanced, 7 = Speed).
+   - Handled `VAEncMiscParameterTypeQualityLevel` in `bc250_RenderPicture()`, routing to `h264_encoder_set_quality_level()` and `hevc_encoder_set_quality_level()`.
+2. **Speed Preset Fast Paths**:
+   - **H.264 (`encoder_h264.c`)**: In high-speed mode (`quality_level >= 5`), when luma residual is zero and chroma residual has negligible DC distortion ($|\Delta| \le 1$), the macroblock is certified as `zero_chroma_residual`, enabling `P_Skip` and bypassing expensive chroma coefficient entropy coding.
+   - **HEVC (`encoder_h265.c`)**: Relaxed stationary early-exit SAD threshold from 32 to 64; skipped step 4 8-point refinement when candidate SAD $\le 96$; relaxed merge skip threshold by $1.5\times$, dramatically reducing compute and CABAC coding on moving scenes.
+   - **Rate Control (`rate_control.c`)**: Allowed single-frame QP step delta of 3 in speed mode (`quality_level >= 5`), ensuring agile reaction to high-motion scene bursts.
+3. **Max Frame Size Constraint (`va_backend.c`, `rate_control.c`)**:
+   - Handled `VAEncMiscParameterTypeMaxFrameSize` in `bc250_RenderPicture()`, storing `max_frame_bits`.
+   - In `rc_get_frame_qp()`, proactively biased QP higher when target frame bits approach or exceed `max_frame_bits`.
+   - In `bc250_EndPicture()` and `bc250_finish_pending_frame()`, set `seg->status |= VA_CODED_BUF_STATUS_FRAME_SIZE_OVERFLOW` if coded output exceeds `max_frame_bits`.
+4. **Validation (`test_va_api.c`)**:
+   - Step 14 validates `VAConfigAttribEncQualityRange == 7`, `VAEncMiscParameterTypeQualityLevel` (preset 7), and `VAEncMiscParameterTypeMaxFrameSize` across both H.264 and HEVC contexts.
+
+

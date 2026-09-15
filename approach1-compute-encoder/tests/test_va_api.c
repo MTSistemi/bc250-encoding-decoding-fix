@@ -513,6 +513,75 @@ int main(void) {
     }
     printf("[PASS] Dynamic bitrate and framerate switching verified for H.264 and HEVC\n");
 
+    /* 14. Test Quality Range / Level Presets and Max Frame Size Constraints */
+    {
+        VAConfigAttrib q_attrib = { .type = VAConfigAttribEncQualityRange, .value = 0 };
+        status = ctx.vtable->vaGetConfigAttributes(&ctx, VAProfileH264Main, VAEntrypointEncSlice, &q_attrib, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(q_attrib.value == 7 && "Driver must report 7 quality levels (1=Quality, 4=Balanced, 7=Speed)");
+
+        /* (a) H.264 Quality Level (speed preset = 7) */
+        uint8_t q_mem[sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterBufferQualityLevel)];
+        memset(q_mem, 0, sizeof(q_mem));
+        VAEncMiscParameterBuffer *m = (VAEncMiscParameterBuffer *)q_mem;
+        m->type = VAEncMiscParameterTypeQualityLevel;
+        VAEncMiscParameterBufferQualityLevel *ql = (VAEncMiscParameterBufferQualityLevel *)m->data;
+        ql->quality_level = 7;
+        VABufferID q_buf = VA_INVALID_ID;
+        status = ctx.vtable->vaCreateBuffer(&ctx, context_id, VAEncMiscParameterBufferType,
+                                            sizeof(q_mem), 1, q_mem, &q_buf);
+        assert(status == VA_STATUS_SUCCESS);
+        status = ctx.vtable->vaRenderPicture(&ctx, context_id, &q_buf, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(h264_encoder_get_quality_level(h264_c->h264_enc) == 7);
+        ctx.vtable->vaDestroyBuffer(&ctx, q_buf);
+
+        /* (b) H.264 Max Frame Size */
+        uint8_t mfs_mem[sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterBufferMaxFrameSize)];
+        memset(mfs_mem, 0, sizeof(mfs_mem));
+        m = (VAEncMiscParameterBuffer *)mfs_mem;
+        m->type = VAEncMiscParameterTypeMaxFrameSize;
+        VAEncMiscParameterBufferMaxFrameSize *mfs = (VAEncMiscParameterBufferMaxFrameSize *)m->data;
+        mfs->max_frame_size = 2500000;
+        VABufferID mfs_buf = VA_INVALID_ID;
+        status = ctx.vtable->vaCreateBuffer(&ctx, context_id, VAEncMiscParameterBufferType,
+                                            sizeof(mfs_mem), 1, mfs_mem, &mfs_buf);
+        assert(status == VA_STATUS_SUCCESS);
+        status = ctx.vtable->vaRenderPicture(&ctx, context_id, &mfs_buf, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(h264_encoder_get_max_frame_size(h264_c->h264_enc) == 2500000);
+        ctx.vtable->vaDestroyBuffer(&ctx, mfs_buf);
+
+        /* (c) HEVC Quality Level (speed preset = 7) */
+        memset(q_mem, 0, sizeof(q_mem));
+        m = (VAEncMiscParameterBuffer *)q_mem;
+        m->type = VAEncMiscParameterTypeQualityLevel;
+        ql = (VAEncMiscParameterBufferQualityLevel *)m->data;
+        ql->quality_level = 7;
+        status = ctx.vtable->vaCreateBuffer(&ctx, hevc_context_id, VAEncMiscParameterBufferType,
+                                            sizeof(q_mem), 1, q_mem, &q_buf);
+        assert(status == VA_STATUS_SUCCESS);
+        status = ctx.vtable->vaRenderPicture(&ctx, hevc_context_id, &q_buf, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(hevc_encoder_get_quality_level(hevc_c->hevc_enc) == 7);
+        ctx.vtable->vaDestroyBuffer(&ctx, q_buf);
+
+        /* (d) HEVC Max Frame Size */
+        memset(mfs_mem, 0, sizeof(mfs_mem));
+        m = (VAEncMiscParameterBuffer *)mfs_mem;
+        m->type = VAEncMiscParameterTypeMaxFrameSize;
+        mfs = (VAEncMiscParameterBufferMaxFrameSize *)m->data;
+        mfs->max_frame_size = 1800000;
+        status = ctx.vtable->vaCreateBuffer(&ctx, hevc_context_id, VAEncMiscParameterBufferType,
+                                            sizeof(mfs_mem), 1, mfs_mem, &mfs_buf);
+        assert(status == VA_STATUS_SUCCESS);
+        status = ctx.vtable->vaRenderPicture(&ctx, hevc_context_id, &mfs_buf, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        assert(hevc_encoder_get_max_frame_size(hevc_c->hevc_enc) == 1800000);
+        ctx.vtable->vaDestroyBuffer(&ctx, mfs_buf);
+    }
+    printf("[PASS] Quality level presets and max frame size constraints verified for H.264 and HEVC\n");
+
     /* Destroy HEVC parameter buffers and context */
     ctx.vtable->vaDestroyBuffer(&ctx, seq_buf_id);
     ctx.vtable->vaDestroyBuffer(&ctx, pic_buf_id);

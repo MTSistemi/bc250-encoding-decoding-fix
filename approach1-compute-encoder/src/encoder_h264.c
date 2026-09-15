@@ -128,6 +128,8 @@ struct h264_encoder {
     bool cbr_intent;             /* see h264_encoder_set_cbr_intent's doc comment */
     uint64_t last_frame_sad;     /* Sum of macroblock motion SAD from previous frame */
     int num_slices;              /* Configured slices per frame (1..16) */
+    uint32_t quality_level;      /* 1..7 (1 = Quality, 4 = Balanced, 7 = Speed) */
+    uint32_t max_frame_bits;     /* Maximum frame size in bits (0 = unlimited) */
 
     /* DPB */
     dpb_entry_t dpb[16];
@@ -1641,6 +1643,8 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
         int s = atoi(slice_env);
         if (s >= 1 && s <= 16) encoder->num_slices = s;
     }
+    encoder->quality_level = 4;
+    encoder->max_frame_bits = 0;
 
     /*
      * BUG FIX (found while wiring up CABAC's Main/High-profile auto-select -
@@ -1924,6 +1928,30 @@ void h264_encoder_set_qp(h264_encoder_t *encoder, int qp) {
 
 int h264_encoder_get_qp(const h264_encoder_t *encoder) {
     return encoder ? encoder->rc.current_qp : 0;
+}
+
+void h264_encoder_set_quality_level(h264_encoder_t *encoder, uint32_t quality_level) {
+    if (encoder) {
+        if (quality_level < 1) quality_level = 1;
+        if (quality_level > 7) quality_level = 7;
+        encoder->quality_level = quality_level;
+        rc_set_quality_level(&encoder->rc, quality_level);
+    }
+}
+
+uint32_t h264_encoder_get_quality_level(const h264_encoder_t *encoder) {
+    return encoder ? encoder->quality_level : 4;
+}
+
+void h264_encoder_set_max_frame_size(h264_encoder_t *encoder, uint32_t max_frame_bits) {
+    if (encoder) {
+        encoder->max_frame_bits = max_frame_bits;
+        rc_set_max_frame_size(&encoder->rc, max_frame_bits);
+    }
+}
+
+uint32_t h264_encoder_get_max_frame_size(const h264_encoder_t *encoder) {
+    return encoder ? encoder->max_frame_bits : 0;
 }
 
 /* Choose frame type and QP and put this frame's GPU work in flight without
@@ -2717,6 +2745,11 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
                 /* See mb_has_any_chroma_nonzero()'s doc comment: a P_Skip MB
                  * must have zero residual for chroma too, not just luma. */
                 bool zero_chroma_residual = (quant_levels && dc_coeff) ? (mb_has_any_chroma_nonzero(quant_levels, dc_coeff, nz_masks, mb) == 0) : true;
+                if (encoder->quality_level >= 5 && zero_luma_residual && !zero_chroma_residual && dc_coeff) {
+                    if (abs(dc_coeff[mb * 2 + 0]) <= 1 && abs(dc_coeff[mb * 2 + 1]) <= 1) {
+                        zero_chroma_residual = true;
+                    }
+                }
                 bool mv_matches_predictor = true;
                 if (mvs) {
                     int pred_x, pred_y;
@@ -2823,6 +2856,11 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
                      * MB must have zero residual for chroma too, not just
                      * luma. */
                     bool zero_chroma_residual = (quant_levels && dc_coeff) ? (mb_has_any_chroma_nonzero(quant_levels, dc_coeff, nz_masks, mb) == 0) : true;
+                    if (encoder->quality_level >= 5 && zero_luma_residual && !zero_chroma_residual && dc_coeff) {
+                        if (abs(dc_coeff[mb * 2 + 0]) <= 1 && abs(dc_coeff[mb * 2 + 1]) <= 1) {
+                            zero_chroma_residual = true;
+                        }
+                    }
                     bool mv_matches_predictor = true;
                     if (mvs) {
                         int pred_x, pred_y;
