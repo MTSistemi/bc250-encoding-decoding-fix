@@ -1,7 +1,7 @@
 /* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * Copyright (c) 2026 BC-250 Project
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-3.0-only
  *
  * va_backend.h - VA-API Driver Backend Interface for AMD BC-250
  */
@@ -13,6 +13,9 @@
 #include <va/va_enc_h264.h>
 #include <va/va_enc_hevc.h>
 #include <va/va_vpp.h>
+#include <va/va_drmcommon.h>
+#include <drm_fourcc.h>
+#include <pthread.h>
 #include "gpu_compute.h"
 #include "encoder_h264.h"
 #include "encoder_h265.h"
@@ -20,6 +23,8 @@
 
 #define MAX_PROFILES 16
 #define MAX_ENTRYPOINTS 16
+#define MAX_CONFIG_ATTRIBUTES 16
+#define MAX_IMAGE_FORMATS 8
 #define MAX_CONFIGS 256
 #define MAX_SURFACES 1024
 #define MAX_CONTEXTS 64
@@ -43,6 +48,17 @@ struct bc250_surface {
     gpu_image_t image;
     gpu_memory_t memory;
     int ref_count;
+    /* Set by bc250_DestroySurfaces() the moment the application asks to
+     * destroy this surface. From that point on the VASurfaceID is invalid
+     * for any further application-facing VA call (vaBeginPicture,
+     * vaDeriveImage, vaGetImage/vaPutImage, vaSyncSurface, ...), even
+     * though `allocated` may still be 1 and the underlying Vulkan
+     * image/memory may still be alive because a derived VAImage created via
+     * vaDeriveImage() is keeping ref_count above zero. This lets the
+     * driver honor normal VA-API surface-destroy semantics from the
+     * caller's point of view while still deferring the actual Vulkan
+     * teardown until the last outstanding derived image is destroyed. */
+    int pending_destroy;
 };
 
 struct bc250_config {
@@ -69,6 +85,23 @@ struct bc250_context {
     hevc_encoder_t *hevc_enc;
     h264_decoder_t *h264_dec;
 
+    /* BC250_PIPELINE=1 only: one frame whose GPU work is in flight and whose
+     * CPU entropy coding has not been done yet. At most one - the pipeline is
+     * deliberately bounded to a depth of 1, because the point is to overlap the
+     * CPU and GPU halves of adjacent frames, not to buffer a queue of frames
+     * (which would add latency to a live stream for no extra overlap).
+     *
+     * pending_coded_buf_id is the coded buffer the deferred finish must write
+     * into: by the time it runs, c->coded_buf_id has already moved on to the
+     * next frame's buffer. Getting this wrong would write frame N's bitstream
+     * into frame N+1's buffer, which decodes as plausible-looking garbage
+     * rather than failing loudly - the same shape of bug as the stale nonzero
+     * mask in DEVLOG 19.4, so it is the thing to check first if pipelined
+     * output ever looks subtly wrong. */
+    bool has_pending_frame;
+    h264_pending_frame_t pending_frame;
+    VABufferID pending_coded_buf_id;
+
     /* Codec parameters accumulated during vaRenderPicture */
     struct {
         VAEncSequenceParameterBufferH264 seq_param;
@@ -77,6 +110,17 @@ struct bc250_context {
         int has_seq;
         int has_pic;
         int has_slice;
+        /* Last target_percentage seen on a VAEncMiscParameterTypeRateControl
+         * buffer, so VAEncSequenceParameterBufferH264's own raw
+         * bits_per_second can be scaled the same way. ffmpeg's default
+         * h264_vaapi invocation sends the intended target X as "50% of 2X"
+         * in BOTH buffers, and the sequence-parameter path used to apply the
+         * raw 2X - re-initializing rate control at double the real target
+         * and undoing the misc path's correct scaling, since whichever
+         * buffer arrives last wins. See docs/DEVLOG.md §15 and
+         * docs/rate_control_audit.md §2. 0 means "none seen yet"; treated
+         * as 100% (no scaling). */
+        unsigned int rc_target_percentage;
     } h264_state;
 
     struct {
@@ -98,6 +142,12 @@ struct bc250_buffer {
     int mapped;
     int is_derived;
     VkDeviceMemory gpu_mem;
+    /* Only meaningful when is_derived is set: the surface whose Vulkan
+     * memory this buffer aliases (via vaDeriveImage()). Used to release
+     * the reference that buffer took on that surface when this buffer is
+     * torn down (bc250_DestroyBuffer). VA_INVALID_SURFACE when this slot
+     * does not currently back a derived image. */
+    VASurfaceID derived_surface;
 };
 
 struct bc250_image {
@@ -108,6 +158,7 @@ struct bc250_image {
 };
 
 typedef struct {
+    pthread_mutex_t lock;
     gpu_context_t gpu;
 
     bc250_surface surfaces[MAX_SURFACES];
@@ -119,6 +170,9 @@ typedef struct {
     int max_width;
     int max_height;
 } bc250_driver_data;
+
+#define DRIVER_LOCK(data)   pthread_mutex_lock(&(data)->lock)
+#define DRIVER_UNLOCK(data) pthread_mutex_unlock(&(data)->lock)
 
 /* Core VA-API Driver Functions */
 VAStatus __vaDriverInit_1_0(VADriverContextP ctx);
@@ -161,6 +215,23 @@ VAStatus bc250_DestroyImage(VADriverContextP ctx, VAImageID image);
 VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image);
 VAStatus bc250_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y, unsigned int width, unsigned int height, VAImageID image);
 VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image, int src_x, int src_y, unsigned int src_width, unsigned int src_height, int dest_x, int dest_y, unsigned int dest_width, unsigned int dest_height);
+VAStatus bc250_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id, uint32_t mem_type, uint32_t flags, void *descriptor);
+VAStatus bc250_SetImagePalette(VADriverContextP ctx, VAImageID image, unsigned char *palette);
+
+/* Subpictures (unsupported - stubs required by the libva driver contract) */
+VAStatus bc250_QuerySubpictureFormats(VADriverContextP ctx, VAImageFormat *format_list, unsigned int *flags, unsigned int *num_formats);
+VAStatus bc250_CreateSubpicture(VADriverContextP ctx, VAImageID image, VASubpictureID *subpicture);
+VAStatus bc250_DestroySubpicture(VADriverContextP ctx, VASubpictureID subpicture);
+VAStatus bc250_SetSubpictureImage(VADriverContextP ctx, VASubpictureID subpicture, VAImageID image);
+VAStatus bc250_SetSubpictureChromakey(VADriverContextP ctx, VASubpictureID subpicture, unsigned int chromakey_min, unsigned int chromakey_max, unsigned int chromakey_mask);
+VAStatus bc250_SetSubpictureGlobalAlpha(VADriverContextP ctx, VASubpictureID subpicture, float global_alpha);
+VAStatus bc250_AssociateSubpicture(VADriverContextP ctx, VASubpictureID subpicture, VASurfaceID *target_surfaces, int num_surfaces, short src_x, short src_y, unsigned short src_width, unsigned short src_height, short dest_x, short dest_y, unsigned short dest_width, unsigned short dest_height, unsigned int flags);
+VAStatus bc250_DeassociateSubpicture(VADriverContextP ctx, VASubpictureID subpicture, VASurfaceID *target_surfaces, int num_surfaces);
+
+/* Display attributes (unsupported - stubs required by the libva driver contract) */
+VAStatus bc250_QueryDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list, int *num_attributes);
+VAStatus bc250_GetDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list, int num_attributes);
+VAStatus bc250_SetDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list, int num_attributes);
 
 /* Video Processing (VPP) */
 VAStatus bc250_QueryVideoProcFilters(VADriverContextP ctx, VAContextID context, VAProcFilterType *filters, unsigned int *num_filters);
