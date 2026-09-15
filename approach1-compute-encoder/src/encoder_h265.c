@@ -317,6 +317,13 @@ struct hevc_encoder {
      * Size: (width_ctu * 2) * (height_ctu * 2). */
     uint8_t *cu_skip_map;
 
+    /* Inter prediction & motion vector maps (for spatial merge candidate derivation).
+     * Size: (width_ctu * 2) * (height_ctu * 2). MVs in 1/4-pel units. */
+    uint8_t *cu_is_inter;
+    int16_t *mv_x_map;
+    int16_t *mv_y_map;
+    uint32_t last_frame_sad;
+
     /* Real per-4x4-luma-PU intra mode, for MPM derivation - one entry per
      * 4x4 position, persistent scratch (positional availability checks
      * gate every read, so stale cross-frame content is never read - see
@@ -394,6 +401,9 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
 
     size_t num_cus = (size_t)(enc->width_ctu * 2) * (enc->height_ctu * 2);
     enc->cu_skip_map = calloc(num_cus, 1);
+    enc->cu_is_inter = calloc(num_cus, 1);
+    enc->mv_x_map = calloc(num_cus, sizeof(int16_t));
+    enc->mv_y_map = calloc(num_cus, sizeof(int16_t));
 
     enc->mode_map_stride = enc->coded_width / HEVC_PU_SIZE;
     enc->luma_mode_map = malloc((size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE));
@@ -410,7 +420,7 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     if (!enc->src_y || !enc->src_cb || !enc->src_cr ||
         !enc->recon_y || !enc->recon_cb || !enc->recon_cr ||
         !enc->prev_recon_y || !enc->prev_recon_cb || !enc->prev_recon_cr ||
-        !enc->cu_skip_map ||
+        !enc->cu_skip_map || !enc->cu_is_inter || !enc->mv_x_map || !enc->mv_y_map ||
         !enc->luma_mode_map || !enc->dl_y || !enc->dl_uv ||
         !enc->slice_rbsp || !enc->scratch_out) {
         hevc_encoder_destroy(enc);
@@ -499,6 +509,11 @@ rc_mode_t hevc_encoder_get_rc_mode(const hevc_encoder_t *encoder)
     return encoder ? encoder->rc.mode : RC_CQP;
 }
 
+uint32_t hevc_encoder_get_last_frame_sad(const hevc_encoder_t *encoder)
+{
+    return encoder ? encoder->last_frame_sad : 0;
+}
+
 void hevc_encoder_destroy(hevc_encoder_t *encoder)
 {
     if (!encoder) return;
@@ -506,6 +521,9 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
     free(encoder->recon_y); free(encoder->recon_cb); free(encoder->recon_cr);
     free(encoder->prev_recon_y); free(encoder->prev_recon_cb); free(encoder->prev_recon_cr);
     free(encoder->cu_skip_map);
+    free(encoder->cu_is_inter);
+    free(encoder->mv_x_map);
+    free(encoder->mv_y_map);
     free(encoder->luma_mode_map);
     free(encoder->dl_y); free(encoder->dl_uv);
     free(encoder->slice_rbsp);
@@ -541,6 +559,293 @@ static int any_nonzero16(const int16_t *c) {
     return 0;
 }
 
+typedef struct {
+    int16_t x;
+    int16_t y;
+} hevc_mv_t;
+
+static inline uint32_t compute_sad_8x8_luma(const uint8_t *src_y,
+                                            const uint8_t *ref_y,
+                                            uint32_t stride,
+                                            int cu_x, int cu_y,
+                                            int dx, int dy)
+{
+    uint32_t sad = 0;
+    const uint8_t *s = &src_y[cu_y * stride + cu_x];
+    const uint8_t *r = &ref_y[(cu_y + dy) * stride + (cu_x + dx)];
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            int diff = (int)s[x] - (int)r[x];
+            sad += (diff < 0) ? -diff : diff;
+        }
+        s += stride;
+        r += stride;
+    }
+    return sad;
+}
+
+static inline uint32_t compute_sad_4x4_chroma(const uint8_t *src_cb,
+                                              const uint8_t *src_cr,
+                                              const uint8_t *ref_cb,
+                                              const uint8_t *ref_cr,
+                                              uint32_t cstride,
+                                              int cx, int cy,
+                                              int cdx, int cdy)
+{
+    uint32_t sad = 0;
+    const uint8_t *scb = &src_cb[cy * cstride + cx];
+    const uint8_t *scr = &src_cr[cy * cstride + cx];
+    const uint8_t *rcb = &ref_cb[(cy + cdy) * cstride + (cx + cdx)];
+    const uint8_t *rcr = &ref_cr[(cy + cdy) * cstride + (cx + cdx)];
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            int dcb = (int)scb[x] - (int)rcb[x];
+            int dcr = (int)scr[x] - (int)rcr[x];
+            sad += (dcb < 0 ? -dcb : dcb) + (dcr < 0 ? -dcr : dcr);
+        }
+        scb += cstride;
+        scr += cstride;
+        rcb += cstride;
+        rcr += cstride;
+    }
+    return sad;
+}
+
+/* Derives spatial merge candidates matching ITU-T H.265 Section 8.5.3.2.2.
+ * Output cand_mvs has exactly 5 candidates (padded with (0,0)), in 1/4-pel units. */
+static int derive_merge_candidates(const hevc_encoder_t *enc,
+                                   int cux, int cuy,
+                                   hevc_mv_t cand_mvs[5])
+{
+    int num_cand = 0;
+    uint32_t w_cu = enc->width_ctu * 2;
+    uint32_t h_cu = enc->height_ctu * 2;
+    int cu_in_ctu = (cuy & 1) * 2 + (cux & 1); /* 0=TL, 1=TR, 2=BL, 3=BR */
+
+    hevc_mv_t spatial_cand[5];
+    int num_spatial = 0;
+
+    /* 1. Candidate A1 (Left): (cu_x - 1, cu_y + 7) -> CU (cux - 1, cuy) */
+    bool a1_avail = false;
+    hevc_mv_t mv_a1 = {0, 0};
+    if (cux > 0) {
+        uint32_t a1_idx = (uint32_t)cuy * w_cu + (uint32_t)(cux - 1);
+        if (enc->cu_is_inter[a1_idx]) {
+            a1_avail = true;
+            mv_a1.x = enc->mv_x_map[a1_idx];
+            mv_a1.y = enc->mv_y_map[a1_idx];
+            spatial_cand[num_spatial++] = mv_a1;
+        }
+    }
+
+    /* 2. Candidate B1 (Above): (cu_x + 7, cu_y - 1) -> CU (cux, cuy - 1) */
+    bool b1_avail = false;
+    hevc_mv_t mv_b1 = {0, 0};
+    if (cuy > 0) {
+        uint32_t b1_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)cux;
+        if (enc->cu_is_inter[b1_idx]) {
+            mv_b1.x = enc->mv_x_map[b1_idx];
+            mv_b1.y = enc->mv_y_map[b1_idx];
+            /* Pruning: B1 against A1 */
+            if (!a1_avail || mv_b1.x != mv_a1.x || mv_b1.y != mv_a1.y) {
+                b1_avail = true;
+                spatial_cand[num_spatial++] = mv_b1;
+            }
+        }
+    }
+
+    /* 3. Candidate B0 (Above-Right): (cu_x + 8, cu_y - 1) -> CU (cux + 1, cuy - 1) */
+    bool b0_avail = false;
+    hevc_mv_t mv_b0 = {0, 0};
+    bool b0_pos_avail = false;
+    if (cuy > 0 && (cux + 1) < (int)w_cu) {
+        if (cu_in_ctu != 3) {
+            b0_pos_avail = true;
+        }
+    }
+    if (b0_pos_avail) {
+        uint32_t b0_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)(cux + 1);
+        if (enc->cu_is_inter[b0_idx]) {
+            mv_b0.x = enc->mv_x_map[b0_idx];
+            mv_b0.y = enc->mv_y_map[b0_idx];
+            /* Pruning: B0 against B1 */
+            if (!b1_avail || mv_b0.x != mv_b1.x || mv_b0.y != mv_b1.y) {
+                b0_avail = true;
+                spatial_cand[num_spatial++] = mv_b0;
+            }
+        }
+    }
+
+    /* 4. Candidate A0 (Below-Left): (cu_x - 1, cu_y + 8) -> CU (cux - 1, cuy + 1) */
+    bool a0_avail = false;
+    hevc_mv_t mv_a0 = {0, 0};
+    bool a0_pos_avail = false;
+    if (cux > 0 && (cuy + 1) < (int)h_cu) {
+        if (cu_in_ctu == 0) {
+            a0_pos_avail = true;
+        }
+    }
+    if (a0_pos_avail) {
+        uint32_t a0_idx = (uint32_t)(cuy + 1) * w_cu + (uint32_t)(cux - 1);
+        if (enc->cu_is_inter[a0_idx]) {
+            mv_a0.x = enc->mv_x_map[a0_idx];
+            mv_a0.y = enc->mv_y_map[a0_idx];
+            /* Pruning: A0 against A1 */
+            if (!a1_avail || mv_a0.x != mv_a1.x || mv_a0.y != mv_a1.y) {
+                a0_avail = true;
+                spatial_cand[num_spatial++] = mv_a0;
+            }
+        }
+    }
+
+    /* 5. Candidate B2 (Above-Left): (cu_x - 1, cu_y - 1) -> CU (cux - 1, cuy - 1) */
+    if (num_spatial < 4 && cux > 0 && cuy > 0) {
+        uint32_t b2_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)(cux - 1);
+        if (enc->cu_is_inter[b2_idx]) {
+            hevc_mv_t mv_b2;
+            mv_b2.x = enc->mv_x_map[b2_idx];
+            mv_b2.y = enc->mv_y_map[b2_idx];
+            /* Pruning: B2 against A1 and B1 */
+            if ((!a1_avail || mv_b2.x != mv_a1.x || mv_b2.y != mv_a1.y) &&
+                (!b1_avail || mv_b2.x != mv_b1.x || mv_b2.y != mv_b1.y)) {
+                spatial_cand[num_spatial++] = mv_b2;
+            }
+        }
+    }
+
+    for (int i = 0; i < num_spatial && num_cand < 5; i++) {
+        cand_mvs[num_cand++] = spatial_cand[i];
+    }
+
+    while (num_cand < 5) {
+        cand_mvs[num_cand].x = 0;
+        cand_mvs[num_cand].y = 0;
+        num_cand++;
+    }
+
+    return num_cand;
+}
+
+/* Hierarchical integer-pel diamond search around (0,0) and spatial predictors.
+ * All tested displacements are even integers (2k) guaranteeing zero chroma drift. */
+static void hevc_motion_search_diamond_8x8(const hevc_encoder_t *enc,
+                                           int cu_x, int cu_y,
+                                           const hevc_mv_t *spatial_preds,
+                                           int num_spatial_preds,
+                                           int *out_best_dx, int *out_best_dy,
+                                           uint32_t *out_best_sad)
+{
+    uint32_t cw = enc->coded_width;
+    uint32_t ch = enc->coded_height;
+    uint32_t ccw = enc->coded_width / 2;
+    int cx = cu_x / 2, cy = cu_y / 2;
+
+    int min_dx = -16, max_dx = 16;
+    int min_dy = -16, max_dy = 16;
+    if (cu_x + min_dx < 0) min_dx = -cu_x;
+    if (cu_x + max_dx + 8 > (int)cw) max_dx = (int)cw - 8 - cu_x;
+    if (cu_y + min_dy < 0) min_dy = -cu_y;
+    if (cu_y + max_dy + 8 > (int)ch) max_dy = (int)ch - 8 - cu_y;
+
+    /* Ensure bounds are even integers for zero chroma drift */
+    if (min_dx & 1) min_dx++;
+    if (max_dx & 1) max_dx--;
+    if (min_dy & 1) min_dy++;
+    if (max_dy & 1) max_dy--;
+
+    /* 1. Evaluate (0, 0) */
+    uint32_t sad0 = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, 0, 0) +
+                    compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
+                                           enc->prev_recon_cb, enc->prev_recon_cr,
+                                           ccw, cx, cy, 0, 0);
+    int best_dx = 0, best_dy = 0;
+    uint32_t best_sad = sad0;
+
+    /* Early exit if stationary background */
+    if (best_sad <= 32) {
+        *out_best_dx = 0;
+        *out_best_dy = 0;
+        *out_best_sad = best_sad;
+        return;
+    }
+
+    /* 2. Evaluate spatial predictors */
+    for (int i = 0; i < num_spatial_preds; i++) {
+        int pdx = spatial_preds[i].x / 4;
+        int pdy = spatial_preds[i].y / 4;
+        pdx &= ~1;
+        pdy &= ~1;
+        if (pdx >= min_dx && pdx <= max_dx && pdy >= min_dy && pdy <= max_dy) {
+            uint32_t sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, pdx, pdy) +
+                           compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
+                                                  enc->prev_recon_cb, enc->prev_recon_cr,
+                                                  ccw, cx, cy, pdx / 2, pdy / 2);
+            if (sad < best_sad) {
+                best_sad = sad;
+                best_dx = pdx;
+                best_dy = pdy;
+            }
+        }
+    }
+
+    /* 3. Multi-step Diamond Search with steps 8, 4, 2 (all even offsets) */
+    static const int steps[3] = { 8, 4, 2 };
+    for (int s = 0; s < 3; s++) {
+        int step = steps[s];
+        bool improved = true;
+        int iter = 0;
+        while (improved && iter < 2) {
+            improved = false;
+            iter++;
+            static const int d_offsets[4][2] = {
+                { 0, -1 }, { -1, 0 }, { 1, 0 }, { 0, 1 }
+            };
+            for (int d = 0; d < 4; d++) {
+                int nx = best_dx + d_offsets[d][0] * step;
+                int ny = best_dy + d_offsets[d][1] * step;
+                if (nx >= min_dx && nx <= max_dx && ny >= min_dy && ny <= max_dy) {
+                    uint32_t sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, nx, ny) +
+                                   compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
+                                                          enc->prev_recon_cb, enc->prev_recon_cr,
+                                                          ccw, cx, cy, nx / 2, ny / 2);
+                    if (sad < best_sad) {
+                        best_sad = sad;
+                        best_dx = nx;
+                        best_dy = ny;
+                        improved = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /* 4. Fine 8-point refinement around best center at step 2 */
+    static const int refine_offsets[8][2] = {
+        { -2, -2 }, {  0, -2 }, {  2, -2 },
+        { -2,  0 },             {  2,  0 },
+        { -2,  2 }, {  0,  2 }, {  2,  2 }
+    };
+    for (int r = 0; r < 8; r++) {
+        int rx = best_dx + refine_offsets[r][0];
+        int ry = best_dy + refine_offsets[r][1];
+        if (rx >= min_dx && rx <= max_dx && ry >= min_dy && ry <= max_dy) {
+            uint32_t sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, rx, ry) +
+                           compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
+                                                  enc->prev_recon_cb, enc->prev_recon_cr,
+                                                  ccw, cx, cy, rx / 2, ry / 2);
+            if (sad < best_sad) {
+                best_sad = sad;
+                best_dx = rx;
+                best_dy = ry;
+            }
+        }
+    }
+
+    *out_best_dx = best_dx;
+    *out_best_dy = best_dy;
+    *out_best_sad = best_sad;
+}
+
 static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y, bool is_idr) {
     int qp = enc->qp;
     uint32_t cw = enc->coded_width, ch = enc->coded_height;
@@ -555,30 +860,19 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     int skip_ctx_inc = cond_l + cond_a;
 
     bool is_skip = false;
-    if (!is_idr && enc->has_ref) {
-        uint32_t sad_y = 0;
-        for (int y = 0; y < HEVC_CU_SIZE; y++) {
-            const uint8_t *s = &enc->src_y[(cu_y + y) * cw + cu_x];
-            const uint8_t *r = &enc->prev_recon_y[(cu_y + y) * cw + cu_x];
-            for (int x = 0; x < HEVC_CU_SIZE; x++) {
-                int d = (int)s[x] - (int)r[x];
-                sad_y += (d < 0) ? -d : d;
-            }
-        }
+    int chosen_merge_idx = 0;
+    int chosen_dx = 0, chosen_dy = 0;
 
-        uint32_t sad_c = 0;
-        int cx = cu_x / 2, cy = cu_y / 2;
-        for (int y = 0; y < HEVC_PU_SIZE; y++) {
-            const uint8_t *scb = &enc->src_cb[(cy + y) * ccw + cx];
-            const uint8_t *rcb = &enc->prev_recon_cb[(cy + y) * ccw + cx];
-            const uint8_t *scr = &enc->src_cr[(cy + y) * ccw + cx];
-            const uint8_t *rcr = &enc->prev_recon_cr[(cy + y) * ccw + cx];
-            for (int x = 0; x < HEVC_PU_SIZE; x++) {
-                int dcb = (int)scb[x] - (int)rcb[x];
-                int dcr = (int)scr[x] - (int)rcr[x];
-                sad_c += ((dcb < 0) ? -dcb : dcb) + ((dcr < 0) ? -dcr : dcr);
-            }
-        }
+    if (!is_idr && enc->has_ref) {
+        hevc_mv_t cand_mvs[5];
+        derive_merge_candidates(enc, cux, cuy, cand_mvs);
+
+        int best_dx = 0, best_dy = 0;
+        uint32_t best_sad = UINT32_MAX;
+        hevc_motion_search_diamond_8x8(enc, cu_x, cu_y, cand_mvs, 5,
+                                       &best_dx, &best_dy, &best_sad);
+
+        enc->last_frame_sad += best_sad;
 
         uint32_t threshold = 96 * (1 + (enc->qp / 8));
         static int s_skip_override = -2;
@@ -590,28 +884,66 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             threshold = (uint32_t)s_skip_override;
         }
 
-        if (sad_y + sad_c <= threshold) {
+        /* Evaluate candidates in cand_mvs to find the best merge candidate */
+        int best_cand_idx = -1;
+        uint32_t best_cand_sad = UINT32_MAX;
+        int cx = cu_x / 2, cy = cu_y / 2;
+
+        for (int i = 0; i < 5; i++) {
+            int c_dx = cand_mvs[i].x / 4;
+            int c_dy = cand_mvs[i].y / 4;
+            if (cu_x + c_dx >= 0 && cu_x + c_dx + 8 <= (int)cw &&
+                cu_y + c_dy >= 0 && cu_y + c_dy + 8 <= (int)ch) {
+                uint32_t c_sad;
+                if (c_dx == best_dx && c_dy == best_dy) {
+                    c_sad = best_sad;
+                } else if (c_dx == 0 && c_dy == 0) {
+                    c_sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, 0, 0) +
+                            compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
+                                                   enc->prev_recon_cb, enc->prev_recon_cr,
+                                                   ccw, cx, cy, 0, 0);
+                } else {
+                    c_sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, c_dx, c_dy) +
+                            compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
+                                                   enc->prev_recon_cb, enc->prev_recon_cr,
+                                                   ccw, cx, cy, c_dx / 2, c_dy / 2);
+                }
+                if (c_sad < best_cand_sad) {
+                    best_cand_sad = c_sad;
+                    best_cand_idx = i;
+                }
+            }
+        }
+
+        if (best_cand_idx >= 0 && best_cand_sad <= threshold) {
             is_skip = true;
+            chosen_merge_idx = best_cand_idx;
+            chosen_dx = cand_mvs[best_cand_idx].x / 4;
+            chosen_dy = cand_mvs[best_cand_idx].y / 4;
         }
     }
 
     if (is_skip) {
         enc->cu_skip_map[cu_idx] = 1;
+        enc->cu_is_inter[cu_idx] = 1;
+        enc->mv_x_map[cu_idx] = (int16_t)(chosen_dx * 4);
+        enc->mv_y_map[cu_idx] = (int16_t)(chosen_dy * 4);
         hevc_cabac_code_cu_skip_flag(cab, 1, skip_ctx_inc);
-        hevc_cabac_code_merge_idx(cab, 0);
+        hevc_cabac_code_merge_idx(cab, chosen_merge_idx);
 
         for (int y = 0; y < HEVC_CU_SIZE; y++) {
             memcpy(&enc->recon_y[(cu_y + y) * cw + cu_x],
-                   &enc->prev_recon_y[(cu_y + y) * cw + cu_x],
+                   &enc->prev_recon_y[(cu_y + chosen_dy + y) * cw + (cu_x + chosen_dx)],
                    HEVC_CU_SIZE);
         }
         int cx = cu_x / 2, cy = cu_y / 2;
+        int cdx = chosen_dx / 2, cdy = chosen_dy / 2;
         for (int y = 0; y < HEVC_PU_SIZE; y++) {
             memcpy(&enc->recon_cb[(cy + y) * ccw + cx],
-                   &enc->prev_recon_cb[(cy + y) * ccw + cx],
+                   &enc->prev_recon_cb[(cy + cdy + y) * ccw + (cx + cdx)],
                    HEVC_PU_SIZE);
             memcpy(&enc->recon_cr[(cy + y) * ccw + cx],
-                   &enc->prev_recon_cr[(cy + y) * ccw + cx],
+                   &enc->prev_recon_cr[(cy + cdy + y) * ccw + (cx + cdx)],
                    HEVC_PU_SIZE);
         }
         for (int pu = 0; pu < 4; pu++) {
@@ -622,6 +954,9 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     }
 
     enc->cu_skip_map[cu_idx] = 0;
+    enc->cu_is_inter[cu_idx] = 0;
+    enc->mv_x_map[cu_idx] = 0;
+    enc->mv_y_map[cu_idx] = 0;
     if (!is_idr) {
         hevc_cabac_code_cu_skip_flag(cab, 0, skip_ctx_inc);
         hevc_cabac_code_pred_mode_flag(cab, 1 /* MODE_INTRA */);
@@ -780,11 +1115,12 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
 
     /* In VBR/CBR/LOW_LATENCY mode, update QP via rate control model */
     if (encoder->rc.mode != RC_CQP) {
-        int target_qp = rc_get_frame_qp(&encoder->rc, 0);
+        int target_qp = rc_get_frame_qp(&encoder->rc, is_idr ? 0 : encoder->last_frame_sad);
         if (target_qp >= 1 && target_qp <= 51) {
             encoder->qp = target_qp;
         }
     }
+    encoder->last_frame_sad = 0;
 
     pad_replicate(encoder->src_y, encoder->coded_width, encoder->coded_height,
                   encoder->dl_y, encoder->width, encoder->width, encoder->height);
@@ -801,8 +1137,12 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     pad_replicate(encoder->src_cb, ccw, cch, encoder->src_cb, ccw, cw2, ch2);
     pad_replicate(encoder->src_cr, ccw, cch, encoder->src_cr, ccw, cw2, ch2);
 
+    size_t num_cus = (size_t)(encoder->width_ctu * 2) * (encoder->height_ctu * 2);
     memset(encoder->luma_mode_map, 0, (size_t)encoder->mode_map_stride * (encoder->coded_height / HEVC_PU_SIZE));
-    memset(encoder->cu_skip_map, 0, (size_t)(encoder->width_ctu * 2) * (encoder->height_ctu * 2));
+    memset(encoder->cu_skip_map, 0, num_cus);
+    memset(encoder->cu_is_inter, 0, num_cus);
+    memset(encoder->mv_x_map, 0, num_cus * sizeof(int16_t));
+    memset(encoder->mv_y_map, 0, num_cus * sizeof(int16_t));
 
     bool write_param_sets = is_idr;
     if (getenv("BC250_HEVC_REPEAT_HEADERS")) {

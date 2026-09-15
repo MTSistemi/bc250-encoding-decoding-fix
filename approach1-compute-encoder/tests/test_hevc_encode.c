@@ -159,7 +159,12 @@ static void test_multi_frame_gop(void) {
             int expected_types[] = { 1 /* TRAIL_R */ };
             int ok = check_nal_sequence(out_buf, (size_t)written, expected_types, 1);
             assert(ok && "expected TRAIL_R P-slice NAL");
-            if (frame == 1) static_p_bytes = written;
+            if (frame == 1) {
+                static_p_bytes = written;
+                assert(hevc_encoder_get_last_frame_sad(enc) == 0 && "Static P-frame should have zero temporal SAD");
+            } else if (frame == 16) {
+                assert(hevc_encoder_get_last_frame_sad(enc) > 0 && "Moving frame should have non-zero motion SAD");
+            }
         }
     }
 

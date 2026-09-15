@@ -178,11 +178,14 @@ void h264_encoder_set_cbr_intent(h264_encoder_t *encoder, bool cbr_intent);
  * h264_encoder_set_fps - Dynamically update framerate
  */
 void h264_encoder_set_fps(h264_encoder_t *encoder, uint32_t fps);
+uint32_t h264_encoder_get_fps(const h264_encoder_t *encoder);
+uint32_t h264_encoder_get_bitrate(const h264_encoder_t *encoder);
 
 /**
  * h264_encoder_set_qp - Set constant/base quantization parameter (0..51)
  */
 void h264_encoder_set_qp(h264_encoder_t *encoder, int qp);
+int h264_encoder_get_qp(const h264_encoder_t *encoder);
 
 /**
  * h264_encoder_encode_raw - Encodes a raw NV12 image frame with pattern/content analysis

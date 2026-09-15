@@ -38,6 +38,14 @@ This PR introduces critical fixes, rate control enhancements, performance optimi
    - Made `encoder->num_slices` the authoritative source of truth across frames in `encoder_h264.c`, eliminating redundant `getenv("BC250_SLICES_PER_FRAME")` overrides that clobbered programmatic `h264_encoder_set_num_slices()` calls.
    - Sanitized test environment in `test_encode.c`, isolated unit tests from host environment variables, added fallback to `/tmp` when the working directory is not writable, and added pre-assertion diagnostic logging.
 
+7. **HEVC Motion Search, Spatial Merge Candidates & Dynamic Bitrate Adaptation (DEVLOG §30)**:
+   - Implemented hierarchical integer-pel diamond search in `encoder_h265.c` (steps 8, 4, 2 across $[-16, 16]$ with fine 8-point refinement).
+   - Restricted motion displacements to even integers $(2k_x, 2k_y)$, mathematically guaranteeing zero chroma fractional phase and bit-identical reconstruction between encoder and reference decoders with zero drift.
+   - Implemented spatial merge candidate derivation ($A_1, B_1, B_0, A_0, B_2$) per ITU-T H.265 Section 8.5.3.2.2, propagating spatial motion vectors to Skip CUs covering moving objects.
+   - Fixed Truncated Unary binarization in `hevc_cabac_code_merge_idx()`.
+   - Wired temporal motion SAD feedback `encoder->last_frame_sad` into `rc_get_frame_qp()`.
+   - Added Step 13 in `test_va_api.c` validating runtime dynamic bitrate (12M -> 4M/3M for H.264, 15M -> 5M for HEVC) and framerate (120 fps <-> 60 fps) adaptation.
+
 ## Type of Change
 - [x] Bug fix (non-breaking change fixing an issue)
 - [x] New feature (non-breaking change adding functionality)

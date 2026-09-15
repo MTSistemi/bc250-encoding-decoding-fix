@@ -1874,6 +1874,14 @@ void h264_encoder_set_fps(h264_encoder_t *encoder, uint32_t fps) {
     }
 }
 
+uint32_t h264_encoder_get_fps(const h264_encoder_t *encoder) {
+    return encoder ? encoder->fps : 0;
+}
+
+uint32_t h264_encoder_get_bitrate(const h264_encoder_t *encoder) {
+    return encoder ? encoder->rc.target_bitrate : 0;
+}
+
 void h264_encoder_set_rc_mode(h264_encoder_t *encoder, rc_mode_t mode) {
     if (encoder) {
         encoder->rc.mode = mode;
@@ -1912,6 +1920,10 @@ void h264_encoder_set_qp(h264_encoder_t *encoder, int qp) {
         encoder->rc.base_qp = qp;
         encoder->rc.current_qp = qp;
     }
+}
+
+int h264_encoder_get_qp(const h264_encoder_t *encoder) {
+    return encoder ? encoder->rc.current_qp : 0;
 }
 
 /* Choose frame type and QP and put this frame's GPU work in flight without
