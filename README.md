@@ -17,6 +17,9 @@ The BC-250 is a repurposed PS5 APU (Zen 2, up to 40 unlocked RDNA 2 CUs) whose V
 
 Stopgap pending a working VCN unlock, not a replacement for it.
 
+> [!NOTE]
+> **A Note on the Project Name (`bc250-vcn-driver`):** Technically, **VCN (Video Core Next)** refers specifically to AMD's fixed-function silicon ASIC block. Because Sony permanently fused off the physical VCN block on these APUs, this project does not magically "turn on" the dead ASIC; instead, it provides a drop-in **VA-API hardware driver replacement** powered by Vulkan Compute shaders running across the GPU's 40 RDNA 2 Compute Units. The project is named `bc250-vcn-driver` because it solves the community's missing VCN capability.
+
 ---
 
 ## Status
