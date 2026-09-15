@@ -173,33 +173,28 @@ with SSH available throughout. The machine always reaches
 ## Board and repo operations
 
 - Board is `user@10.0.0.104`. Builds happen in `distrobox enter driver-build`.
-- **All work happens on `origin/shalasere`.** `origin` is
+- **Commit straight to `origin/main`.** `origin` is
   `simpmix/bc250-encoding-decoding-fix` (Mix's, renamed from
-  `bc250-vcn-driver`); collaborator access granted 2026-09-13, so this
-  branch lives in his repo, not in a fork. It is long-lived and personal —
-  the counterpart to Mix's own `simpmix` branch — not a per-change feature
-  branch, so **don't delete it after a merge**. Work accumulates here and
-  reaches `main` when Mix merges it.
+  `bc250-vcn-driver`); collaborator access granted 2026-09-13. Mix's call
+  2026-09-15, after a personal `shalasere` branch was tried and dropped —
+  work directly on `main`, no personal long-lived branch, no PR round-trip
+  for ordinary changes. `fork` (`Shalasere/bc250-vulkan-encode-stopgap`) is
+  a backup mirror and the home of Shalasere's own release artifacts (v0.2.1
+  through v0.3.2); `origin` carries no releases — Mix owns the real release
+  process.
 
-  Chosen over a fork 2026-09-13: Mix can push directly onto this branch to
-  help or take over, there's one source of truth, and there's no fork to
-  drift (the fork silently fell 17 commits behind while this file described
-  it as a backup). `fork` (`Shalasere/bc250-vulkan-encode-stopgap`) is now
-  only a backup mirror and the home of Shalasere's own release artifacts
-  (v0.2.1 through v0.3.2); `origin` carries no releases — Mix owns the real
-  release process.
-
-  - **Never commit to local `main`.** It is a clean mirror of `origin/main`.
-    With `remote.pushDefault=origin`, a stray `git push` while on `main`
-    lands straight in the shared tree.
-  - Keep `shalasere` current with `main`: `git fetch origin && git merge
-    origin/main` (or rebase while nothing is published on top). Mix pushes
-    to `origin/main` directly and often — every push this session needed a
-    fetch first.
-  - CI (`.github/workflows/build.yml`) runs on `pull_request` into `main`,
-    and on pushes to `main` only — so pushes to this branch are NOT
-    validated by CI. Open a PR when you want the full build, ctest, and
-    ffmpeg decode oracle to run against the work.
+  - **`git pull --ff-only` before every session and before every push.** Two
+    people commit to this `main` with no branch protection, and Mix pushes
+    often — he landed 630 lines of HEVC work overnight on 2026-09-15. Every
+    push in practice needs a fetch first.
+  - **Never force-push `main`.** Either collaborator doing so silently
+    erases the other's work, and nothing mechanically prevents it.
+  - CI (`.github/workflows/build.yml`) runs on pushes to `main` and on PRs
+    into it — so committing directly means **CI validates only after the
+    push has already landed**. For anything that could plausibly break the
+    build, run the tests locally first (`cmake --build` + `ctest`) rather
+    than letting the shared tree be the test. A PR is still the right tool
+    for a change big enough to want review or pre-merge CI.
   - `main` on `origin` has **no branch protection** as of this writing, so
     nothing mechanically enforces any of the above. Never force-push `main`
     — either collaborator doing so can silently erase the other's work.
