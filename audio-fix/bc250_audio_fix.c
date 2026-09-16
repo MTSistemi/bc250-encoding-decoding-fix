@@ -237,7 +237,7 @@ static const struct proc_ops audio_status_ops = {
 
 static int __init bc250_audio_init(void)
 {
-    pr_info("bc250_audio_fix: Initializing AMD BC-250 Audio Fix Module v0.2.0...\n");
+    pr_info("bc250_audio_fix: Initializing AMD BC-250 Audio Fix Module v0.3.0...\n");
 
     /* 1. Discover Graphics APU & Map MMIO */
     gpu_dev = pci_get_device(BC250_PCI_VENDOR_ID, BC250_PCI_DEVICE_ID, NULL);

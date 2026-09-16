@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver
+# bc250-vcn-driver v0.3.0 - https://github.com/Kai/bc250-vcn-driver
 #
 # install_dkms.sh - Installs bc250_audio_fix into DKMS for kernel auto-rebuilds
 #
@@ -7,7 +7,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_NAME="bc250-audio-fix"
 PKG_VER=$(grep -m1 '^PACKAGE_VERSION=' "$SCRIPT_DIR/dkms.conf" 2>/dev/null | cut -d'"' -f2)
-PKG_VER="${PKG_VER:-0.2.0}"
+PKG_VER="${PKG_VER:-0.3.0}"
 SRC_DIR="/usr/src/${PKG_NAME}-${PKG_VER}"
 
 if [ "$EUID" -ne 0 ]; then
