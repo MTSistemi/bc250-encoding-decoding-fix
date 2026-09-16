@@ -58,20 +58,20 @@ static void test_motion_search(void)
     memset(ref, 100, width * height);
     memset(cur, 100, width * height);
 
-    /* Macroblock at (16, 16) - i.e. mbx=1, mby=1
-     * Put a high-contrast pattern in ref at (16, 16) */
-    for (int y = 16; y < 32; y++) {
-        for (int x = 16; x < 32; x++) {
-            ref[y * pitch + x] = ((x + y) % 2 == 0) ? 200 : 20;
+    /* Target macroblock at (16, 16) - i.e. mbx=1, mby=1 in cur frame.
+     * Place a unique distinctive non-repeating pattern in cur at (16..31, 16..31) */
+    int shift_x = 2;
+    int shift_y = 2;
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            cur[(16 + y) * pitch + (16 + x)] = (uint8_t)((x * 13 + y * 7 + 40) % 256);
         }
     }
 
-    /* In cur, shift the exact same pattern by dx=+2, dy=+2 (to position 18, 18) */
-    int shift_x = 2;
-    int shift_y = 2;
-    for (int y = 16; y < 32; y++) {
-        for (int x = 16; x < 32; x++) {
-            cur[y * pitch + x] = ((x - shift_x + y - shift_y) % 2 == 0) ? 200 : 20;
+    /* In ref, place the exact same pattern shifted by (shift_x, shift_y) to (18..33, 18..33) */
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            ref[(16 + shift_y + y) * pitch + (16 + shift_x + x)] = cur[(16 + y) * pitch + (16 + x)];
         }
     }
 
@@ -96,12 +96,12 @@ static void test_motion_search(void)
     uint32_t moving_mb_idx = 1 * width_mbs + 1;
     printf("  Found MV for mb(1,1): mvx=%d, mvy=%d, sad=%u (expected shift dx=%d, dy=%d => mvx=%d, mvy=%d in qpel)\n",
            mvs[moving_mb_idx].mvx, mvs[moving_mb_idx].mvy, mvs[moving_mb_idx].sad,
-           shift_x, shift_y, -shift_x * 4, -shift_y * 4);
+           shift_x, shift_y, shift_x * 4, shift_y * 4);
 
-    /* In motion estimation, ref = cur - MV, so searching ref finds the pattern at offset (+2, +2)
-     * relative to cur offset, meaning mvx = -2 * 4 = -8, mvy = -2 * 4 = -8 (or +8 depending on sign convention). */
-    assert(abs(mvs[moving_mb_idx].mvx) == shift_x * 4);
-    assert(abs(mvs[moving_mb_idx].mvy) == shift_y * 4);
+    /* The displacement found in reference frame is (shift_x, shift_y) in integer pixels,
+     * which in quarter-pel units is shift * 4. */
+    assert(mvs[moving_mb_idx].mvx == shift_x * 4);
+    assert(mvs[moving_mb_idx].mvy == shift_y * 4);
 
     free(ref);
     free(cur);

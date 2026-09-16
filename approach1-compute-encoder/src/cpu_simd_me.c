@@ -81,7 +81,10 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
     int threads = (cfg && cfg->num_threads > 0) ? cfg->num_threads : 2;
     if (threads > 2) threads = 2; /* Cap at 2 threads to guarantee game CPU headroom */
 
-    const ivec2_t diamond[4] = { {0, 1}, {0, -1}, {1, 0}, {-1, 0} };
+    const ivec2_t search_pattern[8] = {
+        { 0,  1}, { 0, -1}, { 1,  0}, {-1,  0},
+        { 1,  1}, {-1, -1}, { 1, -1}, {-1,  1}
+    };
     const uint32_t lambda_motion = 5;
 
 #ifdef _OPENMP
@@ -108,15 +111,15 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
                 continue;
             }
 
-            /* 2. Hierarchical Adaptive Diamond Search */
+            /* 2. Hierarchical Adaptive Diamond/Square Search */
             ivec2_t best_mv = {0, 0};
             uint32_t best_cost = zero_sad;
 
             for (int step = (int)(max_rad / 2); step >= 1; step /= 2) {
                 ivec2_t center = best_mv;
-                for (int c = 0; c < 4; c++) {
-                    int cand_x = center.x + diamond[c].x * step;
-                    int cand_y = center.y + diamond[c].y * step;
+                for (int c = 0; c < 8; c++) {
+                    int cand_x = center.x + search_pattern[c].x * step;
+                    int cand_y = center.y + search_pattern[c].y * step;
 
                     if (abs(cand_x) > (int)max_rad || abs(cand_y) > (int)max_rad) continue;
 
