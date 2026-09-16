@@ -824,12 +824,7 @@ static int chroma_nc(uint8_t (*nz_c)[4], uint32_t mb, uint32_t mbx, uint32_t mby
  * predictor, encode_mb_p16x16()'s MVD, the P_Skip "matches predictor" check
  * in h264_encoder_encode_frame(), and residual_predict.comp's P-slice
  * prediction (which reads the same mv_buffer values directly, no CPU-side
- * rescaling in between). */
-typedef struct {
-    int32_t mvx, mvy;
-    uint32_t sad;
-    uint32_t _pad;
-} gpu_mv_t;
+ * rescaling in between). Defined as gpu_mv_t in gpu_compute.h. */
 
 /*
  * gpu_pred_mode_i16 - I16x16 prediction mode, as chosen by

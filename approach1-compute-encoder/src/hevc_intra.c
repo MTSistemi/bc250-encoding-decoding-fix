@@ -391,17 +391,32 @@ void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
                                int16_t coeff_out[16]) {
     int32_t raw[16];
     forward_transform_4x4(residual, use_dst ? DST4 : DCT4, raw);
+    int per = qp / 6, rem = qp % 6;
+    int64_t denom = (int64_t)HEVC_FLAT_M * levelScale[rem] << per;
+    int64_t half_denom = denom / 2;
     for (int i = 0; i < 16; i++) {
-        int32_t level = quantize_coeff(raw[i], qp);
-        if (level > 32767) level = 32767;
-        if (level < -32768) level = -32768;
-        coeff_out[i] = (int16_t)level;
+        int32_t coeff_raw = raw[i];
+        int sign = coeff_raw < 0 ? -1 : 1;
+        int64_t mag = coeff_raw < 0 ? -(int64_t)coeff_raw : (int64_t)coeff_raw;
+        int64_t num = mag << HEVC_BDSHIFT;
+        int64_t level = (num + half_denom) / denom;
+        int32_t res = (int32_t)(sign * level);
+        if (res > 32767) res = 32767;
+        if (res < -32768) res = -32768;
+        coeff_out[i] = (int16_t)res;
     }
 }
 
 void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
                                   int16_t residual_out[16]) {
     int16_t dq[16];
-    for (int i = 0; i < 16; i++) dq[i] = (int16_t)dequant_level(coeff[i], qp);
+    int per = qp / 6, rem = qp % 6;
+    int64_t scale = ((int64_t)HEVC_FLAT_M * levelScale[rem]) << per;
+    int64_t half_scale = 1 << (HEVC_BDSHIFT - 1);
+    for (int i = 0; i < 16; i++) {
+        int64_t val = (int64_t)coeff[i] * scale;
+        val = (val + half_scale) >> HEVC_BDSHIFT;
+        dq[i] = (int16_t)clip_coeff((int32_t)val);
+    }
     inverse_transform_4x4(dq, use_dst ? DST4 : DCT4, residual_out);
 }

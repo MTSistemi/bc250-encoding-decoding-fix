@@ -443,6 +443,12 @@ int gpu_compute_get_pred_mode_staging_data(gpu_context_t *ctx, void **data, size
  * out as num_mbs entries of {int32_t mvx, mvy; uint32_t sad; uint32_t pad;}
  * (16 bytes/entry, matching the GPU's std430 MotionVector struct). Only
  * meaningful for P-slices. Same fence-safe double-buffer contract as above. */
+typedef struct {
+    int32_t mvx, mvy;
+    uint32_t sad;
+    uint32_t _pad;
+} gpu_mv_t;
+
 int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *size);
 
 /* Per-4x4-block nonzero bitmask from quantize.comp, one uint32 per block laid
