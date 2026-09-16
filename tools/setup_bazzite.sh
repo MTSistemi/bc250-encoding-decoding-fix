@@ -234,3 +234,11 @@ echo -e "encode-only - so other apps lose hardware video ${BOLD}decode${NC} unti
 echo -e "To avoid that, delete /etc/environment.d/99-bc250.conf and set the variable"
 echo -e "only in the environment of the one app you want encoding. See README.md"
 echo -e "(\"What the installers change, and how to undo it\")."
+
+echo
+echo -e "${YELLOW}${BOLD}Note: this installed the 64-bit driver only.${NC}"
+echo -e "${YELLOW}Steam Link's runtime is 32-bit and dlopen()s a 32-bit VA-API driver, so it${NC}"
+echo -e "${YELLOW}cannot see the driver installed above and will fall back to software.${NC}"
+echo -e "If you use Steam Link, also run:"
+echo -e "  ${BOLD}./tools/build_32bit.sh${NC}"
+echo -e "(installs an i386 driver alongside this one; nothing above is replaced.)"

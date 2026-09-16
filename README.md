@@ -99,6 +99,18 @@ Steam Link's runtime is 32-bit and `dlopen()`s a 32-bit VA-API driver, so a 64-b
 encoding. Build an i386 driver **alongside** the 64-bit one — same sources, same
 filename, different install directory, so both can coexist:
 
+**The 64-bit installers do not build this** — it is opt-in, so that a multilib
+toolchain isn't pulled onto every install to serve one kind of client. Run:
+
+```bash
+./tools/build_32bit.sh            # installs deps, builds, verifies, installs
+./tools/build_32bit.sh --help     # --skip-deps / --deps-only / --no-install / --dry-run
+```
+
+It installs the 32-bit development libraries for your distro, builds,
+checks the result really is `ELF32`/i386 with no `DT_TEXTREL`, and installs it
+to the 32-bit DRI directory alongside the 64-bit driver. Equivalent by hand:
+
 ```bash
 cmake -B build32 -S approach1-compute-encoder -DBUILD_32BIT=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build32 --parallel
