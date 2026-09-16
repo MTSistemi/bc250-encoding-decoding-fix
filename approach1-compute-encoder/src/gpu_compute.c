@@ -358,7 +358,7 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
      * probes 20 times over, OOM here is a genuinely reachable state, not a
      * theoretical one - it was already happening on v0.3.0. */
     int rc = 0;
-    rc |= create_buffer_with_memory(ctx, mv_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->mv_buffer, &ctx->mv_memory);
+    rc |= create_buffer_with_memory(ctx, mv_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->mv_buffer, &ctx->mv_memory);
     rc |= create_buffer_with_memory(ctx, residual_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->residual_buffer, &ctx->residual_memory);
     rc |= create_buffer_with_memory(ctx, residual_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->pred_buffer, &ctx->pred_memory);
     /* coeff_buffer no longer needs TRANSFER_SRC: it is consumed on the GPU
@@ -404,8 +404,8 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     rc |= create_buffer_with_memory_preferred(ctx, dc_coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->dc_staging_buffers[1], &ctx->dc_staging_memories[1]);
     rc |= create_buffer_with_memory_preferred(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->pred_mode_staging_buffers[0], &ctx->pred_mode_staging_memories[0]);
     rc |= create_buffer_with_memory_preferred(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->pred_mode_staging_buffers[1], &ctx->pred_mode_staging_memories[1]);
-    rc |= create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[0], &ctx->mv_staging_memories[0]);
-    rc |= create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[1], &ctx->mv_staging_memories[1]);
+    rc |= create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[0], &ctx->mv_staging_memories[0]);
+    rc |= create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[1], &ctx->mv_staging_memories[1]);
     rc |= create_buffer_with_memory_preferred(ctx, nz_count_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->nz_staging_buffers[0], &ctx->nz_staging_memories[0]);
     rc |= create_buffer_with_memory_preferred(ctx, nz_count_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->nz_staging_buffers[1], &ctx->nz_staging_memories[1]);
     {
@@ -1936,7 +1936,7 @@ int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target) {
     return 0;
 }
 
-int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices) {
+int gpu_compute_dispatch_encode_ext(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices, int me_mode, const gpu_mv_t *cpu_mvs) {
     if (!ctx) return -1;
     if (num_slices < 1) num_slices = 1;
 
@@ -2084,7 +2084,27 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     /* Stage 1: Color Convert (Skipped: inputs in VA-API are already NV12) */
 
     /* Stage 2: Motion Estimation */
-    if (ctx->motion_est_pipeline) {
+    if (cpu_mvs != NULL) {
+        /* Dynamic Governor Tier 2: CPU SIMD Motion Estimation offload.
+         * Copy CPU-computed motion vectors into mv_staging_buffers and transfer
+         * to device-local mv_buffer, skipping the expensive GPU compute shader. */
+        size_t mv_bytes = (size_t)width_mbs * height_mbs * sizeof(gpu_mv_t);
+        if (ctx->mv_staging_mapped[perf_buf]) {
+            memcpy(ctx->mv_staging_mapped[perf_buf], cpu_mvs, mv_bytes);
+            VkBufferCopy mv_copy = {
+                .srcOffset = 0,
+                .dstOffset = 0,
+                .size = mv_bytes
+            };
+            vkCmdCopyBuffer(cmd_buf, ctx->mv_staging_buffers[perf_buf], ctx->mv_buffer, 1, &mv_copy);
+            insert_compute_barrier(cmd_buf);
+        }
+    } else if (ctx->motion_est_pipeline) {
+        if (me_mode == 1) {
+            /* Tier 1: Fast ME mode - higher lambda and fast diamond */
+            pc[6] = 1;
+            pc[7] = 8;
+        }
         vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->motion_est_pipeline);
         vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->motion_est_layout, 0, 1, &ctx->me_desc_set, 0, NULL);
         vkCmdPushConstants(cmd_buf, ctx->motion_est_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
@@ -2353,6 +2373,10 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     return 0;
 }
 
+int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices) {
+    return gpu_compute_dispatch_encode_ext(ctx, render_target, width, height, qp, is_intra, num_slices, 0, NULL);
+}
+
 int gpu_compute_end_picture(gpu_context_t *ctx) {
     struct timespec e0, e1, s0, s1;
     if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &e0);
@@ -2433,7 +2457,10 @@ int gpu_compute_end_picture(gpu_context_t *ctx) {
                     attempt + 1, BC250_ALLOC_MAX_ATTEMPTS, backoff_ms);
         }
         submit_result = vkQueueSubmit(ctx->compute_queue, 1, &submit_info, ctx->fences[ctx->current_buf]);
-        if (submit_result == VK_SUCCESS) break;
+        if (submit_result == VK_SUCCESS) {
+            clock_gettime(CLOCK_MONOTONIC, &ctx->submit_time[ctx->current_buf]);
+            break;
+        }
         fprintf(stderr, "[bc250-gpu] vkQueueSubmit failed: %d\n", submit_result);
     }
     if (ctx->perf_stats_enabled) {
@@ -2481,10 +2508,13 @@ int gpu_compute_sync_slot(gpu_context_t *ctx, int slot) {
      * Report failure so the caller skips the staging-buffer fetch instead
      * of reading quant/coeff/mv data the GPU may still be mid-write on. */
     VkResult wait_result = vkWaitForFences(ctx->device, 1, &ctx->fences[prev_buf], VK_TRUE, UINT64_MAX);
+    struct timespec sync_now;
+    clock_gettime(CLOCK_MONOTONIC, &sync_now);
+    ctx->last_gpu_duration_ms = bc250_diag_delta_ms(&ctx->submit_time[prev_buf], &sync_now);
     if (ctx->perf_stats_enabled) {
         clock_gettime(CLOCK_MONOTONIC, &w1);
-        fprintf(stderr, "[BC250_PERF_WAIT] site=sync buf=%d wait_ms=%.3f\n",
-                prev_buf, bc250_diag_delta_ms(&w0, &w1));
+        fprintf(stderr, "[BC250_PERF_WAIT] site=sync buf=%d wait_ms=%.3f gpu_total_ms=%.3f\n",
+                prev_buf, bc250_diag_delta_ms(&w0, &w1), ctx->last_gpu_duration_ms);
     }
     if (wait_result != VK_SUCCESS) {
         fprintf(stderr, "[bc250-gpu] vkWaitForFences failed in sync: %d\n", wait_result);
@@ -2530,6 +2560,10 @@ int gpu_compute_sync_slot(gpu_context_t *ctx, int slot) {
 int gpu_compute_sync(gpu_context_t *ctx) {
     if (!ctx) return -1;
     return gpu_compute_sync_slot(ctx, gpu_compute_submitted_slot(ctx));
+}
+
+double gpu_compute_get_last_latency_ms(const gpu_context_t *ctx) {
+    return ctx ? ctx->last_gpu_duration_ms : 0.0;
 }
 
 int gpu_compute_get_staging_data(gpu_context_t *ctx, void **data, size_t *size) {

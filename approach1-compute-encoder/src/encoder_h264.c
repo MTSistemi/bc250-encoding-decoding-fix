@@ -21,6 +21,8 @@
 #include "cabac.h"
 #include "rate_control.h"
 #include "gpu_compute.h"
+#include "cpu_simd_me.h"
+#include "dynamic_governor.h"
 #include "encoder_h264.h"
 
 /* Decoded Picture Buffer entry */
@@ -195,6 +197,12 @@ struct h264_encoder {
      * which is precisely the scattered small-read pattern the GPU staging
      * memory is worst at. It is 1/16th the size of quant_levels_shadow. */
     uint32_t *nz_masks_shadow; size_t nz_masks_shadow_cap;
+
+    /* Dynamic CPU/GPU Load Governor & CPU SIMD Motion Estimation */
+    dynamic_governor_t governor;
+    cpu_simd_me_config_t me_cfg;
+    gpu_mv_t *cpu_mvs;
+    size_t cpu_mvs_cap;
 };
 
 static void manage_dpb(h264_encoder_t *encoder, int new_frame_num, int new_poc)
@@ -1768,7 +1776,12 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
         memset(encoder->cbp_nb, 0xFF, encoder->total_mbs * sizeof(*encoder->cbp_nb));
     }
 
-    fprintf(stderr, "[bc250-h264] Encoder initialized: %ux%u @ %u fps, %u bps, profile %d, entropy=%s\n",
+    dynamic_governor_init(&encoder->governor);
+    cpu_simd_me_config_init(&encoder->me_cfg, width, height);
+    encoder->cpu_mvs = calloc(encoder->total_mbs, sizeof(gpu_mv_t));
+    encoder->cpu_mvs_cap = encoder->total_mbs;
+
+    fprintf(stderr, "[bc250-h264] Encoder initialized: %ux%u @ %u fps, %u bps, profile %d, entropy=%s, hybrid_governor=enabled\n",
             width, height, encoder->fps, bitrate, prof_idc, use_cabac ? "CABAC" : "CAVLC");
 
     return encoder;
@@ -1952,10 +1965,18 @@ uint32_t h264_encoder_get_max_frame_size(const h264_encoder_t *encoder) {
 /* Choose frame type and QP and put this frame's GPU work in flight without
  * waiting for it. See h264_encoder_submit_frame()'s header doc for why the
  * split exists and what it costs (rate control runs one frame ahead). */
-int h264_encoder_submit_frame(h264_encoder_t *encoder,
-                              bc250_gpu_context_t *gpu_ctx,
-                              gpu_image_t input_surface,
-                              h264_pending_frame_t *pending)
+int h264_encoder_get_governor_tier(const h264_encoder_t *encoder) {
+    return encoder ? (int)dynamic_governor_get_tier(&encoder->governor) : 0;
+}
+
+/* Choose frame type and QP and put this frame's GPU work in flight without
+ * waiting for it. When GPU contention is high, dynamically offload Motion
+ * Estimation to the CPU Zen 2 SIMD engine. */
+int h264_encoder_submit_frame_ext(h264_encoder_t *encoder,
+                                  bc250_gpu_context_t *gpu_ctx,
+                                  gpu_image_t input_surface,
+                                  gpu_memory_t input_memory,
+                                  h264_pending_frame_t *pending)
 {
     if (!encoder || !pending) return -1;
 
@@ -1988,17 +2009,57 @@ int h264_encoder_submit_frame(h264_encoder_t *encoder,
     pending->qp         = qp;
     pending->num_slices = num_slices;
 
-    /* The dispatch/submit half of what used to be one synchronous block. A
-     * failed begin_picture() or a permanently failed submit leaves
-     * gpu_submitted false, and the finish then takes the same safe
-     * "no new GPU output this frame" fallback the synchronous path took -
-     * critically WITHOUT waiting on a fence that will never signal, and
-     * without reading staging buffers still holding the previous successful
-     * dispatch's data as if it were this frame's. */
+    governor_tier_t tier = dynamic_governor_get_tier(&encoder->governor);
+
+    /* Dynamic Governor Tier 3: Emergency Failover.
+     * When GPU is in severe lockup/contention (>15.5ms), skip submitting new GPU work
+     * this frame. pending->gpu_submitted remains false, causing finish_frame()
+     * to safely emit an immediate P_Skip frame in 0.1ms, maintaining stream deadline. */
+    if (!is_idr && tier == GOV_TIER_3_FAILOVER) {
+        return 0;
+    }
+
+    /* The dispatch/submit half of what used to be one synchronous block. */
     if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE
         && gpu_compute_begin_picture(gpu_ctx, input_surface) == 0) {
-        gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height,
-                                     qp, is_idr ? 1 : 0, num_slices);
+
+        gpu_mv_t *cpu_mvs = NULL;
+        int me_mode = (tier == GOV_TIER_1_GPU_FAST) ? 1 : 0;
+
+        /* Dynamic Governor Tier 2: CPU SIMD Motion Estimation Offload.
+         * If GPU is saturated (>12ms) on a P-frame, compute MVs across Zen 2 cores using SSE2. */
+        if (!is_idr && tier == GOV_TIER_2_CPU_OFFLOAD &&
+            input_memory.memory != VK_NULL_HANDLE &&
+            gpu_ctx->has_recon_frame && gpu_ctx->recon_memory.memory != VK_NULL_HANDLE) {
+
+            gpu_nv12_layout_t in_layout, ref_layout;
+            if (gpu_compute_get_nv12_layout(gpu_ctx, &input_surface, input_memory, &in_layout) == 0 &&
+                gpu_compute_get_nv12_layout(gpu_ctx, &gpu_ctx->recon_image, gpu_ctx->recon_memory, &ref_layout) == 0) {
+
+                void *in_mapped = NULL, *ref_mapped = NULL;
+                if (vkMapMemory(gpu_ctx->device, input_memory.memory, 0, input_memory.size, 0, &in_mapped) == VK_SUCCESS &&
+                    vkMapMemory(gpu_ctx->device, gpu_ctx->recon_memory.memory, 0, gpu_ctx->recon_memory.size, 0, &ref_mapped) == VK_SUCCESS) {
+
+                    const uint8_t *src_y = (const uint8_t *)in_mapped + in_layout.y_offset;
+                    const uint8_t *ref_y = (const uint8_t *)ref_mapped + ref_layout.y_offset;
+
+                    if (cpu_simd_me_search_frame(src_y, (int)in_layout.y_pitch,
+                                                 ref_y, (int)ref_layout.y_pitch,
+                                                 encoder->width, encoder->height,
+                                                 encoder->cpu_mvs,
+                                                 &encoder->me_cfg) == 0) {
+                        cpu_mvs = encoder->cpu_mvs;
+                        me_mode = 2;
+                    }
+
+                    vkUnmapMemory(gpu_ctx->device, gpu_ctx->recon_memory.memory);
+                    vkUnmapMemory(gpu_ctx->device, input_memory.memory);
+                }
+            }
+        }
+
+        gpu_compute_dispatch_encode_ext(gpu_ctx, input_surface, encoder->width, encoder->height,
+                                        qp, is_idr ? 1 : 0, num_slices, me_mode, cpu_mvs);
         if (gpu_compute_end_picture(gpu_ctx) == 0) {
             pending->gpu_submitted = true;
             /* Captured HERE, not read back at finish time: this is the frame
@@ -2010,23 +2071,38 @@ int h264_encoder_submit_frame(h264_encoder_t *encoder,
     return 0;
 }
 
+int h264_encoder_submit_frame(h264_encoder_t *encoder,
+                              bc250_gpu_context_t *gpu_ctx,
+                              gpu_image_t input_surface,
+                              h264_pending_frame_t *pending)
+{
+    gpu_memory_t dummy_mem = {0};
+    return h264_encoder_submit_frame_ext(encoder, gpu_ctx, input_surface, dummy_mem, pending);
+}
+
+int h264_encoder_encode_frame_ext(h264_encoder_t *encoder,
+                                  bc250_gpu_context_t *gpu_ctx,
+                                  gpu_image_t input_surface,
+                                  gpu_memory_t input_memory,
+                                  uint8_t *output_buf, size_t output_size)
+{
+    if (!encoder || !output_buf) return -1;
+
+    h264_pending_frame_t pending;
+    if (h264_encoder_submit_frame_ext(encoder, gpu_ctx, input_surface, input_memory, &pending) != 0)
+        return -1;
+    return h264_encoder_finish_frame(encoder, gpu_ctx,
+                                     output_buf, output_size, &pending);
+}
+
 int h264_encoder_encode_frame(h264_encoder_t *encoder,
                               bc250_gpu_context_t *gpu_ctx,
                               gpu_image_t input_surface,
                               uint8_t *output_buf, size_t output_size)
 {
-    if (!encoder || !output_buf) return -1;
-
-    /* The original synchronous contract, preserved exactly: submit and finish
-     * back to back with no other frame interleaved, so frame type, QP, rate
-     * control order and every emitted byte are identical to before the split.
-     * Only a caller that interleaves another submit between these two (see
-     * va_backend.c's BC250_PIPELINE path) gets pipelined behaviour. */
-    h264_pending_frame_t pending;
-    if (h264_encoder_submit_frame(encoder, gpu_ctx, input_surface, &pending) != 0)
-        return -1;
-    return h264_encoder_finish_frame(encoder, gpu_ctx,
-                                     output_buf, output_size, &pending);
+    gpu_memory_t dummy_mem = {0};
+    return h264_encoder_encode_frame_ext(encoder, gpu_ctx, input_surface, dummy_mem,
+                                         output_buf, output_size);
 }
 
 int h264_encoder_finish_frame(h264_encoder_t *encoder,
@@ -2167,6 +2243,8 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
          * succeeded. Folded into the same condition so either failure takes
          * the same safe fallback. */
         if (gpu_compute_sync_slot(gpu_ctx, pending->gpu_slot) == 0) {
+            double last_gpu_lat = gpu_compute_get_last_latency_ms(gpu_ctx);
+            dynamic_governor_update(&encoder->governor, last_gpu_lat);
         if (ph) {
             clock_gettime(CLOCK_MONOTONIC, &ph_d);
             ph_begin_ms    = (double)(ph_b.tv_sec - ph_a.tv_sec) * 1000.0 +
@@ -3346,5 +3424,6 @@ void h264_encoder_destroy(h264_encoder_t *encoder)
     if (encoder->pred_modes_shadow) free(encoder->pred_modes_shadow);
     if (encoder->mvs_shadow) free(encoder->mvs_shadow);
     if (encoder->nz_masks_shadow) free(encoder->nz_masks_shadow);
+    if (encoder->cpu_mvs) free(encoder->cpu_mvs);
     free(encoder);
 }

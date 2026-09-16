@@ -298,6 +298,10 @@ typedef struct bc250_gpu_context {
      * gpu_compute_end_picture() call, which adds image_ready_semaphore to
      * its vkQueueSubmit()'s pWaitSemaphores. */
     bool has_pending_wait_semaphore;
+
+    /* Dynamic CPU/GPU governor latency tracking */
+    struct timespec submit_time[2];
+    double last_gpu_duration_ms;
 } bc250_gpu_context_t;
 
 typedef bc250_gpu_context_t gpu_context_t;
@@ -387,6 +391,16 @@ void bc250_debug_dump_nv12_frame(const uint8_t *y_plane, int y_pitch,
                                   const uint8_t *uv_plane, int uv_pitch,
                                   int width, int height);
 
+/* Real per-MB motion vectors (see motion_estimation.comp's OutputMV), laid
+ * out as num_mbs entries of {int32_t mvx, mvy; uint32_t sad; uint32_t pad;}
+ * (16 bytes/entry, matching the GPU's std430 MotionVector struct). Only
+ * meaningful for P-slices. Same fence-safe double-buffer contract as above. */
+typedef struct {
+    int32_t mvx, mvy;
+    uint32_t sad;
+    uint32_t _pad;
+} gpu_mv_t;
+
 /* Picture encoding orchestration */
 int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target);
 /* num_slices: threaded through to residual_predict.comp so its I16x16
@@ -395,6 +409,10 @@ int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target);
  * Must match the num_slices the caller will actually partition the CAVLC
  * bitstream into (encoder_h264.c's BC250_SLICES_PER_FRAME). */
 int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices);
+/* Extended dispatch: allows passing dynamic ME mode and CPU-computed motion vectors.
+ * If cpu_mvs != NULL, Stage 2 (Vulkan motion estimation) is skipped and CPU MVs are uploaded. */
+int gpu_compute_dispatch_encode_ext(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices, int me_mode, const gpu_mv_t *cpu_mvs);
+double gpu_compute_get_last_latency_ms(const gpu_context_t *ctx);
 int gpu_compute_end_picture(gpu_context_t *ctx);
 int gpu_compute_sync(gpu_context_t *ctx);
 
@@ -438,16 +456,6 @@ int gpu_compute_get_dc_staging_data(gpu_context_t *ctx, void **data, size_t *siz
  * per MB, values match cavlc.h's H264_I16x16_* constants. Only meaningful for
  * I-slices. Same fence-safe double-buffer contract as above. */
 int gpu_compute_get_pred_mode_staging_data(gpu_context_t *ctx, void **data, size_t *size);
-
-/* Real per-MB motion vectors (see motion_estimation.comp's OutputMV), laid
- * out as num_mbs entries of {int32_t mvx, mvy; uint32_t sad; uint32_t pad;}
- * (16 bytes/entry, matching the GPU's std430 MotionVector struct). Only
- * meaningful for P-slices. Same fence-safe double-buffer contract as above. */
-typedef struct {
-    int32_t mvx, mvy;
-    uint32_t sad;
-    uint32_t _pad;
-} gpu_mv_t;
 
 int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *size);
 

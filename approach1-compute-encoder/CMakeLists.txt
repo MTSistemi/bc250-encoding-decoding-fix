@@ -197,6 +197,8 @@ set(SOURCES
     src/hevc_cabac.c
     src/hevc_intra.c
     src/decoder_h264.c
+    src/cpu_simd_me.c
+    src/dynamic_governor.c
 )
 
 add_library(bc250_drv_video SHARED ${SOURCES})
