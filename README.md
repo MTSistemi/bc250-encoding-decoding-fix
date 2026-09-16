@@ -1,13 +1,13 @@
 # AMD BC-250 Custom Driver & VA-API Video Encoder
 
-[![Build & Release BC-250 Drivers](https://github.com/Shalasere/bc250-vulkan-encode-stopgap/actions/workflows/build.yml/badge.svg)](https://github.com/Shalasere/bc250-vulkan-encode-stopgap/actions/workflows/build.yml)
+[![Build & Release BC-250 Drivers](https://github.com/simpmix/bc250-encoding-decoding-fix/actions/workflows/build.yml/badge.svg)](https://github.com/simpmix/bc250-encoding-decoding-fix/actions/workflows/build.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/Driver%20License-GPL--3.0-blue.svg)](LICENSE)
 [![Kernel Module: GPL-2.0](https://img.shields.io/badge/Audio%20Module-GPL--2.0-green.svg)](audio-fix/README.md)
 
-Software H.264 encoder (Vulkan compute, not the VCN block) and a DisplayPort/HDMI audio clock fix for the AMD BC-250 on Linux.
+Software H.264 (Vulkan compute accelerated) and H.265/HEVC (CABAC, IDR/P-frame GOPs) video encoders and a DisplayPort/HDMI audio clock fix for the AMD BC-250 on Linux.
 
 > [!IMPORTANT]
-> **H.264**: correct, real-time, validated in real Sunshine/Moonlight use at 1440p. **H.265/HEVC**: non-functional stub — do not enable it in any app pointed at this driver. See [Known Limitations](#known-limitations).
+> **H.264**: fully hardware-accelerated via Vulkan compute shaders with asynchronous pipelining, validated for locked 1080p60/1440p real-time game streaming in Sunshine/Moonlight and Steam Link. **H.265/HEVC**: functional Main profile encoder with periodic/forced IDR and inter-predicted P-frames (CABAC, integer diamond search, merge skip), verified against the FFmpeg reference decoder oracle. Because HEVC's DST/DCT transform and CABAC execute on the host CPU, H.264 remains the recommended choice for high-framerate real-time game streaming. See [Known Limitations](#known-limitations).
 
 ---
 
@@ -39,12 +39,12 @@ Validated on physical hardware.
 On moving 1440p content the encode ceiling is **67 fps, up 46% from 46 fps** (static content: 92 fps, up 42%), from two changes to what crosses the GPU→CPU boundary. The GPU now hands the CPU a per-4x4-block nonzero bitmask, so the ~90-96% of blocks that quantize to all-zero are never read out of the 22 MB coefficient buffer; and the pre-quantization coefficient buffer is no longer staged to the host at all, since all 13 CPU reads of it wanted only each block's DC term — the GPU writes those to a compact buffer 1/16th the size. Together that cut CAVLC time ~40% and dropped host-visible staging from 44.2 MB to 2.8 MB per encoder context. `docs/DEVLOG.md` §19–§20.
 
 - `tools/setup_bazzite.sh` — verified end-to-end on real Bazzite (installs, persists, `vainfo` sees it).
-- Test suite: all 4 binaries run and assert (not always true historically — see [Known Limitations](#known-limitations)).
+- Test suite: all 5 test suites run and pass (`BitstreamTest`, `CavlcUnitTest`, `VaApiDriverTest`, `EncodeBitstreamTest`, `HevcEncodeBitstreamTest`).
 - **CABAC** (`feature/h264-cabac`, ITU-T 9.3, adapted from x264, GPL-2.0-or-later): auto-selected for Main/High profile or via `BC250_USE_CABAC=1`. 10-13% smaller output than CAVLC at matched QP, ~28% more CPU, still well above real-time. Scope: I_16x16 intra / P_L0_16x16 inter only.
 
 ## Known Limitations
 
-- **H.265/HEVC**: intra-only; correct on flat content (~56 dB PSNR), not on real high-frequency content; no inter-prediction/SAO/WPP. Leave `hevc_mode` off. See `docs/hevc_scope_note.md`.
+- **H.265/HEVC Architecture & Streaming Advice**: HEVC Main profile encoding is fully functional via VA-API (`VAProfileHEVCMain` / `VAEntrypointEncSlice`) with periodic/forced IDR I-slices, inter-predicted P-slices, 5-candidate spatial merge skip, rate control (CQP/VBR/CBR), quality presets (1–7), and max frame size limits. Because HEVC's 4x4 DST-VII/DCT-II transform and CABAC entropy coding currently execute on the host CPU rather than Vulkan compute shaders, real-time 1080p60 encoding incurs higher CPU load than H.264. For low-latency real-time game streaming (Sunshine/Moonlight), H.264 remains strongly recommended.
 - **Sunshine specifically** needs more than `LIBVA_DRIVER_NAME=bc250` — its binary's `cap_sys_admin` capability (needed for KMS capture) puts it in the kernel's secure-exec mode, where libva's `secure_getenv()`-based driver-name lookup can't see any environment variable at all, regardless of what's set. Run `sudo ./tools/install_vaapi_boot_redirect.sh` once (redirects the system `radeonsi` VA-API driver slot to this driver, persists across reboots). `docs/DEVLOG.md` §10.5/§10.6/§12.6.
 - **Display must not be asleep** when Sunshine initializes capture, or it reads the output as `0x0` and fails with *"Failed to initialize video capture/encoding"* (Moonlight Error 503) — including on a client launching an app hours after Sunshine started, since each launch re-initializes capture. Disable screen blanking on the host (on KDE: PowerDevil "Screen Energy Saving" off). This is the single most likely reason a working install appears broken. `docs/DEVLOG.md` §14.4.
 - **`qp_min=12` is deliberate, and lowering it is a measured net loss** — don't "fix" it. At 1440p the encoder settles at QP 12 spending ~15-19 of 31 Mbps, which looks like wasted bandwidth; taking the floor to 8 spent 14% more bits for **−22% encode throughput and no visible quality change**. QP 12 is past the point of visible return on desktop content. `docs/DEVLOG.md` §18.
@@ -66,15 +66,15 @@ The long-standing "corruption during on-screen motion" report is **fixed** as of
 
 **A — Immutable/atomic distros** (Bazzite, SteamOS, HoloISO, ChimeraOS):
 ```bash
-git clone https://github.com/Shalasere/bc250-vulkan-encode-stopgap.git
-cd bc250-vulkan-encode-stopgap
+git clone https://github.com/simpmix/bc250-encoding-decoding-fix.git
+cd bc250-encoding-decoding-fix
 sudo ./tools/setup_bazzite.sh   # or setup_steamos.sh
 ```
 
 **B — Traditional distros** (Fedora, Ubuntu, Arch, openSUSE):
 ```bash
-git clone https://github.com/Shalasere/bc250-vulkan-encode-stopgap.git
-cd bc250-vulkan-encode-stopgap
+git clone https://github.com/simpmix/bc250-encoding-decoding-fix.git
+cd bc250-encoding-decoding-fix
 ./build_and_install.sh
 ```
 
@@ -169,7 +169,7 @@ affect newly started processes, so a re-login or reboot is needed either way.
 
 ```bash
 ./tools/bc250_diagnose.sh          # hardware, CU count, driver load, benchmark
-LIBVA_DRIVER_NAME=bc250 vainfo     # lists H.264 profiles + VAEntrypointEncSlice
+LIBVA_DRIVER_NAME=bc250 vainfo     # lists H.264 & HEVC profiles + VAEntrypointEncSlice
 ./tools/quality_test.sh            # PSNR/SSIM vs. ground truth, not just decode-without-error
 ```
 
@@ -187,7 +187,12 @@ LIBVA_DRIVER_NAME=bc250 vainfo     # lists H.264 profiles + VAEntrypointEncSlice
 **ffmpeg**:
 ```bash
 export LIBVA_DRIVER_NAME=bc250
-ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload' -c:v h264_vaapi -b:v 8M output.mp4
+
+# H.264 encode (GPU compute accelerated):
+ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload' -c:v h264_vaapi -b:v 8M output_h264.mp4
+
+# H.265/HEVC encode (CABAC, IDR/P-frame):
+ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload' -c:v hevc_vaapi -b:v 6M output_hevc.mp4
 ```
 
 ---
@@ -204,7 +209,7 @@ Carried over as-is; out of scope for this project's correctness work.
 
 ## Contributing / CI
 
-`.github/workflows/build.yml` builds, runs the full test suite, and runs quality verification. Test failures currently only warn (`continue-on-error`); the encode-verification step checks decode-without-error, not pixel correctness — `tools/quality_test.sh` covers that and isn't wired into CI yet.
+`.github/workflows/build.yml` builds 64-bit and 32-bit drivers, runs all 5 automated test suites (`ctest`), and strictly validates both generated H.264 and H.265/HEVC bitstreams against the external FFmpeg reference decoder oracle.
 
 Troubleshooting: [docs/troubleshooting.md](docs/troubleshooting.md)
 
