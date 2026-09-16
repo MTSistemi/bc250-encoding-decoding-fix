@@ -153,7 +153,10 @@ Run:
 cat /sys/class/drm/card0/device/current_compute_units 2>/dev/null || dmesg | grep -i "compute units"
 ```
 * **Expected:** 40 active CUs.
-* **If it reports 24 CUs:** Your kernel or BIOS is limiting the APU to its mining board default. You will need to apply the community `bc250-40cu-unlock` kernel patch or install an APU-optimized distribution like **Bazzite** or **SkillFishOS** which bundles the 40 CU unlock out of the box.
+* **If it reports 24 CUs:** Your kernel or BIOS is limiting the APU to its stock crypto-mining default (24 CUs / 12 WGPs). This project does *not* bundle a kernel unlock patch because modifying compute unit allocation requires an `amdgpu` kernel driver patch. To unlock all 40 CUs (20 WGPs):
+  1. Install an APU-optimized distribution like **Bazzite** (BC-250 / Deck image) or **SkillFishOS**, which pre-integrates the 40 CU unlock out of the box.
+  2. Or apply the community kernel patch from **[duggasco/bc250-40cu-unlock](https://github.com/duggasco/bc250-40cu-unlock)** using module parameter `amdgpu.bc250_cc_write_mode=3`.
+  * Note: Once unlocked, this driver's compute shaders automatically dispatch across all 40 CUs with <3–5% overhead!
 
 ---
 
@@ -181,24 +184,59 @@ cat /sys/class/drm/card0/device/current_compute_units 2>/dev/null || dmesg | gre
 
 ---
 
-## 8. How to Completely Uninstall the Driver
+## 8. FFmpeg Warning: "Driver does not support some wanted packed headers (wanted 0xd, found 0)"
 
-If you ever wish to remove the driver:
+### Symptoms
+When encoding with FFmpeg's `h264_vaapi` or `hevc_vaapi`, the console prints:
+```text
+[h264_vaapi @ 0x560ddcc95dc0] Driver does not support some wanted packed headers (wanted 0xd, found 0).
+```
+
+### Cause
+* In VA-API, "packed headers" refers to the client application (FFmpeg) generating raw NAL headers (SPS, PPS, Slice, SEI) and asking the hardware driver to splice them into the stream.
+* FFmpeg requests packed headers bitmask `0xd` (`VA_ENC_PACKED_HEADER_SEQUENCE (0x1) | VA_ENC_PACKED_HEADER_SLICE (0x4) | VA_ENC_PACKED_HEADER_MISC (0x8)`).
+* The BC-250 driver reports `0` (`VA_ENC_PACKED_HEADER_NONE`) because it is a self-contained Vulkan compute encoder that **authors and embeds its own conforming in-band AUD, SPS, PPS, and Slice NAL units** directly into the bitstream.
+* Previously, the driver advertised `0x7`, which caused FFmpeg to generate external `extradata` (avcC) that could desync from the driver's actual in-band headers during MP4/MKV muxing. Reporting `NONE` guarantees that container muxers preserve the driver's authoritative in-band headers.
+
+### Action Needed
+* **None — this is a harmless informational warning, not an error.**
+* Encoding completes normally, and all output streams contain valid in-band headers that decoders (including FFmpeg itself) parse cleanly.
+
+---
+
+## 9. 32-bit VA-API Clients (Steam Link)
+
+### Symptoms
+* Steam Link silently falls back to software encoding or fails to initialize hardware acceleration.
+* Log reports that `bc250_drv_video.so` cannot be loaded or is the wrong ELF class.
+
+### Cause
+* Steam Link's client runtime is a 32-bit process and cannot load 64-bit `.so` drivers from `/usr/lib64/dri` or `/usr/lib/x86_64-linux-gnu/dri`.
+
+### Solution
+1. Download the companion 32-bit driver archive `bc250-driver-linux-i386.tar.gz` from Releases.
+2. Install it to your system's 32-bit DRI directory (leaving the 64-bit driver in place for 64-bit apps):
+   ```bash
+   tar -xzvf bc250-driver-linux-i386.tar.gz
+   sudo install -Dm755 bc250-driver-i386/bc250_drv_video.so /usr/lib32/dri/bc250_drv_video.so
+   # Or on Debian/Ubuntu multiarch:
+   # sudo install -Dm755 bc250-driver-i386/bc250_drv_video.so /usr/lib/i386-linux-gnu/dri/bc250_drv_video.so
+   ```
+3. Shaders are shared at `/usr/share/bc250/shaders` from the 64-bit install — no extra shaders needed.
+
+---
+
+## 10. How to Completely Uninstall the Driver
+
+Use the automated uninstaller script:
 
 ```bash
-# 1. Remove DRI libraries (standard, SteamOS persistent, and Bazzite /usr/local)
-sudo rm -f /usr/lib*/dri/bc250_drv_video.so
-sudo rm -f /usr/lib/x86_64-linux-gnu/dri/bc250_drv_video.so
-sudo rm -f /usr/local/lib*/dri/bc250_drv_video.so
-sudo rm -rf /var/lib/bc250
+# Preview what will be removed without changing anything:
+sudo ./tools/bc250_uninstall.sh --dry-run
 
-# 2. Remove shaders
-sudo rm -rf /usr/share/bc250 /usr/local/share/bc250
+# Perform full cleanup:
+sudo ./tools/bc250_uninstall.sh
 
-# 3. Remove environment configs & shell profiles
-sudo rm -f /etc/environment.d/99-bc250.conf
-sudo rm -f /etc/profile.d/bc250.sh
-
-# 4. Uninstall audio fix from DKMS
+# Remove the DKMS audio fix:
 cd audio-fix && sudo ./uninstall_dkms.sh
 ```

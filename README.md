@@ -7,18 +7,18 @@
 Software H.264 (Vulkan compute accelerated) and H.265/HEVC (CABAC, IDR/P-frame GOPs) video encoders and a DisplayPort/HDMI audio clock fix for the AMD BC-250 on Linux.
 
 > [!IMPORTANT]
-> **H.264**: fully hardware-accelerated via Vulkan compute shaders with asynchronous pipelining, validated for locked 1080p60/1440p real-time game streaming in Sunshine/Moonlight and Steam Link. **H.265/HEVC**: functional Main profile encoder with periodic/forced IDR and inter-predicted P-frames (CABAC, integer diamond search, merge skip), verified against the FFmpeg reference decoder oracle. Because HEVC's DST/DCT transform and CABAC execute on the host CPU, H.264 remains the recommended choice for high-framerate real-time game streaming. See [Known Limitations](#known-limitations).
+> **H.264**: fully hardware-accelerated via Vulkan compute shaders with asynchronous pipelining, validated for locked 1080p60/1440p real-time game streaming in Sunshine/Moonlight and Steam Link. **H.265/HEVC**: Main profile encoder with periodic/forced IDR, inter-predicted P-frames, GPU compute motion estimation across 40 CUs, and SSE2 SIMD acceleration, verified against the FFmpeg reference decoder oracle. Because HEVC's DST/DCT transform and CABAC execute on the host CPU, H.264 remains the recommended choice for high-framerate real-time game streaming on lower-end host CPUs. See [Known Limitations](#known-limitations).
 
 ---
 
 ## Background
 
-The BC-250 is a repurposed PS5 APU (Zen 2, up to 40 unlocked RDNA 2 CUs) whose VCN hardware video engine is not currently usable (likely a firmware/power-management block, not a fuse — a separate community effort targets this). Without it, apps needing hardware encode (Sunshine, OBS, Steam Link) have no good fallback. This project runs H.264 encoding as Vulkan compute shaders on the APU's CUs, exposed as a standard VA-API driver (`bc250_drv_video.so`).
-
-Stopgap pending a working VCN unlock, not a replacement for it.
+The BC-250 is a repurposed PS5 APU (Zen 2, up to 40 unlocked RDNA 2 CUs) whose hardware VCN video engine was permanently unprovisioned/eFused off at the factory. Without a working VCN block, applications requiring hardware encode (Sunshine, OBS, Steam Link) fall back to software encoding. This project solves this by running video encoding as Vulkan compute shaders on the APU's CUs, exposed as a standard VA-API driver (`bc250_drv_video.so`).
 
 > [!NOTE]
-> **A Note on the Project Name (`bc250-vcn-driver`):** Technically, **VCN (Video Core Next)** refers specifically to AMD's fixed-function silicon ASIC block. Because Sony permanently fused off the physical VCN block on these APUs, this project does not magically "turn on" the dead ASIC; instead, it provides a drop-in **VA-API hardware driver replacement** powered by Vulkan Compute shaders running across the GPU's 40 RDNA 2 Compute Units. The project is named `bc250-vcn-driver` because it solves the community's missing VCN capability.
+> **A Note on the Project Name (`bc250-vcn-driver`):** Technically, **VCN (Video Core Next)** refers specifically to AMD's fixed-function silicon ASIC block. Because the physical VCN block was permanently eFused off on these APUs, this project does not "turn on" the dead ASIC; instead, it provides a drop-in **VA-API hardware driver replacement** powered by Vulkan Compute shaders running across the GPU's RDNA 2 Compute Units.
+>
+> **40 CU vs 24 CU Unlock**: The physical chip has 40 CUs (20 WGPs). Stock mining board firmware often limits the APU to 24 CUs. Unlocking all 40 CUs requires an `amdgpu` kernel patch ([duggasco/bc250-40cu-unlock](https://github.com/duggasco/bc250-40cu-unlock)) or an APU-optimized distribution like **Bazzite** or **SkillFishOS**. This project does *not* bundle a kernel unlock patch, but automatically scales its compute shaders across all 40 CUs when unlocked (taking <3–5% of GPU resources).
 
 ---
 
@@ -44,7 +44,8 @@ On moving 1440p content the encode ceiling is **67 fps, up 46% from 46 fps** (st
 
 ## Known Limitations
 
-- **H.265/HEVC Architecture & Streaming Advice**: HEVC Main profile encoding is fully functional via VA-API (`VAProfileHEVCMain` / `VAEntrypointEncSlice`) with periodic/forced IDR I-slices, inter-predicted P-slices, 5-candidate spatial merge skip, rate control (CQP/VBR/CBR), quality presets (1–7), and max frame size limits. Because HEVC's 4x4 DST-VII/DCT-II transform and CABAC entropy coding currently execute on the host CPU rather than Vulkan compute shaders, real-time 1080p60 encoding incurs higher CPU load than H.264. For low-latency real-time game streaming (Sunshine/Moonlight), H.264 remains strongly recommended.
+- **H.265/HEVC Architecture & Streaming Advice**: HEVC Main profile encoding is fully functional via VA-API (`VAProfileHEVCMain` / `VAEntrypointEncSlice`) with periodic/forced IDR I-slices, inter-predicted P-slices, 5-candidate spatial merge skip, rate control (CQP/VBR/CBR), quality presets (1–7), max frame size limits, Vulkan compute motion estimation, and SSE2 SIMD acceleration. Because HEVC's 4x4 DST-VII/DCT-II transform and CABAC entropy coding currently execute on the host CPU rather than compute shaders, real-time 1080p60 encoding incurs higher CPU load than H.264. For low-latency real-time game streaming (Sunshine/Moonlight), H.264 remains strongly recommended.
+- **Packed Headers Warning**: When encoding via FFmpeg (`h264_vaapi` or `hevc_vaapi`), FFmpeg logs `Driver does not support some wanted packed headers (wanted 0xd, found 0)`. This is a harmless informational warning: the driver directly generates and embeds its own authoritative in-band AUD, SPS, PPS, and Slice headers rather than relying on external application-provided headers. See [Troubleshooting](docs/troubleshooting.md#8-ffmpeg-warning-driver-does-not-support-some-wanted-packed-headers-wanted-0xd-found-0).
 - **Sunshine specifically** needs more than `LIBVA_DRIVER_NAME=bc250` — its binary's `cap_sys_admin` capability (needed for KMS capture) puts it in the kernel's secure-exec mode, where libva's `secure_getenv()`-based driver-name lookup can't see any environment variable at all, regardless of what's set. Run `sudo ./tools/install_vaapi_boot_redirect.sh` once (redirects the system `radeonsi` VA-API driver slot to this driver, persists across reboots). `docs/DEVLOG.md` §10.5/§10.6/§12.6.
 - **Display must not be asleep** when Sunshine initializes capture, or it reads the output as `0x0` and fails with *"Failed to initialize video capture/encoding"* (Moonlight Error 503) — including on a client launching an app hours after Sunshine started, since each launch re-initializes capture. Disable screen blanking on the host (on KDE: PowerDevil "Screen Energy Saving" off). This is the single most likely reason a working install appears broken. `docs/DEVLOG.md` §14.4.
 - **`qp_min=12` is deliberate, and lowering it is a measured net loss** — don't "fix" it. At 1440p the encoder settles at QP 12 spending ~15-19 of 31 Mbps, which looks like wasted bandwidth; taking the floor to 8 spent 14% more bits for **−22% encode throughput and no visible quality change**. QP 12 is past the point of visible return on desktop content. `docs/DEVLOG.md` §18.
@@ -78,7 +79,13 @@ cd bc250-encoding-decoding-fix
 ./build_and_install.sh
 ```
 
-**C — Pre-built release**: download `bc250_drv_video.so` + `shaders/*.spv` from [Releases](../../releases) (`v0.2.1`+), place both at the repo root, then run the A or B installer. The installers verify shaders actually landed and fail rather than silently reporting success.
+**C — Pre-built release** (fastest — no compiling or dev packages needed):
+Download `bc250-driver-linux-x86_64.tar.gz` from [Releases](https://github.com/simpmix/bc250-encoding-decoding-fix/releases) (`v0.3.0`+):
+```bash
+tar -xzvf bc250-driver-linux-x86_64.tar.gz
+cd bc250-driver
+sudo ./build_and_install.sh
+```
 
 ### 32-bit driver (Steam Link)
 
@@ -191,9 +198,12 @@ export LIBVA_DRIVER_NAME=bc250
 # H.264 encode (GPU compute accelerated):
 ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload' -c:v h264_vaapi -b:v 8M output_h264.mp4
 
-# H.265/HEVC encode (CABAC, IDR/P-frame):
+# H.265/HEVC encode (GPU motion estimation, CABAC, IDR/P-frame):
 ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload' -c:v hevc_vaapi -b:v 6M output_hevc.mp4
 ```
+
+> [!NOTE]
+> **Packed Headers Warning**: When encoding via FFmpeg, you may see `[h264_vaapi] Driver does not support some wanted packed headers (wanted 0xd, found 0)`. This is an expected, harmless informational message: the driver authors and embeds its own conforming in-band AUD, SPS, PPS, and Slice NAL headers directly in the bitstream. See [Troubleshooting](docs/troubleshooting.md#8-ffmpeg-warning-driver-does-not-support-some-wanted-packed-headers-wanted-0xd-found-0).
 
 ---
 

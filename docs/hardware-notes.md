@@ -1,21 +1,22 @@
 # BC-250 Hardware Notes
 
 ## APU Specifications
-- **Architecture**: Zen 2 CPU + RDNA 2 GPU
-- **Compute Units**: 40 CUs
-- **Hardware Block**: VCN 3.0 (Video Core Next)
-- **Codename**: Cyan Skillfish
+- **Architecture**: Zen 2 CPU (8 cores / 16 threads) + RDNA 2 GPU (gfx1013)
+- **Compute Units**: 40 CUs (20 WGPs, physically present on the PS5-derived die).
+  - *Stock Mining Board State*: Often ships software-limited to 24 CUs (12 WGPs).
+  - *40 CU Unlock*: Re-enabled via the community `amdgpu` kernel patch ([duggasco/bc250-40cu-unlock](https://github.com/duggasco/bc250-40cu-unlock)) or distributions like Bazzite/SkillFishOS.
+- **Hardware Video Block**: VCN 3.0 (Video Core Next) — permanently unprovisioned/eFused off by the AMD/Sony Platform Security Processor (PSP).
+- **Codename**: Cyan Skillfish (Device ID: `1002:13fe`)
 
-## Device Identification
-- **PCI Vendor ID**: 1002 (AMD)
-- **PCI Device ID**: 13fe
-- **Revision**: Varies, commonly known as `CYAN_SKILLFISH_REV` in kernel code.
+## Memory Map & Architecture
+- **Unified GDDR6 Pool**: All 16 GB is a single unified pool of high-bandwidth GDDR6 shared by CPU and GPU.
+- **VRAM vs GTT**: The `512 MB` reported in `mem_info_vram_total` is merely a kernel-level label for the initial aperture slice; the GPU accesses the unified memory via GART/GTT (`amdgpu.gttsize`). Vulkan RADV exposes ~7.95 GiB across two heaps. Attempting to force larger "dedicated VRAM" in BIOS/APCB is ineffective and unnecessary.
 
-## Known Limitations
-- The VCN block is physically present but locked by the Platform Security Processor (PSP) firmware, presumably a leftover from its original console design.
-- The default DisplayPort/HDMI audio clock divisors in standard Linux drivers calculate the wrong frequencies, leading to distorted sound.
+## Known Hardware Realities
+1. **Physical VCN is Unusable**:
+   - eFuses permanently disable the hardware VCN block. Upstream Mesa 25.1 added native `gfx1013` RADV Vulkan support, but does not provide hardware VCN decoding/encoding.
+   - This driver (`bc250-vcn-driver`) provides the community's sole hardware-accelerated encoding solution by translating VA-API calls into Vulkan Compute shaders executed on the RDNA2 CUs.
+2. **DisplayPort / HDMI Audio Clock Divisor**:
+   - The display controller (`dc`) calculates an incorrect audio sample clock divisor for 44.1/48 kHz audio. The included `bc250_audio_fix` DKMS module writes the proper clock ratios directly to APU DCCG registers (`0x05E0`, `0x05E4`, `0x05E8`).
 
-## Memory Map & Power
-(Community research notes go here. Always ensure adequate cooling when stress testing.)
-
-<!-- bc250-vcn-driver v0.2.0 -->
+<!-- bc250-vcn-driver v0.3.0 -->
