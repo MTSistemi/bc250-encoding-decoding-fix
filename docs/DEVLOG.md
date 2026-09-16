@@ -1,7 +1,7 @@
-# BC-250 VCN Driver — Development Log
+# BC-250 Compute Driver (bc250-encoding-decoding-fix) — Development Log
 
 A running record of the correctness, performance, and integration work on
-`bc250-vcn-driver`. Written to be picked up cold by anyone (including a
+`bc250-encoding-decoding-fix` (formerly `bc250-vcn-driver`). Written to be picked up cold by anyone (including a
 future session with no memory of how any of this happened) — every claim
 below is backed by a real, on-hardware measurement, not inference.
 
@@ -11,7 +11,7 @@ below is backed by a real, on-hardware measurement, not inference.
 This is a real, actively-used gaming console, not a disposable test rig —
 every change below was validated with that in mind.
 
-**Repos**: upstream `simpmix/bc250-vcn-driver` (origin), fork
+**Repos**: upstream `simpmix/bc250-encoding-decoding-fix` (origin), fork
 `Shalasere/bc250-vulkan-encode-stopgap` (fork remote — renamed from
 `bc250-encoding-decoding-fix` partway through this project to better
 reflect what this actually is: a Vulkan-compute stopgap for a VCN block

@@ -1,4 +1,4 @@
-/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * VALIDATION RECORD (2026-09-08, branch fix/subpel-motion-compensation,
  * against integration/all-fixes @ 97b7137 / tag checkpoint-pre-subpel-motion)

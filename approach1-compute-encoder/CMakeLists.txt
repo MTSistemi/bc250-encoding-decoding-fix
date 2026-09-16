@@ -1,6 +1,6 @@
-# bc250-vcn-driver v0.3.0 - https://github.com/Kai/bc250-vcn-driver
+# bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix
 cmake_minimum_required(VERSION 3.16)
-project(bc250-compute-encoder VERSION 0.3.0 LANGUAGES C)
+project(bc250-compute-encoder VERSION 0.4.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O2 -fPIC")

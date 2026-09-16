@@ -19,7 +19,7 @@ board, how to avoid racing other agents, how to verify a change).
 
 ## 0. What this repo is, in one paragraph
 
-`bc250-vcn-driver`: a from-scratch Vulkan-compute H.264 encoder exposed as a
+`bc250-encoding-decoding-fix` (formerly `bc250-vcn-driver`): a from-scratch Vulkan-compute H.264 encoder exposed as a
 libva VA-API driver, for the AMD BC-250 APU, whose real hardware video block
 (VCN) is fused off/dead. It bypasses that dead block by doing the whole
 encode — motion estimation, transform, quantize, entropy coding — as Vulkan
@@ -144,7 +144,7 @@ concurrently:
   current `HEAD` before starting, and diff against it rather than rebuilding
   it yourself.
 - **Commit locally on your own branch. Do not push, ever, unless explicitly
-  told to and told where.** `origin` (upstream `simpmix/bc250-vcn-driver`) is
+  told to and told where.** `origin` (upstream `simpmix/bc250-encoding-decoding-fix`) is
   never pushed to under any circumstance. `fork`
   (`Shalasere/bc250-vulkan-encode-stopgap`) is pushed only when a human
   explicitly asks.

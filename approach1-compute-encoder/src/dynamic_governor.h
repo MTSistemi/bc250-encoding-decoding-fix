@@ -1,4 +1,4 @@
-/* bc250-vcn-driver - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only

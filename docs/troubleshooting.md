@@ -9,7 +9,7 @@ This guide covers solutions to all known issues when using the AMD BC-250 (Cyan 
 Before troubleshooting individual issues, run the built-in diagnostic tool from your terminal:
 
 ```bash
-cd /path/to/bc250-vcn-driver
+cd /path/to/bc250-encoding-decoding-fix
 ./tools/bc250_diagnose.sh
 ```
 

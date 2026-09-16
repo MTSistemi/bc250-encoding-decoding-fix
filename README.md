@@ -16,7 +16,10 @@ Software H.264 (Vulkan compute accelerated) and H.265/HEVC (CABAC, IDR/P-frame G
 The BC-250 is a repurposed PS5 APU (Zen 2, up to 40 unlocked RDNA 2 CUs) whose hardware VCN video engine was permanently unprovisioned/eFused off at the factory. Without a working VCN block, applications requiring hardware encode (Sunshine, OBS, Steam Link) fall back to software encoding. This project solves this by running video encoding as Vulkan compute shaders on the APU's CUs, exposed as a standard VA-API driver (`bc250_drv_video.so`).
 
 > [!NOTE]
-> **A Note on the Project Name (`bc250-vcn-driver`):** Technically, **VCN (Video Core Next)** refers specifically to AMD's fixed-function silicon ASIC block. Because the physical VCN block was permanently eFused off on these APUs, this project does not "turn on" the dead ASIC; instead, it provides a drop-in **VA-API hardware driver replacement** powered by Vulkan Compute shaders running across the GPU's RDNA 2 Compute Units.
+> **Project & Repository Rename (`bc250-encoding-decoding-fix`):**
+> This repository was renamed from `bc250-vcn-driver` to **`bc250-encoding-decoding-fix`** to eliminate confusion and avoid misleading anyone into believing that the physical VCN (Video Core Next) cores have been magically unlocked or revived.
+>
+> On the BC-250 mining APU, AMD permanently unprovisioned and eFused off the hardware VCN silicon at the factory. No driver or software patch can revive permanently fused silicon. Instead, this project provides a from-scratch, high-performance **VA-API hardware driver replacement** powered by custom Vulkan Compute shaders executed directly across the GPU's RDNA 2 Compute Units, coupled with real-time CPU SIMD motion estimation offloading and an audio clock fix.
 >
 > **40 CU vs 24 CU Unlock**: The physical chip has 40 CUs (20 WGPs). Stock mining board firmware often limits the APU to 24 CUs. Unlocking all 40 CUs requires an `amdgpu` kernel patch ([duggasco/bc250-40cu-unlock](https://github.com/duggasco/bc250-40cu-unlock)) or an APU-optimized distribution like **Bazzite** or **SkillFishOS**. This project does *not* bundle a kernel unlock patch, but automatically scales its compute shaders across all 40 CUs when unlocked (taking <3–5% of GPU resources).
 
@@ -233,4 +236,4 @@ Troubleshooting: [docs/troubleshooting.md](docs/troubleshooting.md)
 
 Copyleft: derivatives must ship source under the same terms; GPL-3.0's anti-tivoization clauses block shipping this inside a locked-down device that prevents installing a modified build.
 
-<!-- bc250-vcn-driver -->
+<!-- bc250-encoding-decoding-fix v0.4.0 -->

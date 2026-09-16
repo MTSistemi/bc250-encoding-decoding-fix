@@ -1,4 +1,4 @@
-/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 #version 450
 layout(local_size_x = 32) in; // Wave32 aligned
 

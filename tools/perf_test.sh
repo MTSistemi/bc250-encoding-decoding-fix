@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bc250-vcn-driver - feature/realtime-perf
+# bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix
 #
 # perf_test.sh - Honest wall-clock throughput + per-stage GPU/CPU timing
 # harness for the BC-250 Vulkan-compute VA-API H.264 encoder.

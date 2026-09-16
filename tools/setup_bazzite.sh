@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver
+# bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix
 #
 # setup_bazzite.sh - Automated installer tailored specifically for Bazzite / Silverblue / Kinoite (rpm-ostree)
 #
