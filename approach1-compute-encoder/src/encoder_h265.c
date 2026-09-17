@@ -748,7 +748,6 @@ static int derive_merge_candidates(const hevc_encoder_t *enc,
     }
 
     /* 3. Candidate B0 (Above-Right): (cu_x + 8, cu_y - 1) -> CU (cux + 1, cuy - 1) */
-    bool b0_avail = false;
     hevc_mv_t mv_b0 = {0, 0};
     bool b0_pos_avail = false;
     if (cuy > 0 && (cux + 1) < (int)w_cu) {
@@ -763,14 +762,12 @@ static int derive_merge_candidates(const hevc_encoder_t *enc,
             mv_b0.y = enc->mv_y_map[b0_idx];
             /* Pruning: B0 against B1 */
             if (!b1_avail || mv_b0.x != mv_b1.x || mv_b0.y != mv_b1.y) {
-                b0_avail = true;
                 spatial_cand[num_spatial++] = mv_b0;
             }
         }
     }
 
     /* 4. Candidate A0 (Below-Left): (cu_x - 1, cu_y + 8) -> CU (cux - 1, cuy + 1) */
-    bool a0_avail = false;
     hevc_mv_t mv_a0 = {0, 0};
     bool a0_pos_avail = false;
     if (cux > 0 && (cuy + 1) < (int)h_cu) {
@@ -785,7 +782,6 @@ static int derive_merge_candidates(const hevc_encoder_t *enc,
             mv_a0.y = enc->mv_y_map[a0_idx];
             /* Pruning: A0 against A1 */
             if (!a1_avail || mv_a0.x != mv_a1.x || mv_a0.y != mv_a1.y) {
-                a0_avail = true;
                 spatial_cand[num_spatial++] = mv_a0;
             }
         }
@@ -822,7 +818,7 @@ static int derive_merge_candidates(const hevc_encoder_t *enc,
 static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y, bool is_idr) {
     int qp = enc->qp;
     uint32_t cw = enc->coded_width, ch = enc->coded_height;
-    uint32_t ccw = cw / 2;
+    uint32_t ccw = cw / 2, cch = ch / 2;
     int cux = cu_x / HEVC_CU_SIZE;
     int cuy = cu_y / HEVC_CU_SIZE;
     uint32_t cu_stride = enc->width_ctu * 2;
