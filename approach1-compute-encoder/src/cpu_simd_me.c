@@ -146,8 +146,8 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
                 }
             }
 
-            /* If predictor cost is already very low, early exit immediately */
-            if (best_cost < EARLY_TERMINATION_COST) {
+            /* If spatial predictor found a low cost match, early exit immediately */
+            if ((best_mv.x != 0 || best_mv.y != 0) && best_cost < EARLY_TERMINATION_COST) {
                 out_mvs[mb_idx].mvx = best_mv.x * 4;
                 out_mvs[mb_idx].mvy = best_mv.y * 4;
                 out_mvs[mb_idx].sad = best_cost;
@@ -184,7 +184,7 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
                     }
                 }
 
-                if (best_cost < EARLY_TERMINATION_COST) break;
+                if (best_cost == 0) break;
             }
 
             /* Convert integer motion vector to quarter-pel units (multiply by 4) */
