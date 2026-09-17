@@ -703,10 +703,11 @@ static inline uint32_t compute_sad_4x4_chroma(const uint8_t *src_cb,
 }
 
 /* Derives spatial merge candidates matching ITU-T H.265 Section 8.5.3.2.2.
- * Output cand_mvs has exactly 5 candidates (padded with (0,0)), in 1/4-pel units. */
+ * Output cand_mvs has exactly 5 candidates (padded with (0,0)), in 1/4-pel units.
+ * All candidates are strictly derived from spatial neighbors or zero-vectors,
+ * ensuring 100% bit-exact candidate derivation matching hardware decoders. */
 static int derive_merge_candidates(const hevc_encoder_t *enc,
                                    int cux, int cuy,
-                                   const hevc_mv_t *gpu_mv,
                                    hevc_mv_t cand_mvs[5])
 {
     int num_cand = 0;
@@ -805,23 +806,6 @@ static int derive_merge_candidates(const hevc_encoder_t *enc,
         }
     }
 
-    /* 6. Integrate GPU compute motion vector candidate if available and unique */
-    if (gpu_mv && num_spatial < 5) {
-        int gdx = (gpu_mv->x / 4) & ~1;
-        int gdy = (gpu_mv->y / 4) & ~1;
-        hevc_mv_t mv_g = { (int16_t)(gdx * 4), (int16_t)(gdy * 4) };
-        bool duplicate = false;
-        for (int i = 0; i < num_spatial; i++) {
-            if (spatial_cand[i].x == mv_g.x && spatial_cand[i].y == mv_g.y) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) {
-            spatial_cand[num_spatial++] = mv_g;
-        }
-    }
-
     for (int i = 0; i < num_spatial && num_cand < 5; i++) {
         cand_mvs[num_cand++] = spatial_cand[i];
     }
@@ -835,167 +819,10 @@ static int derive_merge_candidates(const hevc_encoder_t *enc,
     return num_cand;
 }
 
-/* Hierarchical integer-pel diamond search around (0,0), spatial predictors, and GPU MV.
- * All tested displacements are even integers (2k) guaranteeing zero chroma drift. */
-static void hevc_motion_search_diamond_8x8(const hevc_encoder_t *enc,
-                                           int cu_x, int cu_y,
-                                           const hevc_mv_t *spatial_preds,
-                                           int num_spatial_preds,
-                                           const hevc_mv_t *gpu_mv,
-                                           int *out_best_dx, int *out_best_dy,
-                                           uint32_t *out_best_sad)
-{
-    uint32_t cw = enc->coded_width;
-    uint32_t ch = enc->coded_height;
-    uint32_t ccw = enc->coded_width / 2;
-    int cx = cu_x / 2, cy = cu_y / 2;
-
-    int min_dx = -16, max_dx = 16;
-    int min_dy = -16, max_dy = 16;
-    if (cu_x + min_dx < 0) min_dx = -cu_x;
-    if (cu_x + max_dx + 8 > (int)cw) max_dx = (int)cw - 8 - cu_x;
-    if (cu_y + min_dy < 0) min_dy = -cu_y;
-    if (cu_y + max_dy + 8 > (int)ch) max_dy = (int)ch - 8 - cu_y;
-
-    /* Ensure bounds are even integers for zero chroma drift */
-    if (min_dx & 1) min_dx++;
-    if (max_dx & 1) max_dx--;
-    if (min_dy & 1) min_dy++;
-    if (max_dy & 1) max_dy--;
-
-    /* 1. Evaluate (0, 0) */
-    uint32_t sad0 = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, 0, 0) +
-                    compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                           enc->prev_recon_cb, enc->prev_recon_cr,
-                                           ccw, cx, cy, 0, 0);
-    int best_dx = 0, best_dy = 0;
-    uint32_t best_sad = sad0;
-
-    /* Early exit if stationary background */
-    uint32_t early_exit_sad = (enc && enc->quality_level >= 5) ? 64 : 32;
-    if (best_sad <= early_exit_sad) {
-        *out_best_dx = 0;
-        *out_best_dy = 0;
-        *out_best_sad = best_sad;
-        return;
-    }
-
-    /* 2. Evaluate GPU motion vector candidate if provided */
-    if (gpu_mv) {
-        int gdx = (gpu_mv->x / 4) & ~1;
-        int gdy = (gpu_mv->y / 4) & ~1;
-        if (gdx >= min_dx && gdx <= max_dx && gdy >= min_dy && gdy <= max_dy) {
-            if (gdx != 0 || gdy != 0) {
-                uint32_t gsad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, gdx, gdy) +
-                                compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                       enc->prev_recon_cb, enc->prev_recon_cr,
-                                                       ccw, cx, cy, gdx / 2, gdy / 2);
-                if (gsad < best_sad) {
-                    best_sad = gsad;
-                    best_dx = gdx;
-                    best_dy = gdy;
-                    if (best_sad <= early_exit_sad) {
-                        *out_best_dx = best_dx;
-                        *out_best_dy = best_dy;
-                        *out_best_sad = best_sad;
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    /* 3. Evaluate spatial predictors */
-    for (int i = 0; i < num_spatial_preds; i++) {
-        int pdx = spatial_preds[i].x / 4;
-        int pdy = spatial_preds[i].y / 4;
-        pdx &= ~1;
-        pdy &= ~1;
-        if (pdx == best_dx && pdy == best_dy) continue;
-        if (pdx >= min_dx && pdx <= max_dx && pdy >= min_dy && pdy <= max_dy) {
-            uint32_t sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, pdx, pdy) +
-                           compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                  enc->prev_recon_cb, enc->prev_recon_cr,
-                                                  ccw, cx, cy, pdx / 2, pdy / 2);
-            if (sad < best_sad) {
-                best_sad = sad;
-                best_dx = pdx;
-                best_dy = pdy;
-            }
-        }
-    }
-
-    /* 4. Multi-step Diamond Search with steps 8, 4, 2 (all even offsets)
-     * If best_sad is already low (e.g. from GPU MV or spatial predictor), skip coarse steps! */
-    static const int steps[3] = { 8, 4, 2 };
-    int start_s = 0;
-    if (best_sad <= 48) {
-        start_s = 2;
-    } else if (best_sad <= 96) {
-        start_s = 1;
-    }
-    for (int s = start_s; s < 3; s++) {
-        int step = steps[s];
-        bool improved = true;
-        int iter = 0;
-        while (improved && iter < 2) {
-            improved = false;
-            iter++;
-            static const int d_offsets[4][2] = {
-                { 0, -1 }, { -1, 0 }, { 1, 0 }, { 0, 1 }
-            };
-            for (int d = 0; d < 4; d++) {
-                int nx = best_dx + d_offsets[d][0] * step;
-                int ny = best_dy + d_offsets[d][1] * step;
-                if (nx >= min_dx && nx <= max_dx && ny >= min_dy && ny <= max_dy) {
-                    uint32_t sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, nx, ny) +
-                                   compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                          enc->prev_recon_cb, enc->prev_recon_cr,
-                                                          ccw, cx, cy, nx / 2, ny / 2);
-                    if (sad < best_sad) {
-                        best_sad = sad;
-                        best_dx = nx;
-                        best_dy = ny;
-                        improved = true;
-                    }
-                }
-            }
-        }
-    }
-
-    /* 5. Fine 8-point refinement around best center at step 2 */
-    if (!(enc && enc->quality_level >= 5 && best_sad <= 96)) {
-        static const int refine_offsets[8][2] = {
-            { -2, -2 }, {  0, -2 }, {  2, -2 },
-            { -2,  0 },             {  2,  0 },
-            { -2,  2 }, {  0,  2 }, {  2,  2 }
-        };
-        for (int r = 0; r < 8; r++) {
-            int rx = best_dx + refine_offsets[r][0];
-            int ry = best_dy + refine_offsets[r][1];
-            if (rx >= min_dx && rx <= max_dx && ry >= min_dy && ry <= max_dy) {
-                uint32_t sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, rx, ry) +
-                               compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                      enc->prev_recon_cb, enc->prev_recon_cr,
-                                                      ccw, cx, cy, rx / 2, ry / 2);
-                if (sad < best_sad) {
-                    best_sad = sad;
-                    best_dx = rx;
-                    best_dy = ry;
-                }
-            }
-        }
-    }
-
-    *out_best_dx = best_dx;
-    *out_best_dy = best_dy;
-    *out_best_sad = best_sad;
-}
-
-static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y, bool is_idr, const hevc_mv_t *gpu_mv) {
+static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y, bool is_idr) {
     int qp = enc->qp;
     uint32_t cw = enc->coded_width, ch = enc->coded_height;
-    uint32_t ccw = cw / 2, cch = ch / 2;
+    uint32_t ccw = cw / 2;
     int cux = cu_x / HEVC_CU_SIZE;
     int cuy = cu_y / HEVC_CU_SIZE;
     uint32_t cu_stride = enc->width_ctu * 2;
@@ -1011,14 +838,45 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
 
     if (!is_idr && enc->has_ref) {
         hevc_mv_t cand_mvs[5];
-        derive_merge_candidates(enc, cux, cuy, gpu_mv, cand_mvs);
+        derive_merge_candidates(enc, cux, cuy, cand_mvs);
 
-        int best_dx = 0, best_dy = 0;
-        uint32_t best_sad = UINT32_MAX;
-        hevc_motion_search_diamond_8x8(enc, cu_x, cu_y, cand_mvs, 5, gpu_mv,
-                                       &best_dx, &best_dy, &best_sad);
+        int best_cand_idx = -1;
+        uint32_t best_cand_sad = UINT32_MAX;
+        int cx = cu_x / 2, cy = cu_y / 2;
 
-        enc->last_frame_sad += best_sad;
+        /* Evaluate ITU-T standard merge candidates in order */
+        for (int i = 0; i < 5; i++) {
+            int c_dx = cand_mvs[i].x / 4;
+            int c_dy = cand_mvs[i].y / 4;
+
+            /* Ensure displacement is an even integer to prevent chroma subpel interpolation drift */
+            if ((c_dx & 1) != 0 || (c_dy & 1) != 0) continue;
+            if (cu_x + c_dx < 0 || cu_x + c_dx + 8 > (int)cw ||
+                cu_y + c_dy < 0 || cu_y + c_dy + 8 > (int)ch) continue;
+
+            /* Skip redundant evaluations */
+            bool dup = false;
+            for (int p = 0; p < i; p++) {
+                if (cand_mvs[p].x == cand_mvs[i].x && cand_mvs[p].y == cand_mvs[i].y) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+
+            uint32_t c_sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, c_dx, c_dy) +
+                             compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
+                                                    enc->prev_recon_cb, enc->prev_recon_cr,
+                                                    ccw, cx, cy, c_dx / 2, c_dy / 2);
+            if (c_sad < best_cand_sad) {
+                best_cand_sad = c_sad;
+                best_cand_idx = i;
+                /* Fast path: stationary (0,0) or perfect match exits immediately */
+                if (c_dx == 0 && c_dy == 0 && best_cand_sad <= 32) {
+                    break;
+                }
+            }
+        }
 
         uint32_t threshold = 96 * (1 + (enc->qp / 8));
         if (enc->quality_level >= 5) {
@@ -1033,42 +891,14 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             threshold = (uint32_t)s_skip_override;
         }
 
-        /* Evaluate candidates in cand_mvs to find the best merge candidate */
-        int best_cand_idx = -1;
-        uint32_t best_cand_sad = UINT32_MAX;
-        int cx = cu_x / 2, cy = cu_y / 2;
-
-        for (int i = 0; i < 5; i++) {
-            int c_dx = cand_mvs[i].x / 4;
-            int c_dy = cand_mvs[i].y / 4;
-            if (cu_x + c_dx >= 0 && cu_x + c_dx + 8 <= (int)cw &&
-                cu_y + c_dy >= 0 && cu_y + c_dy + 8 <= (int)ch) {
-                uint32_t c_sad;
-                if (c_dx == best_dx && c_dy == best_dy) {
-                    c_sad = best_sad;
-                } else if (c_dx == 0 && c_dy == 0) {
-                    c_sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, 0, 0) +
-                            compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                   enc->prev_recon_cb, enc->prev_recon_cr,
-                                                   ccw, cx, cy, 0, 0);
-                } else {
-                    c_sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, c_dx, c_dy) +
-                            compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                   enc->prev_recon_cb, enc->prev_recon_cr,
-                                                   ccw, cx, cy, c_dx / 2, c_dy / 2);
-                }
-                if (c_sad < best_cand_sad) {
-                    best_cand_sad = c_sad;
-                    best_cand_idx = i;
-                }
-            }
-        }
-
         if (best_cand_idx >= 0 && best_cand_sad <= threshold) {
             is_skip = true;
             chosen_merge_idx = best_cand_idx;
             chosen_dx = cand_mvs[best_cand_idx].x / 4;
             chosen_dy = cand_mvs[best_cand_idx].y / 4;
+            enc->last_frame_sad += best_cand_sad;
+        } else {
+            enc->last_frame_sad += (best_cand_sad != UINT32_MAX ? best_cand_sad : (threshold * 2));
         }
     }
 
@@ -1238,23 +1068,10 @@ static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int 
     int cond_a = ctu_row > 0 ? 1 : 0;
     hevc_cabac_code_split_cu_flag(cab, 1, cond_l + cond_a);
 
-    /* Look up GPU motion vector for this CTU if available */
-    hevc_mv_t gpu_mv_storage;
-    const hevc_mv_t *gpu_mv_ptr = NULL;
-    if (enc->gpu_mvs && enc->num_gpu_mvs > 0) {
-        uint32_t ctu_idx = (uint32_t)ctu_row * enc->width_ctu + (uint32_t)ctu_col;
-        if (ctu_idx < enc->num_gpu_mvs) {
-            const gpu_mv_t *gm = &enc->gpu_mvs[ctu_idx];
-            gpu_mv_storage.x = (int16_t)gm->mvx;
-            gpu_mv_storage.y = (int16_t)gm->mvy;
-            gpu_mv_ptr = &gpu_mv_storage;
-        }
-    }
-
     static const int cu_off_x[4] = { 0, 8, 0, 8 };
     static const int cu_off_y[4] = { 0, 0, 8, 8 };
     for (int i = 0; i < 4; i++)
-        encode_cu(enc, cab, ctu_x + cu_off_x[i], ctu_y + cu_off_y[i], is_idr, gpu_mv_ptr);
+        encode_cu(enc, cab, ctu_x + cu_off_x[i], ctu_y + cu_off_y[i], is_idr);
 }
 
 /* ============================================================================
@@ -1441,34 +1258,9 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
      * By passing is_intra = (is_idr ? 1 : 0), the GPU computes motion
      * estimation for each 16x16 CTU on P-slices across its 40 CUs! */
     if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
-        gpu_mv_t *cpu_mvs = NULL;
-        int me_mode = (tier == GOV_TIER_1_GPU_FAST) ? 1 : 0;
-
-        /* Dynamic Governor Tier 2: CPU SIMD Motion Estimation Offload.
-         * If GPU is saturated (>12ms), download the frame first and run AVX2/SSE2 ME on Zen 2 CPU. */
-        if (!is_idr && tier == GOV_TIER_2_CPU_OFFLOAD && encoder->has_ref && encoder->gpu_mvs) {
-            gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
-                                       encoder->dl_y, (int)encoder->width,
-                                       encoder->dl_uv, (int)encoder->width,
-                                       (int)encoder->width, (int)encoder->height);
-
-            pad_replicate(encoder->src_y, encoder->coded_width, encoder->coded_height,
-                          encoder->dl_y, encoder->width, encoder->width, encoder->height);
-
-            if (cpu_simd_me_search_frame(encoder->src_y, (int)encoder->coded_width,
-                                         encoder->prev_recon_y, (int)encoder->coded_width,
-                                         encoder->width, encoder->height,
-                                         encoder->gpu_mvs,
-                                         &encoder->me_cfg) == 0) {
-                encoder->num_gpu_mvs = encoder->width_ctu * encoder->height_ctu;
-                cpu_mvs = encoder->gpu_mvs;
-                me_mode = 2; /* Inform shader to bypass Vulkan ME and take CPU MVs */
-            }
-        }
-
         if (gpu_compute_begin_picture(gpu_ctx, input_surface) == 0) {
             gpu_compute_dispatch_encode_ext(gpu_ctx, input_surface, encoder->width, encoder->height,
-                                            encoder->qp, is_idr ? 1 : 0, 1, me_mode, cpu_mvs);
+                                            encoder->qp, is_idr ? 1 : 0, 1, 0, NULL);
             gpu_compute_end_picture(gpu_ctx);
             if (gpu_compute_sync(gpu_ctx) == 0) {
                 double last_gpu_lat = gpu_compute_get_last_latency_ms(gpu_ctx);
@@ -1476,23 +1268,10 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
             }
         }
 
-        if (!is_idr && encoder->has_ref && encoder->gpu_mvs && me_mode != 2) {
-            void *mv_data = NULL;
-            size_t mv_size = 0;
-            if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0 && mv_data) {
-                size_t max_bytes = (size_t)encoder->width_ctu * encoder->height_ctu * sizeof(gpu_mv_t);
-                size_t copy_bytes = (mv_size < max_bytes) ? mv_size : max_bytes;
-                memcpy(encoder->gpu_mvs, mv_data, copy_bytes);
-                encoder->num_gpu_mvs = (uint32_t)(copy_bytes / sizeof(gpu_mv_t));
-            }
-        }
-
-        if (me_mode != 2) {
-            gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
-                                       encoder->dl_y, (int)encoder->width,
-                                       encoder->dl_uv, (int)encoder->width,
-                                       (int)encoder->width, (int)encoder->height);
-        }
+        gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
+                                   encoder->dl_y, (int)encoder->width,
+                                   encoder->dl_uv, (int)encoder->width,
+                                   (int)encoder->width, (int)encoder->height);
     } else {
         memset(encoder->dl_y, 128, (size_t)encoder->width * encoder->height);
         memset(encoder->dl_uv, 128, (size_t)(encoder->width / 2) * (encoder->height / 2) * 2);

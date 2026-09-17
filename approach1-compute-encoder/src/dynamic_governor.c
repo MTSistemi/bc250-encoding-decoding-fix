@@ -18,14 +18,27 @@ void dynamic_governor_init(dynamic_governor_t *gov)
     gov->tier1_threshold_ms = 8.0;
     gov->tier2_threshold_ms = 12.0;
     gov->tier3_threshold_ms = 15.5;
-    gov->step_down_hysteresis = 15;
+    gov->step_down_hysteresis = 4;
     gov->current_tier = GOV_TIER_0_GPU_FULL;
     gov->enabled = true;
     gov->forced_tier = -1;
+    gov->cpu_offload_enabled = false;
 
     const char *env_enable = getenv("BC250_GOVERNOR_ENABLE");
     if (env_enable && (strcmp(env_enable, "0") == 0 || strcmp(env_enable, "false") == 0)) {
         gov->enabled = false;
+    }
+
+    const char *env_cpu_me = getenv("BC250_ENABLE_CPU_ME");
+    if (!env_cpu_me) env_cpu_me = getenv("BC250_TIER2_ENABLE");
+    if (env_cpu_me && (strcmp(env_cpu_me, "1") == 0 || strcmp(env_cpu_me, "true") == 0)) {
+        gov->cpu_offload_enabled = true;
+    }
+
+    const char *env_hyst = getenv("BC250_GOVERNOR_HYSTERESIS");
+    if (env_hyst) {
+        int h = atoi(env_hyst);
+        if (h > 0) gov->step_down_hysteresis = (uint32_t)h;
     }
 
     const char *env_force = getenv("BC250_FORCE_TIER");
@@ -81,13 +94,14 @@ governor_tier_t dynamic_governor_update(dynamic_governor_t *gov, double gpu_late
         gov->current_tier = GOV_TIER_3_FAILOVER;
         gov->stable_frames_count = 0;
     } else if (gov->current_tier == GOV_TIER_3_FAILOVER) {
-        /* Drop from Tier 3 to Tier 2 immediately after the emergency frame */
-        gov->current_tier = GOV_TIER_2_CPU_OFFLOAD;
+        /* Drop from Tier 3 immediately after the emergency frame */
+        gov->current_tier = gov->cpu_offload_enabled ? GOV_TIER_2_CPU_OFFLOAD : GOV_TIER_1_GPU_FAST;
         gov->stable_frames_count = 0;
     } else if (metric >= gov->tier2_threshold_ms) {
-        /* Upward tier transitions happen immediately to prevent dropped frames */
-        if (gov->current_tier < GOV_TIER_2_CPU_OFFLOAD) {
-            gov->current_tier = GOV_TIER_2_CPU_OFFLOAD;
+        /* If CPU offload is enabled, transition to Tier 2; otherwise clamp to Tier 1 GPU Fast ME */
+        governor_tier_t target_tier = gov->cpu_offload_enabled ? GOV_TIER_2_CPU_OFFLOAD : GOV_TIER_1_GPU_FAST;
+        if (gov->current_tier < target_tier) {
+            gov->current_tier = target_tier;
             gov->stable_frames_count = 0;
         } else {
             gov->stable_frames_count = 0;
@@ -158,7 +172,7 @@ void dynamic_governor_notify_failover_handled(dynamic_governor_t *gov)
 {
     if (!gov) return;
     if (gov->current_tier == GOV_TIER_3_FAILOVER) {
-        gov->current_tier = GOV_TIER_2_CPU_OFFLOAD;
+        gov->current_tier = gov->cpu_offload_enabled ? GOV_TIER_2_CPU_OFFLOAD : GOV_TIER_1_GPU_FAST;
         gov->stable_frames_count = 0;
     }
 }

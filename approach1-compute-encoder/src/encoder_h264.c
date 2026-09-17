@@ -2026,11 +2026,11 @@ int h264_encoder_submit_frame_ext(h264_encoder_t *encoder,
         && gpu_compute_begin_picture(gpu_ctx, input_surface) == 0) {
 
         gpu_mv_t *cpu_mvs = NULL;
-        int me_mode = (tier == GOV_TIER_1_GPU_FAST) ? 1 : 0;
+        int me_mode = (tier >= GOV_TIER_1_GPU_FAST) ? 1 : 0;
 
         /* Dynamic Governor Tier 2: CPU SIMD Motion Estimation Offload.
-         * If GPU is saturated (>12ms) on a P-frame, compute MVs across Zen 2 cores using SSE2. */
-        if (!is_idr && tier == GOV_TIER_2_CPU_OFFLOAD &&
+         * Only run if explicitly opted in via BC250_ENABLE_CPU_ME=1 / cpu_offload_enabled. */
+        if (!is_idr && tier == GOV_TIER_2_CPU_OFFLOAD && encoder->governor.cpu_offload_enabled &&
             input_memory.memory != VK_NULL_HANDLE &&
             gpu_ctx->has_recon_frame && gpu_ctx->recon_memory.memory != VK_NULL_HANDLE) {
 

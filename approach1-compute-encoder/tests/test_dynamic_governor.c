@@ -18,6 +18,8 @@ static void test_governor_transitions(void)
 
     dynamic_governor_t gov;
     dynamic_governor_init(&gov);
+    gov.cpu_offload_enabled = true;
+    gov.step_down_hysteresis = 15;
     assert(dynamic_governor_get_tier(&gov) == GOV_TIER_0_GPU_FULL);
 
     /* 1. Low latency: stays Tier 0 */
@@ -56,7 +58,47 @@ static void test_governor_transitions(void)
     dynamic_governor_update(&gov, 4.0);
     assert(dynamic_governor_get_tier(&gov) == GOV_TIER_0_GPU_FULL);
 
-    printf("  âœ“ Governor transitions and hysteresis verified!\n");
+    printf("  ✓ Governor transitions and hysteresis verified!\n");
+}
+
+static void test_governor_gpu_only_mode(void)
+{
+    printf("[TEST] Testing default GPU-only governor mode (Tier 2 CPU ME offload disabled)...\n");
+
+    dynamic_governor_t gov;
+    dynamic_governor_init(&gov);
+    assert(!gov.cpu_offload_enabled);
+    assert(gov.step_down_hysteresis == 4);
+
+    /* 1. Low latency: stays Tier 0 */
+    for (int i = 0; i < 5; i++) {
+        governor_tier_t t = dynamic_governor_update(&gov, 4.0);
+        assert(t == GOV_TIER_0_GPU_FULL);
+    }
+
+    /* 2. Severe latency spike (>12ms): caps at Tier 1 (GPU Fast ME), never enters Tier 2 */
+    for (int i = 0; i < 5; i++) {
+        dynamic_governor_update(&gov, 14.0);
+    }
+    assert(dynamic_governor_get_tier(&gov) == GOV_TIER_1_GPU_FAST);
+
+    /* 3. Emergency spike (>15.5ms): trips Tier 3 (Failover) for 1 frame */
+    governor_tier_t emergency = dynamic_governor_update(&gov, 16.5);
+    assert(emergency == GOV_TIER_3_FAILOVER);
+
+    /* 4. Unlatch drops to Tier 1 GPU Fast ME, not Tier 2 */
+    dynamic_governor_notify_failover_handled(&gov);
+    assert(dynamic_governor_get_tier(&gov) == GOV_TIER_1_GPU_FAST);
+
+    /* 5. Fast recovery in 4 stable frames */
+    for (int i = 0; i < 3; i++) {
+        dynamic_governor_update(&gov, 3.5);
+        assert(dynamic_governor_get_tier(&gov) == GOV_TIER_1_GPU_FAST);
+    }
+    dynamic_governor_update(&gov, 3.5);
+    assert(dynamic_governor_get_tier(&gov) == GOV_TIER_0_GPU_FULL);
+
+    printf("  ✓ Default GPU-only governor mode verified!\n");
 }
 
 static void test_governor_failover_handled(void)
@@ -65,13 +107,14 @@ static void test_governor_failover_handled(void)
 
     dynamic_governor_t gov;
     dynamic_governor_init(&gov);
+    gov.cpu_offload_enabled = true;
 
     /* Trip Tier 3 emergency failover */
     dynamic_governor_update(&gov, 17.0);
     assert(dynamic_governor_get_tier(&gov) == GOV_TIER_3_FAILOVER);
 
     /* In Tier 3, no GPU work is submitted, so dynamic_governor_update() is not called.
-     * notify_failover_handled must transition immediately down to Tier 2 CPU offload. */
+     * notify_failover_handled must transition immediately down to Tier 2 CPU offload when enabled. */
     dynamic_governor_notify_failover_handled(&gov);
     assert(dynamic_governor_get_tier(&gov) == GOV_TIER_2_CPU_OFFLOAD);
 
@@ -82,7 +125,7 @@ static void test_governor_failover_handled(void)
     /* Calling with NULL should be safe */
     dynamic_governor_notify_failover_handled(NULL);
 
-    printf("  âœ“ Governor failover unlatch verified!\n");
+    printf("  ✓ Governor failover unlatch verified!\n");
 }
 
 static void test_governor_negative_latency(void)
@@ -97,7 +140,7 @@ static void test_governor_negative_latency(void)
     assert(t == GOV_TIER_0_GPU_FULL);
     assert(gov.last_latency_ms == 0.0);
 
-    printf("  âœ“ Negative latency guard verified!\n");
+    printf("  ✓ Negative latency guard verified!\n");
 }
 
 static void test_governor_telemetry_stats(void)
@@ -112,6 +155,7 @@ static void test_governor_telemetry_stats(void)
 
     dynamic_governor_t gov;
     dynamic_governor_init(&gov);
+    gov.cpu_offload_enabled = true;
     gov.stats_log_interval = 5; /* trigger logging every 5 frames for test */
 
     for (int i = 0; i < 5; i++) {
@@ -142,6 +186,7 @@ int main(void)
     printf("========================================\n");
 
     test_governor_transitions();
+    test_governor_gpu_only_mode();
     test_governor_failover_handled();
     test_governor_negative_latency();
     test_governor_telemetry_stats();

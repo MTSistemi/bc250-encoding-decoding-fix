@@ -48,9 +48,10 @@ typedef struct {
     double tier1_threshold_ms;     /* Default: 8.0 ms */
     double tier2_threshold_ms;     /* Default: 12.0 ms */
     double tier3_threshold_ms;     /* Default: 15.5 ms */
-    uint32_t step_down_hysteresis; /* Default: 15 frames */
+    uint32_t step_down_hysteresis; /* Default: 4 frames */
     bool enabled;
     int forced_tier;               /* -1: auto, 0..3: forced via BC250_FORCE_TIER */
+    bool cpu_offload_enabled;      /* Default: false; enabled via BC250_ENABLE_CPU_ME=1 */
 } dynamic_governor_t;
 
 /**

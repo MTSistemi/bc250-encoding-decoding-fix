@@ -63,8 +63,8 @@ The driver monitors Vulkan encode compute latency in real-time. When intense 3D 
 ```
 +--------------------------------------------------------------------------------+
 |  Tier 0: GPU Full ME   (< 8 ms)   - Full diamond search + subpel on 40 CUs     |
-|  Tier 1: GPU Fast ME   (8 - 12 ms) - Scaled search radius on GPU               |
-|  Tier 2: CPU SIMD ME   (12 - 15.5ms) - AVX2/SSE2 16x16 SAD on 2 Zen 2 cores   |
+|  Tier 1: GPU Fast ME   (>= 8 ms)  - Scaled search radius on GPU (~1 ms)        |
+|  Tier 2: CPU SIMD ME   (Optional) - Opt-in via BC250_ENABLE_CPU_ME=1           |
 |  Tier 3: Failover P-Skip (> 15.5ms) - Emergency bypass to prevent stream drop  |
 +--------------------------------------------------------------------------------+
 ```
@@ -74,6 +74,8 @@ The driver monitors Vulkan encode compute latency in real-time. When intense 3D 
 | Variable | Values | Default | Purpose |
 | :--- | :--- | :--- | :--- |
 | `BC250_GOVERNOR_ENABLE` | `1` / `0` | `1` (Enabled) | Enable or disable dynamic CPU/GPU load balancing. |
+| `BC250_ENABLE_CPU_ME` | `1` / `0` | `0` (Disabled) | Opt-in to Tier 2 CPU SIMD ME offload. Keep `0` (default) for smooth zero-stutter GPU ME. |
+| `BC250_GOVERNOR_HYSTERESIS` | `1` to `30` | `4` | Number of stable frames required to step down tier (fast recovery from scene changes). |
 | `BC250_GOVERNOR_STATS` | `1` or `N` | `0` (Disabled) | Print live telemetry stats every `N` frames to `stderr` (1 = every 60 frames). |
 | `BC250_CPU_CORES` | `6,7` or `c1,c2` | Unpinned | Pin encoder worker threads to specific CPU cores. |
 | `BC250_MAX_CPU_THREADS` | `1` to `8` | `2` | Cap maximum OpenMP worker threads for slice entropy coding (protects host game headroom). |
