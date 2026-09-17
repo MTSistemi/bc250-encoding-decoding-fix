@@ -6,6 +6,15 @@
  * cpu_simd_me.c - Multi-threaded SSE2/AVX2 SIMD Motion Estimation for BC-250 Zen 2 CPU
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#if defined(__linux__)
+#include <sched.h>
+#include <pthread.h>
+#endif
+
 #include "cpu_simd_me.h"
 #include <stdlib.h>
 #include <string.h>
@@ -16,14 +25,6 @@
 
 #ifdef _OPENMP
 #include <omp.h>
-#endif
-
-#if defined(__linux__)
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-#include <sched.h>
-#include <pthread.h>
 #endif
 
 #define STATIC_MB_THRESHOLD 512
@@ -223,6 +224,9 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
     {
         cpu_simd_apply_thread_affinity(omp_get_thread_num(), cfg);
 #pragma omp for schedule(static)
+#else
+    cpu_simd_apply_thread_affinity(0, cfg);
+#endif
         for (int mby = 0; mby < (int)height_mbs; mby++) {
             for (int mbx = 0; mbx < (int)width_mbs; mbx++) {
             uint32_t mb_idx = (uint32_t)mby * width_mbs + (uint32_t)mbx;
