@@ -1,4 +1,4 @@
-/* bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
@@ -39,7 +39,7 @@ static void test_sad_16x16(void)
     uint32_t sad_stride = cpu_simd_sad_16x16(canvas_a, 32, canvas_b, 32);
     assert(sad_stride == 16 * 16 * 10);
 
-    printf("  ✓ cpu_simd_sad_16x16 verified!\n");
+    printf("  âœ“ cpu_simd_sad_16x16 verified!\n");
 }
 
 static void test_motion_search(void)
@@ -106,7 +106,7 @@ static void test_motion_search(void)
     free(ref);
     free(cur);
     free(mvs);
-    printf("  ✓ cpu_simd_me_search_frame verified!\n");
+    printf("  âœ“ cpu_simd_me_search_frame verified!\n");
 }
 
 static void test_spatial_predictor_and_boundaries(void)
@@ -186,7 +186,7 @@ static void test_spatial_predictor_and_boundaries(void)
     free(cur2);
     free(mvs2);
 
-    printf("  ✓ Spatial predictor & boundary handling verified!\n");
+    printf("  âœ“ Spatial predictor & boundary handling verified!\n");
 }
 
 static void test_sad_equivalence_with_scalar(void)
@@ -220,7 +220,7 @@ static void test_sad_equivalence_with_scalar(void)
         }
     }
 
-    printf("  ✓ SIMD (AVX2/SSE2) vs scalar equivalence verified!\n");
+    printf("  âœ“ SIMD (AVX2/SSE2) vs scalar equivalence verified!\n");
 }
 
 int main(void)

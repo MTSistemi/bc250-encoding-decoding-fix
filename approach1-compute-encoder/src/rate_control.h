@@ -1,4 +1,4 @@
-/* bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: GPL-3.0-only
@@ -44,7 +44,7 @@ typedef struct {
      * controller was hitting its target perfectly, the target was just
      * sized for a frame rate that never arrives). Draining by real elapsed
      * time instead makes the bucket rate-correct at any achieved fps.
-     * See docs/DEVLOG.md §16. */
+     * See docs/DEVLOG.md Â§16. */
     uint64_t last_frame_ns;   /* CLOCK_MONOTONIC of previous rc_update_stats; 0 = none yet */
     double   measured_fps;    /* EMA of achieved frame rate, diagnostics only */
 

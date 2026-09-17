@@ -1,4 +1,4 @@
-/* bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
@@ -1707,7 +1707,7 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
      * RC_LOW_LATENCY's 2-frame buffer (vs. RC_CBR's 1-second buffer) is
      * documented in rate_control.h to be for - it was implemented but never
      * actually selected here. Real-world effect measured on-hardware
-     * (docs/DEVLOG.md §10.8): a single legitimate bitrate spike (e.g. a
+     * (docs/DEVLOG.md Â§10.8): a single legitimate bitrate spike (e.g. a
      * large real screen change) saturates a 1-second buffer, and
      * rc_get_frame_qp()'s deliberately-clamped max QP step then takes many
      * frames - up to a full GOP, since nothing else resets it sooner - to
@@ -2649,7 +2649,7 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
          * body). See docs/DEVLOG.md for the full investigation.
          *
          * That 768 figure is CABAC-only reasoning and does not hold for
-         * CAVLC (docs/DEVLOG.md §26.1.1, "ruled out as the SIGSEGV cause but
+         * CAVLC (docs/DEVLOG.md Â§26.1.1, "ruled out as the SIGSEGV cause but
          * worth fixing on its own merits" - undersizing truncates the
          * bitstream rather than corrupting the heap, since bs_write_u() above
          * bounds-checks byte_offset before every store, but truncation still
@@ -3067,7 +3067,7 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
      * size: filler is manufactured to make bits_used equal the per-frame
      * target, so feeding the padded total back into the buffer model makes
      * bits_used cancel the drain exactly and buffer_fullness can never
-     * fall. Measured consequence on real hardware (docs/DEVLOG.md §16): a
+     * fall. Measured consequence on real hardware (docs/DEVLOG.md Â§16): a
      * large opening IDR pins buffer_fullness at its clamp, error stays
      * positive forever, the integral term winds to full range, and QP
      * sticks at qp_max=51 for the entire session while every frame is

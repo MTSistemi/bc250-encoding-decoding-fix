@@ -1,4 +1,4 @@
-/* bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
@@ -56,7 +56,7 @@ static void test_governor_transitions(void)
     dynamic_governor_update(&gov, 4.0);
     assert(dynamic_governor_get_tier(&gov) == GOV_TIER_0_GPU_FULL);
 
-    printf("  ✓ Governor transitions and hysteresis verified!\n");
+    printf("  âœ“ Governor transitions and hysteresis verified!\n");
 }
 
 static void test_governor_failover_handled(void)
@@ -82,7 +82,7 @@ static void test_governor_failover_handled(void)
     /* Calling with NULL should be safe */
     dynamic_governor_notify_failover_handled(NULL);
 
-    printf("  ✓ Governor failover unlatch verified!\n");
+    printf("  âœ“ Governor failover unlatch verified!\n");
 }
 
 static void test_governor_negative_latency(void)
@@ -97,7 +97,7 @@ static void test_governor_negative_latency(void)
     assert(t == GOV_TIER_0_GPU_FULL);
     assert(gov.last_latency_ms == 0.0);
 
-    printf("  ✓ Negative latency guard verified!\n");
+    printf("  âœ“ Negative latency guard verified!\n");
 }
 
 int main(void)

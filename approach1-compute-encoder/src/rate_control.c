@@ -1,4 +1,4 @@
-/* bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: GPL-3.0-only
@@ -62,12 +62,12 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
     rc->target_bitrate = bitrate > 0 ? bitrate : 5000000;
     rc->max_bitrate = rc->target_bitrate * 3 / 2;
     /* Stays at 12. Lowering it was tried and measured as a net LOSS, so
-     * this constant is deliberate, not an oversight (docs/DEVLOG.md §18).
+     * this constant is deliberate, not an oversight (docs/DEVLOG.md Â§18).
      *
      * The reasoning for lowering it looked sound: on real 1440p desktop
      * content the controller pins at this floor with roughly a third of
      * the requested bitrate unspent and frame-time headroom to spare
-     * (§17.3), i.e. quality appeared bounded by this constant rather than
+     * (Â§17.3), i.e. quality appeared bounded by this constant rather than
      * by bandwidth or throughput. Measured at qp_min=8 on a real remote
      * client, though:
      *
@@ -119,7 +119,7 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
     /* Diagnostic (BC250_DEBUG_RC=1): every rc_init with the target it was
      * actually handed and the base QP that fell out of it. Added while
      * root-causing "requested bitrate has no effect on output" - see
-     * docs/DEVLOG.md §15. */
+     * docs/DEVLOG.md Â§15. */
     if (getenv("BC250_DEBUG_RC")) {
         fprintf(stderr, "[bc250-rc] rc_init: mode=%d target=%u bps fps=%.1f %ux%u "
                         "-> base_qp=%d target_bits_per_frame=%u\n",
@@ -246,7 +246,7 @@ void rc_update_stats(rate_control_t *rc, int bits_used) {
      * any pathological gap (a stall, a paused stream, a suspended session)
      * from injecting a huge one-shot drain that would slam QP to qp_min;
      * outside those cases it is a no-op. Falls back to the old fixed quota
-     * when no timestamp is available yet. See docs/DEVLOG.md §16. */
+     * when no timestamp is available yet. See docs/DEVLOG.md Â§16. */
     /* TEST-ONLY (BC250_RC_NOMINAL_DRAIN=1): pin the drain to the fixed
      * per-frame quota by pretending no clock is available, taking the
      * already-existing fallback path below.
@@ -258,7 +258,7 @@ void rc_update_stats(rate_control_t *rc, int bits_used) {
      * differing md5 no longer distinguishes "faster" from "broken". Setting
      * this makes output timing-independent so an A/B of a supposedly
      * output-neutral change can be checked byte-for-byte. Never set in
-     * production: it reintroduces the §16 failure mode where a slow encoder
+     * production: it reintroduces the Â§16 failure mode where a slow encoder
      * drains as if it were hitting its target frame rate. */
     static int nominal_drain = -1;
     if (nominal_drain < 0) {

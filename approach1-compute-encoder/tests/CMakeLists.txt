@@ -1,4 +1,4 @@
-# bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix
+﻿# bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix
 cmake_minimum_required(VERSION 3.16)
 
 # All four test binaries below validate exclusively via assert() - there is

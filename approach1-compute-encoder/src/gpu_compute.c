@@ -1,4 +1,4 @@
-/* bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: GPL-3.0-only
@@ -353,7 +353,7 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
      * so an out-of-memory left VK_NULL_HANDLE buffers behind and the failure
      * surfaced later as a SEGV in the vkMapMemory()/dispatch path instead of a
      * clean "this encoder is unavailable". That is the same failure shape as
-     * the silent slice overflow in DEVLOG §18.2: an ignored return turning a
+     * the silent slice overflow in DEVLOG Â§18.2: an ignored return turning a
      * diagnosable error into a crash. On a ~8 GB GART aperture that Sunshine
      * probes 20 times over, OOM here is a genuinely reachable state, not a
      * theoretical one - it was already happening on v0.3.0. */
@@ -1119,7 +1119,7 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
      * compact DC buffer used 3 of the old 32-descriptor margin in one sitting.
      * vkAllocateDescriptorSets()'s result is not checked at its call sites, so
      * exhausting this pool would fail the same silent way an exhausted memory
-     * heap did (DEVLOG §19.7) - cheaper to keep the ceiling far away. */
+     * heap did (DEVLOG Â§19.7) - cheaper to keep the ceiling far away. */
     VkDescriptorPoolSize pool_sizes[] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64}
@@ -1291,7 +1291,7 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
      * split as a 2.65 GiB host-visible heap (every HOST_VISIBLE memory type)
      * and a 5.30 GiB DEVICE_LOCAL heap - it is a unified-memory APU, so this
      * is the GART/GTT aperture, NOT the 512 MB mem_info_vram_total carve-out
-     * (an earlier version of this comment claimed the latter; see DEVLOG §21).
+     * (an earlier version of this comment claimed the latter; see DEVLOG Â§21).
      * Sunshine's encoder probe calls bc250_gpu_init 20 times, and 20 x ~431 MiB
      * exceeds 7.95 GiB - the host-visible half worst, at 20 x ~222 MiB against
      * 2.65 GiB, which is why the failures clustered on
@@ -1692,9 +1692,9 @@ int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory) {
  * bytes to disk when BC250_DUMP_INPUT_FRAMES=1 is set, building a
  * byte-exact ground-truth reference of what the driver actually received
  * from libva/ffmpeg for later PSNR/SSIM comparison against encoder output.
- * Called from both known upload paths — gpu_compute_upload_nv12()
+ * Called from both known upload paths â€” gpu_compute_upload_nv12()
  * (vaPutImage) and bc250_UnmapBuffer() in va_backend.c (the zero-copy
- * vaDeriveImage+vaMapBuffer path some ffmpeg versions use instead) — so
+ * vaDeriveImage+vaMapBuffer path some ffmpeg versions use instead) â€” so
  * whichever path a given ffmpeg build takes, the frame gets captured.
  * Compiled in unconditionally but a no-op (single getenv check) unless the
  * env var is set, so it costs nothing in normal operation. */
@@ -2310,7 +2310,7 @@ int gpu_compute_dispatch_encode_ext(gpu_context_t *ctx, gpu_image_t render_targe
      * per-frame GPU dispatch (measured ~0.34ms via BC250_PERF_GPU's
      * entropy_ms) that did real work nobody ever used, and every frame
      * lengthens the single contended GPU queue this driver is stuck on
-     * under contention (DEVLOG s.21/§ the phase-bracket work) for zero
+     * under contention (DEVLOG s.21/Â§ the phase-bracket work) for zero
      * benefit. Found while converting quant_levels_buffer to int16_t
      * storage: this dispatch reads that exact buffer through
      * entropy_desc_set binding 0, and entropy_encode.comp's own SPIR-V was
