@@ -109,6 +109,83 @@ static void test_motion_search(void)
     printf("  ✓ cpu_simd_me_search_frame verified!\n");
 }
 
+static void test_spatial_predictor_and_boundaries(void)
+{
+    printf("[TEST] Testing spatial predictor & macroblock boundary handling...\n");
+
+    /* Test 64x64 frame with adjacent moving blocks to test predictor */
+    const int width = 64;
+    const int height = 64;
+    const int pitch = 64;
+
+    uint8_t *ref = calloc(1, width * height);
+    uint8_t *cur = calloc(1, width * height);
+    assert(ref && cur);
+
+    memset(ref, 120, width * height);
+    memset(cur, 120, width * height);
+
+    /* Move both mb(1, 1) and mb(2, 1) by (+3, +2) */
+    int shift_x = 3;
+    int shift_y = 2;
+    for (int mbx = 1; mbx <= 2; mbx++) {
+        for (int y = 0; y < 16; y++) {
+            for (int x = 0; x < 16; x++) {
+                cur[(16 + y) * pitch + (mbx * 16 + x)] = (uint8_t)((x * 17 + y * 11 + mbx * 23) % 256);
+                ref[(16 + shift_y + y) * pitch + (mbx * 16 + shift_x + x)] = cur[(16 + y) * pitch + (mbx * 16 + x)];
+            }
+        }
+    }
+
+    uint32_t width_mbs = width / 16;
+    uint32_t height_mbs = height / 16;
+    gpu_mv_t *mvs = calloc(width_mbs * height_mbs, sizeof(gpu_mv_t));
+    assert(mvs);
+
+    cpu_simd_me_config_t cfg;
+    cpu_simd_me_config_init(&cfg, width, height);
+    cfg.search_radius = 8;
+    cfg.num_threads = 1;
+
+    int rc = cpu_simd_me_search_frame(cur, pitch, ref, pitch, width, height, mvs, &cfg);
+    assert(rc == 0);
+
+    /* mb(1, 1) index: 1 * 4 + 1 = 5 */
+    /* mb(2, 1) index: 1 * 4 + 2 = 6 */
+    assert(mvs[5].mvx == shift_x * 4);
+    assert(mvs[5].mvy == shift_y * 4);
+    assert(mvs[6].mvx == shift_x * 4);
+    assert(mvs[6].mvy == shift_y * 4);
+    assert(mvs[6].sad < 100);
+
+    free(ref);
+    free(cur);
+    free(mvs);
+
+    /* Test non-multiple height (e.g. 50 lines, 4 MB rows = 64 lines padded) */
+    const int w2 = 32;
+    const int h2 = 50;
+    const int p2 = 32;
+    const int w2_mbs = (w2 + 15) / 16; /* 2 */
+    const int h2_mbs = (h2 + 15) / 16; /* 4 */
+    const int max_y = h2_mbs * 16;      /* 64 */
+
+    uint8_t *ref2 = calloc(1, p2 * max_y);
+    uint8_t *cur2 = calloc(1, p2 * max_y);
+    gpu_mv_t *mvs2 = calloc(w2_mbs * h2_mbs, sizeof(gpu_mv_t));
+    assert(ref2 && cur2 && mvs2);
+
+    cpu_simd_me_config_init(&cfg, w2, h2);
+    rc = cpu_simd_me_search_frame(cur2, p2, ref2, p2, w2, h2, mvs2, &cfg);
+    assert(rc == 0);
+
+    free(ref2);
+    free(cur2);
+    free(mvs2);
+
+    printf("  ✓ Spatial predictor & boundary handling verified!\n");
+}
+
 int main(void)
 {
     printf("========================================\n");
@@ -117,6 +194,7 @@ int main(void)
 
     test_sad_16x16();
     test_motion_search();
+    test_spatial_predictor_and_boundaries();
 
     printf("\nALL CPU SIMD MOTION ESTIMATION TESTS PASSED!\n");
     return 0;

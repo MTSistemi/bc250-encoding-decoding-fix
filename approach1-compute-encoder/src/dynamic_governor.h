@@ -59,6 +59,12 @@ governor_tier_t dynamic_governor_get_tier(const dynamic_governor_t *gov);
  */
 void dynamic_governor_reset(dynamic_governor_t *gov);
 
+/**
+ * Notifies governor that an emergency Tier 3 failover frame was handled
+ * and immediately transitions to Tier 2 (CPU offload) for the subsequent frame.
+ */
+void dynamic_governor_notify_failover_handled(dynamic_governor_t *gov);
+
 #ifdef __cplusplus
 }
 #endif

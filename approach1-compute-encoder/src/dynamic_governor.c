@@ -50,6 +50,10 @@ governor_tier_t dynamic_governor_update(dynamic_governor_t *gov, double gpu_late
         return GOV_TIER_0_GPU_FULL;
     }
 
+    if (gpu_latency_ms < 0.0) {
+        gpu_latency_ms = 0.0;
+    }
+
     gov->last_latency_ms = gpu_latency_ms;
 
     /* Initialize or update Exponential Moving Average (EMA) with alpha=0.25 */
@@ -129,4 +133,13 @@ void dynamic_governor_reset(dynamic_governor_t *gov)
     gov->last_latency_ms = 0.0;
     gov->stable_frames_count = 0;
     gov->current_tier = (gov->forced_tier >= 0) ? (governor_tier_t)gov->forced_tier : GOV_TIER_0_GPU_FULL;
+}
+
+void dynamic_governor_notify_failover_handled(dynamic_governor_t *gov)
+{
+    if (!gov) return;
+    if (gov->current_tier == GOV_TIER_3_FAILOVER) {
+        gov->current_tier = GOV_TIER_2_CPU_OFFLOAD;
+        gov->stable_frames_count = 0;
+    }
 }

@@ -59,6 +59,47 @@ static void test_governor_transitions(void)
     printf("  ✓ Governor transitions and hysteresis verified!\n");
 }
 
+static void test_governor_failover_handled(void)
+{
+    printf("[TEST] Testing failover notification and unlatch...\n");
+
+    dynamic_governor_t gov;
+    dynamic_governor_init(&gov);
+
+    /* Trip Tier 3 emergency failover */
+    dynamic_governor_update(&gov, 17.0);
+    assert(dynamic_governor_get_tier(&gov) == GOV_TIER_3_FAILOVER);
+
+    /* In Tier 3, no GPU work is submitted, so dynamic_governor_update() is not called.
+     * notify_failover_handled must transition immediately down to Tier 2 CPU offload. */
+    dynamic_governor_notify_failover_handled(&gov);
+    assert(dynamic_governor_get_tier(&gov) == GOV_TIER_2_CPU_OFFLOAD);
+
+    /* Calling it again while in Tier 2 should be a safe no-op */
+    dynamic_governor_notify_failover_handled(&gov);
+    assert(dynamic_governor_get_tier(&gov) == GOV_TIER_2_CPU_OFFLOAD);
+
+    /* Calling with NULL should be safe */
+    dynamic_governor_notify_failover_handled(NULL);
+
+    printf("  ✓ Governor failover unlatch verified!\n");
+}
+
+static void test_governor_negative_latency(void)
+{
+    printf("[TEST] Testing negative latency guard...\n");
+
+    dynamic_governor_t gov;
+    dynamic_governor_init(&gov);
+
+    /* Passing a negative latency (e.g. clock anomaly) must be clamped to 0.0 */
+    governor_tier_t t = dynamic_governor_update(&gov, -10.0);
+    assert(t == GOV_TIER_0_GPU_FULL);
+    assert(gov.last_latency_ms == 0.0);
+
+    printf("  ✓ Negative latency guard verified!\n");
+}
+
 int main(void)
 {
     printf("========================================\n");
@@ -66,6 +107,8 @@ int main(void)
     printf("========================================\n");
 
     test_governor_transitions();
+    test_governor_failover_handled();
+    test_governor_negative_latency();
 
     printf("\nALL DYNAMIC GOVERNOR TESTS PASSED!\n");
     return 0;

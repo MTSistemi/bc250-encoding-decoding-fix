@@ -2016,6 +2016,7 @@ int h264_encoder_submit_frame_ext(h264_encoder_t *encoder,
      * this frame. pending->gpu_submitted remains false, causing finish_frame()
      * to safely emit an immediate P_Skip frame in 0.1ms, maintaining stream deadline. */
     if (!is_idr && tier == GOV_TIER_3_FAILOVER) {
+        dynamic_governor_notify_failover_handled(&encoder->governor);
         return 0;
     }
 
@@ -2037,22 +2038,22 @@ int h264_encoder_submit_frame_ext(h264_encoder_t *encoder,
                 gpu_compute_get_nv12_layout(gpu_ctx, &gpu_ctx->recon_image, gpu_ctx->recon_memory, &ref_layout) == 0) {
 
                 void *in_mapped = NULL, *ref_mapped = NULL;
-                if (vkMapMemory(gpu_ctx->device, input_memory.memory, 0, input_memory.size, 0, &in_mapped) == VK_SUCCESS &&
-                    vkMapMemory(gpu_ctx->device, gpu_ctx->recon_memory.memory, 0, gpu_ctx->recon_memory.size, 0, &ref_mapped) == VK_SUCCESS) {
+                if (vkMapMemory(gpu_ctx->device, input_memory.memory, 0, input_memory.size, 0, &in_mapped) == VK_SUCCESS) {
+                    if (vkMapMemory(gpu_ctx->device, gpu_ctx->recon_memory.memory, 0, gpu_ctx->recon_memory.size, 0, &ref_mapped) == VK_SUCCESS) {
+                        const uint8_t *src_y = (const uint8_t *)in_mapped + in_layout.y_offset;
+                        const uint8_t *ref_y = (const uint8_t *)ref_mapped + ref_layout.y_offset;
 
-                    const uint8_t *src_y = (const uint8_t *)in_mapped + in_layout.y_offset;
-                    const uint8_t *ref_y = (const uint8_t *)ref_mapped + ref_layout.y_offset;
+                        if (cpu_simd_me_search_frame(src_y, (int)in_layout.y_pitch,
+                                                     ref_y, (int)ref_layout.y_pitch,
+                                                     encoder->width, encoder->height,
+                                                     encoder->cpu_mvs,
+                                                     &encoder->me_cfg) == 0) {
+                            cpu_mvs = encoder->cpu_mvs;
+                            me_mode = 2;
+                        }
 
-                    if (cpu_simd_me_search_frame(src_y, (int)in_layout.y_pitch,
-                                                 ref_y, (int)ref_layout.y_pitch,
-                                                 encoder->width, encoder->height,
-                                                 encoder->cpu_mvs,
-                                                 &encoder->me_cfg) == 0) {
-                        cpu_mvs = encoder->cpu_mvs;
-                        me_mode = 2;
+                        vkUnmapMemory(gpu_ctx->device, gpu_ctx->recon_memory.memory);
                     }
-
-                    vkUnmapMemory(gpu_ctx->device, gpu_ctx->recon_memory.memory);
                     vkUnmapMemory(gpu_ctx->device, input_memory.memory);
                 }
             }
@@ -2577,6 +2578,10 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
             }
         }
         } /* gpu_compute_sync() == 0 */
+    } else {
+        /* Emergency Failover or submit failure: no GPU work was submitted for this frame.
+         * Notify the governor so any Tier 3 Failover steps down to Tier 2 CPU offload. */
+        dynamic_governor_notify_failover_handled(&encoder->governor);
     } /* pending->gpu_submitted */
 
     /* 4. Encode Slices */
