@@ -1,4 +1,4 @@
-﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * test_cavlc.c - Spec-conformance unit tests for H.264 CAVLC entropy engine
  *                Tests ITU-T H.264 Section 9.2 tables, trailing ones,
@@ -59,7 +59,7 @@ static void test_zero_blocks(void) {
     assert(bs_bytes_written(&bs) == 1);
     assert((buf[0] & 0xFC) == 0x0C); /* First 6 bits are 000011 */
 
-    printf("      âœ“ Passed all 4 nC context classes for zero blocks.\n");
+    printf("      ✓ Passed all 4 nC context classes for zero blocks.\n");
 }
 
 static void test_trailing_ones(void) {
@@ -85,7 +85,7 @@ static void test_trailing_ones(void) {
     bs_flush(&bs);
     assert(bs_bytes_written(&bs) > 0);
 
-    printf("      âœ“ Trailing ones and sign bits verified.\n");
+    printf("      ✓ Trailing ones and sign bits verified.\n");
 }
 
 static void test_levels_and_runs(void) {
@@ -102,7 +102,7 @@ static void test_levels_and_runs(void) {
     bs_flush(&bs);
     assert(bs_bytes_written(&bs) > 0);
 
-    printf("      âœ“ Levels, zeros, and run_before encoding verified.\n");
+    printf("      ✓ Levels, zeros, and run_before encoding verified.\n");
 }
 
 static void test_chroma_dc(void) {
@@ -145,7 +145,7 @@ static void test_chroma_dc(void) {
     bs_flush(&bs);
     assert(bs_bytes_written(&bs) > 0);
 
-    printf("      âœ“ Chroma DC encoding verified.\n");
+    printf("      ✓ Chroma DC encoding verified.\n");
 }
 
 static void test_ac_block(void) {
@@ -203,7 +203,7 @@ static void test_ac_block(void) {
     assert(bs_bytes_written(&bs_a) == bs_bytes_written(&bs_b));
     assert(memcmp(buf_a, buf_b, bs_bytes_written(&bs_a)) == 0);
 
-    printf("      âœ“ AC-only block encoding (DC exclusion, total_zeros full-block omission) verified.\n");
+    printf("      ✓ AC-only block encoding (DC exclusion, total_zeros full-block omission) verified.\n");
 }
 
 /* A coefficient large enough that suffixLength must escalate past 0 for
@@ -229,7 +229,7 @@ static void test_large_level_escalation(void) {
     assert(bs_bytes_written(&bs) > 0);
     assert(bs_bytes_written(&bs) < sizeof(buf));
 
-    printf("      âœ“ Large-level suffixLength escalation completes without overflow.\n");
+    printf("      ✓ Large-level suffixLength escalation completes without overflow.\n");
 }
 
 static void test_macroblock_headers(void) {
@@ -289,7 +289,7 @@ static void test_macroblock_headers(void) {
     assert(buf[0] == 0x27);
     assert(buf[1] == 0x80);
 
-    printf("      âœ“ I16x16, P16x16, and P_Skip syntax headers verified.\n");
+    printf("      ✓ I16x16, P16x16, and P_Skip syntax headers verified.\n");
 }
 
 static void test_slice_trailing(void) {
@@ -306,7 +306,7 @@ static void test_slice_trailing(void) {
     /* 3 bits: 101, then 1 stop bit: 1, then 4 zero bits: 0000 -> 0b10110000 = 0xB0 */
     assert(buf[0] == 0xB0);
 
-    printf("      âœ“ RBSP trailing bits byte alignment verified.\n");
+    printf("      ✓ RBSP trailing bits byte alignment verified.\n");
 }
 
 /*

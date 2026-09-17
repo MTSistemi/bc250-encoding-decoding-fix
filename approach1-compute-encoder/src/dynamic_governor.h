@@ -1,4 +1,4 @@
-﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
@@ -24,12 +24,27 @@ typedef enum {
 } governor_tier_t;
 
 typedef struct {
+    uint32_t total_frames;
+    uint32_t total_tier0_frames;
+    uint32_t total_tier1_frames;
+    uint32_t total_offload_frames;
+    uint32_t total_failover_frames;
+    double ema_latency_ms;
+    double last_latency_ms;
+    governor_tier_t current_tier;
+} governor_stats_t;
+
+typedef struct {
     double ema_latency_ms;
     double last_latency_ms;
     governor_tier_t current_tier;
     uint32_t stable_frames_count;
+    uint32_t total_frames;
+    uint32_t total_tier0_frames;
+    uint32_t total_tier1_frames;
     uint32_t total_offload_frames;
     uint32_t total_failover_frames;
+    int stats_log_interval;        /* 0: disabled, >0: log every N frames */
     double tier1_threshold_ms;     /* Default: 8.0 ms */
     double tier2_threshold_ms;     /* Default: 12.0 ms */
     double tier3_threshold_ms;     /* Default: 15.5 ms */
@@ -64,6 +79,16 @@ void dynamic_governor_reset(dynamic_governor_t *gov);
  * and immediately transitions to Tier 2 (CPU offload) for the subsequent frame.
  */
 void dynamic_governor_notify_failover_handled(dynamic_governor_t *gov);
+
+/**
+ * Returns human-readable name of a governor tier.
+ */
+const char *dynamic_governor_tier_name(governor_tier_t tier);
+
+/**
+ * Queries cumulative telemetry statistics from the governor.
+ */
+void dynamic_governor_get_stats(const dynamic_governor_t *gov, governor_stats_t *out_stats);
 
 #ifdef __cplusplus
 }

@@ -1,4 +1,4 @@
-﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
@@ -223,6 +223,30 @@ static void test_sad_equivalence_with_scalar(void)
     printf("  âœ“ SIMD (AVX2/SSE2) vs scalar equivalence verified!\n");
 }
 
+static void test_cpu_affinity_config(void)
+{
+    printf("[TEST] Testing CPU core pinning affinity configuration...\n");
+
+    cpu_simd_me_config_t cfg;
+    cpu_simd_me_config_init(&cfg, 1920, 1080);
+    /* Default: unpinned */
+    assert(cfg.core_ids[0] == -1);
+    assert(cfg.core_ids[1] == -1);
+
+    /* Test programmatic pinning */
+    cfg.core_ids[0] = 6;
+    cfg.core_ids[1] = 7;
+
+    uint8_t cur[16 * 16] = {0};
+    uint8_t ref[16 * 16] = {0};
+    gpu_mv_t mv = {0};
+
+    int rc = cpu_simd_me_search_frame(cur, 16, ref, 16, 16, 16, &mv, &cfg);
+    assert(rc == 0);
+
+    printf("  ✓ CPU core pinning affinity configuration verified!\n");
+}
+
 int main(void)
 {
     printf("========================================\n");
@@ -233,6 +257,7 @@ int main(void)
     test_sad_equivalence_with_scalar();
     test_motion_search();
     test_spatial_predictor_and_boundaries();
+    test_cpu_affinity_config();
 
     printf("\nALL CPU SIMD MOTION ESTIMATION TESTS PASSED!\n");
     return 0;

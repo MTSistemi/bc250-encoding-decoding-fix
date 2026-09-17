@@ -1,4 +1,4 @@
-﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
@@ -25,6 +25,7 @@ typedef struct {
     uint32_t height_in_mbs;
     uint32_t search_radius;  /* Default 4 or 8 pixels */
     int num_threads;         /* Capped at 2 worker threads to preserve CPU headroom */
+    int core_ids[2];         /* Optional CPU core pinning (-1 = unpinned, via BC250_CPU_CORES) */
 } cpu_simd_me_config_t;
 
 /**

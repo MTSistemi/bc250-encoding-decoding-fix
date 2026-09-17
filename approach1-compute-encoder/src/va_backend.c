@@ -1,4 +1,4 @@
-﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: GPL-3.0-only
@@ -723,7 +723,7 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
      * buffers, and whichever is handled last previously won - so with
      * SeqParam last, rate control was re-initialized at 2X the real target.
      * Making this order-independent is the actual fix; see docs/DEVLOG.md
-     * Â§15 and docs/rate_control_audit.md Â§2. */
+     * §15 and docs/rate_control_audit.md §2. */
     for (int i = 0; i < num_buffers; i++) {
         VABufferID pid = buffers[i];
         if (!VALID_ID(pid, MAX_BUFFERS) || !data->buffers[pid].allocated) continue;
@@ -918,7 +918,7 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
 /* BC250_PIPELINE=1 defers a frame's CPU entropy coding so that the next
  * frame's GPU work can overlap it.
  *
- * ðŸ›‘ MEASURED A NET LOSS - see docs/DEVLOG.md 24. Kept only because the
+ * 🛑 MEASURED A NET LOSS - see docs/DEVLOG.md 24. Kept only because the
  * submit/finish split it needs is independently useful and is byte-exact when
  * this is off. Do not enable it on the strength of the theory; the theory was
  * measured and it did not hold:
@@ -1421,7 +1421,7 @@ VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID ima
  * driver's encode surfaces for its cursor-overlay/color-conversion
  * pipeline, confirmed on real hardware to call exactly this
  * (`vaExportSurfaceHandle()` -> "the requested function is not
- * implemented" before this was added; see docs/DEVLOG.md Â§10.5).
+ * implemented" before this was added; see docs/DEVLOG.md §10.5).
  *
  * Only VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 (VADRMPRIMESurfaceDescriptor)
  * is supported - the older VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME (single

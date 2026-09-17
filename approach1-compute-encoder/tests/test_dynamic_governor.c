@@ -1,4 +1,4 @@
-﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
@@ -100,6 +100,41 @@ static void test_governor_negative_latency(void)
     printf("  âœ“ Negative latency guard verified!\n");
 }
 
+static void test_governor_telemetry_stats(void)
+{
+    printf("[TEST] Testing governor telemetry stats & tier names...\n");
+
+    /* Test tier names */
+    assert(strcmp(dynamic_governor_tier_name(GOV_TIER_0_GPU_FULL), "GPU Full ME") == 0);
+    assert(strcmp(dynamic_governor_tier_name(GOV_TIER_1_GPU_FAST), "GPU Fast ME") == 0);
+    assert(strcmp(dynamic_governor_tier_name(GOV_TIER_2_CPU_OFFLOAD), "CPU SIMD Offload") == 0);
+    assert(strcmp(dynamic_governor_tier_name(GOV_TIER_3_FAILOVER), "Emergency Failover") == 0);
+
+    dynamic_governor_t gov;
+    dynamic_governor_init(&gov);
+    gov.stats_log_interval = 5; /* trigger logging every 5 frames for test */
+
+    for (int i = 0; i < 5; i++) {
+        dynamic_governor_update(&gov, 5.0);
+    }
+    for (int i = 0; i < 5; i++) {
+        dynamic_governor_update(&gov, 13.0);
+    }
+
+    governor_stats_t stats;
+    dynamic_governor_get_stats(&gov, &stats);
+    assert(stats.total_frames == 10);
+    assert(stats.total_tier0_frames >= 4);
+    assert(stats.total_offload_frames >= 1);
+    assert(stats.last_latency_ms == 13.0);
+
+    /* Test NULL safety */
+    dynamic_governor_get_stats(NULL, &stats);
+    dynamic_governor_get_stats(&gov, NULL);
+
+    printf("  ✓ Governor telemetry stats & tier names verified!\n");
+}
+
 int main(void)
 {
     printf("========================================\n");
@@ -109,6 +144,7 @@ int main(void)
     test_governor_transitions();
     test_governor_failover_handled();
     test_governor_negative_latency();
+    test_governor_telemetry_stats();
 
     printf("\nALL DYNAMIC GOVERNOR TESTS PASSED!\n");
     return 0;

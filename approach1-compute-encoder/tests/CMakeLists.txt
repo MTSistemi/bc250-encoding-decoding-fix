@@ -1,4 +1,4 @@
-﻿# bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix
+# bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix
 cmake_minimum_required(VERSION 3.16)
 
 # All four test binaries below validate exclusively via assert() - there is
@@ -47,7 +47,7 @@ target_link_libraries(test_hevc_encode PRIVATE bc250_drv_video ${Vulkan_LIBRARIE
 # Unit tests for Dynamic Governor and CPU SIMD Motion Estimation
 add_executable(test_cpu_simd_me test_cpu_simd_me.c ../src/cpu_simd_me.c)
 target_include_directories(test_cpu_simd_me PRIVATE ../src ${Vulkan_INCLUDE_DIRS})
-target_link_libraries(test_cpu_simd_me PRIVATE m)
+target_link_libraries(test_cpu_simd_me PRIVATE m ${CMAKE_THREAD_LIBS_INIT})
 if(TARGET OpenMP::OpenMP_C)
     target_link_libraries(test_cpu_simd_me PRIVATE OpenMP::OpenMP_C)
 endif()

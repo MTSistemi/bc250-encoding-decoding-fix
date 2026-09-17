@@ -1,4 +1,4 @@
-﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
@@ -36,6 +36,16 @@ void dynamic_governor_init(dynamic_governor_t *gov)
             gov->current_tier = (governor_tier_t)ft;
         }
     }
+
+    const char *env_stats = getenv("BC250_GOVERNOR_STATS");
+    if (env_stats) {
+        if (strcmp(env_stats, "1") == 0 || strcmp(env_stats, "true") == 0) {
+            gov->stats_log_interval = 60; /* Log telemetry every 60 frames (~1 sec at 60fps) */
+        } else {
+            int interval = atoi(env_stats);
+            if (interval > 0) gov->stats_log_interval = interval;
+        }
+    }
 }
 
 governor_tier_t dynamic_governor_update(dynamic_governor_t *gov, double gpu_latency_ms)
@@ -55,6 +65,7 @@ governor_tier_t dynamic_governor_update(dynamic_governor_t *gov, double gpu_late
     }
 
     gov->last_latency_ms = gpu_latency_ms;
+    gov->total_frames++;
 
     /* Initialize or update Exponential Moving Average (EMA) with alpha=0.25 */
     if (gov->ema_latency_ms <= 0.0) {
@@ -69,50 +80,60 @@ governor_tier_t dynamic_governor_update(dynamic_governor_t *gov, double gpu_late
     if (gpu_latency_ms >= gov->tier3_threshold_ms) {
         gov->current_tier = GOV_TIER_3_FAILOVER;
         gov->stable_frames_count = 0;
-        gov->total_failover_frames++;
-        return gov->current_tier;
-    }
-
-    /* Upward tier transitions happen immediately to prevent dropped frames */
-    if (metric >= gov->tier2_threshold_ms) {
+    } else if (metric >= gov->tier2_threshold_ms) {
+        /* Upward tier transitions happen immediately to prevent dropped frames */
         if (gov->current_tier != GOV_TIER_2_CPU_OFFLOAD) {
             gov->current_tier = GOV_TIER_2_CPU_OFFLOAD;
             gov->stable_frames_count = 0;
         }
-        gov->total_offload_frames++;
-        return gov->current_tier;
     } else if (metric >= gov->tier1_threshold_ms) {
         if (gov->current_tier < GOV_TIER_1_GPU_FAST) {
             gov->current_tier = GOV_TIER_1_GPU_FAST;
             gov->stable_frames_count = 0;
         }
+    } else {
+        /* Downward tier transitions require hysteresis to avoid fluttering */
+        if (gov->current_tier == GOV_TIER_3_FAILOVER) {
+            /* Drop from Tier 3 to Tier 2 immediately after the emergency frame */
+            gov->current_tier = GOV_TIER_2_CPU_OFFLOAD;
+            gov->stable_frames_count = 0;
+        } else if (gov->current_tier == GOV_TIER_2_CPU_OFFLOAD) {
+            if (metric < gov->tier2_threshold_ms) {
+                gov->stable_frames_count++;
+                if (gov->stable_frames_count >= gov->step_down_hysteresis) {
+                    gov->current_tier = (metric >= gov->tier1_threshold_ms) ? GOV_TIER_1_GPU_FAST : GOV_TIER_0_GPU_FULL;
+                    gov->stable_frames_count = 0;
+                }
+            } else {
+                gov->stable_frames_count = 0;
+            }
+        } else if (gov->current_tier == GOV_TIER_1_GPU_FAST) {
+            if (metric < gov->tier1_threshold_ms) {
+                gov->stable_frames_count++;
+                if (gov->stable_frames_count >= gov->step_down_hysteresis) {
+                    gov->current_tier = GOV_TIER_0_GPU_FULL;
+                    gov->stable_frames_count = 0;
+                }
+            } else {
+                gov->stable_frames_count = 0;
+            }
+        }
     }
 
-    /* Downward tier transitions require hysteresis to avoid fluttering */
-    if (gov->current_tier == GOV_TIER_3_FAILOVER) {
-        /* Drop from Tier 3 to Tier 2 immediately after the emergency frame */
-        gov->current_tier = GOV_TIER_2_CPU_OFFLOAD;
-        gov->stable_frames_count = 0;
-    } else if (gov->current_tier == GOV_TIER_2_CPU_OFFLOAD) {
-        if (metric < gov->tier2_threshold_ms) {
-            gov->stable_frames_count++;
-            if (gov->stable_frames_count >= gov->step_down_hysteresis) {
-                gov->current_tier = (metric >= gov->tier1_threshold_ms) ? GOV_TIER_1_GPU_FAST : GOV_TIER_0_GPU_FULL;
-                gov->stable_frames_count = 0;
-            }
-        } else {
-            gov->stable_frames_count = 0;
-        }
-    } else if (gov->current_tier == GOV_TIER_1_GPU_FAST) {
-        if (metric < gov->tier1_threshold_ms) {
-            gov->stable_frames_count++;
-            if (gov->stable_frames_count >= gov->step_down_hysteresis) {
-                gov->current_tier = GOV_TIER_0_GPU_FULL;
-                gov->stable_frames_count = 0;
-            }
-        } else {
-            gov->stable_frames_count = 0;
-        }
+    if (gov->current_tier == GOV_TIER_0_GPU_FULL) gov->total_tier0_frames++;
+    else if (gov->current_tier == GOV_TIER_1_GPU_FAST) gov->total_tier1_frames++;
+    else if (gov->current_tier == GOV_TIER_2_CPU_OFFLOAD) gov->total_offload_frames++;
+    else if (gov->current_tier == GOV_TIER_3_FAILOVER) gov->total_failover_frames++;
+
+    if (gov->stats_log_interval > 0 && (gov->total_frames % (uint32_t)gov->stats_log_interval == 0)) {
+        fprintf(stderr, "[bc250-gov] Frame %u: Tier %d (%s) | GPU: %.2f ms | EMA: %.2f ms | Offload: %u | Failover: %u\n",
+                gov->total_frames,
+                (int)gov->current_tier,
+                dynamic_governor_tier_name(gov->current_tier),
+                gov->last_latency_ms,
+                gov->ema_latency_ms,
+                gov->total_offload_frames,
+                gov->total_failover_frames);
     }
 
     return gov->current_tier;
@@ -142,4 +163,28 @@ void dynamic_governor_notify_failover_handled(dynamic_governor_t *gov)
         gov->current_tier = GOV_TIER_2_CPU_OFFLOAD;
         gov->stable_frames_count = 0;
     }
+}
+
+const char *dynamic_governor_tier_name(governor_tier_t tier)
+{
+    switch (tier) {
+        case GOV_TIER_0_GPU_FULL: return "GPU Full ME";
+        case GOV_TIER_1_GPU_FAST: return "GPU Fast ME";
+        case GOV_TIER_2_CPU_OFFLOAD: return "CPU SIMD Offload";
+        case GOV_TIER_3_FAILOVER: return "Emergency Failover";
+        default: return "Unknown";
+    }
+}
+
+void dynamic_governor_get_stats(const dynamic_governor_t *gov, governor_stats_t *out_stats)
+{
+    if (!gov || !out_stats) return;
+    out_stats->total_frames = gov->total_frames;
+    out_stats->total_tier0_frames = gov->total_tier0_frames;
+    out_stats->total_tier1_frames = gov->total_tier1_frames;
+    out_stats->total_offload_frames = gov->total_offload_frames;
+    out_stats->total_failover_frames = gov->total_failover_frames;
+    out_stats->ema_latency_ms = gov->ema_latency_ms;
+    out_stats->last_latency_ms = gov->last_latency_ms;
+    out_stats->current_tier = gov->current_tier;
 }

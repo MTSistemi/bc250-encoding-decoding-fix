@@ -1,4 +1,4 @@
-﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: GPL-3.0-only
@@ -174,7 +174,7 @@ typedef struct bc250_gpu_context {
      * pair, the per-frame vkCmdCopyBuffer and the per-frame shadow_copy() were
      * all moving 16x more data than anything consumed. At 1440p that is 44.2 MB
      * of staging (out of a 2.65 GiB host-visible heap, the smaller half of this
-     * APU's ~8 GB GART/GTT aperture - see DEVLOG Â§21) and 22.1 MB of copy +
+     * APU's ~8 GB GART/GTT aperture - see DEVLOG §21) and 22.1 MB of copy +
      * 22.1 MB of memcpy per frame, for 1.4 MB of actually-used values.
      *
      * dct_transform.comp (P/inter) and intra_wavefront.comp (I) now write this

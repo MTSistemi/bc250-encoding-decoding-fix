@@ -1,4 +1,4 @@
-﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
@@ -16,6 +16,14 @@
 
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+#if defined(__linux__)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sched.h>
+#include <pthread.h>
 #endif
 
 #define STATIC_MB_THRESHOLD 512
@@ -134,6 +142,48 @@ void cpu_simd_me_config_init(cpu_simd_me_config_t *cfg, uint32_t width, uint32_t
     cfg->height_in_mbs = (height + 15) / 16;
     cfg->search_radius = 8;
     cfg->num_threads = 2; /* Strictly limit to 2 worker threads on Zen 2 */
+    cfg->core_ids[0] = -1;
+    cfg->core_ids[1] = -1;
+
+    const char *env_cores = getenv("BC250_CPU_CORES");
+    if (env_cores && *env_cores) {
+        char buf[64];
+        strncpy(buf, env_cores, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        char *token = strtok(buf, ",");
+        int idx = 0;
+        while (token && idx < 2) {
+            int c = atoi(token);
+            if (c >= 0 && c < 256) {
+                cfg->core_ids[idx++] = c;
+            }
+            token = strtok(NULL, ",");
+        }
+    }
+}
+
+static void cpu_simd_apply_thread_affinity(int thread_id, const cpu_simd_me_config_t *cfg)
+{
+#if defined(__linux__)
+    if (!cfg) return;
+    int target_core = -1;
+    if (cfg->core_ids[0] >= 0) {
+        if (thread_id == 0) {
+            target_core = cfg->core_ids[0];
+        } else if (thread_id == 1) {
+            target_core = (cfg->core_ids[1] >= 0) ? cfg->core_ids[1] : cfg->core_ids[0];
+        }
+    }
+    if (target_core >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(target_core, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    }
+#else
+    (void)thread_id;
+    (void)cfg;
+#endif
 }
 
 typedef struct {
@@ -169,10 +219,12 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
     sad_16x16_fn_t sad_fn = cpu_simd_get_sad_fn();
 
 #ifdef _OPENMP
-#pragma omp parallel for num_threads(threads) schedule(static)
-#endif
-    for (int mby = 0; mby < (int)height_mbs; mby++) {
-        for (int mbx = 0; mbx < (int)width_mbs; mbx++) {
+#pragma omp parallel num_threads(threads)
+    {
+        cpu_simd_apply_thread_affinity(omp_get_thread_num(), cfg);
+#pragma omp for schedule(static)
+        for (int mby = 0; mby < (int)height_mbs; mby++) {
+            for (int mbx = 0; mbx < (int)width_mbs; mbx++) {
             uint32_t mb_idx = (uint32_t)mby * width_mbs + (uint32_t)mbx;
             int px = mbx * 16;
             int py = mby * 16;
@@ -268,6 +320,9 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
             out_mvs[mb_idx]._pad = 0;
         }
     }
+#ifdef _OPENMP
+    }
+#endif
 
     return 0;
 }
