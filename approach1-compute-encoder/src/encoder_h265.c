@@ -1,4 +1,4 @@
-﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
@@ -363,6 +363,7 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
                                     uint32_t width, uint32_t height,
                                     uint32_t fps, uint32_t bitrate)
 {
+    if (width == 0 || height == 0) return NULL;
     hevc_encoder_t *enc = calloc(1, sizeof(hevc_encoder_t));
     if (!enc) return NULL;
 
@@ -1451,7 +1452,10 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
                                        encoder->dl_uv, (int)encoder->width,
                                        (int)encoder->width, (int)encoder->height);
 
-            if (cpu_simd_me_search_frame(encoder->dl_y, (int)encoder->width,
+            pad_replicate(encoder->src_y, encoder->coded_width, encoder->coded_height,
+                          encoder->dl_y, encoder->width, encoder->width, encoder->height);
+
+            if (cpu_simd_me_search_frame(encoder->src_y, (int)encoder->coded_width,
                                          encoder->prev_recon_y, (int)encoder->coded_width,
                                          encoder->width, encoder->height,
                                          encoder->gpu_mvs,

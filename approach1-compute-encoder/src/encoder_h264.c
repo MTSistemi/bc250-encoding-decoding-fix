@@ -1,4 +1,4 @@
-﻿/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.1 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
@@ -1626,6 +1626,7 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
                                     uint32_t fps, uint32_t bitrate,
                                     int profile)
 {
+    if (width == 0 || height == 0) return NULL;
     h264_encoder_t *encoder = calloc(1, sizeof(h264_encoder_t));
     if (!encoder) return NULL;
 
