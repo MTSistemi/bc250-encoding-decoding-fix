@@ -189,6 +189,40 @@ static void test_spatial_predictor_and_boundaries(void)
     printf("  ✓ Spatial predictor & boundary handling verified!\n");
 }
 
+static void test_sad_equivalence_with_scalar(void)
+{
+    printf("[TEST] Testing SIMD SAD equivalence against scalar oracle across patterns...\n");
+
+    uint8_t a[64 * 64];
+    uint8_t b[64 * 64];
+
+    for (int i = 0; i < 64 * 64; i++) {
+        a[i] = (uint8_t)((i * 37 + 13) & 0xFF);
+        b[i] = (uint8_t)((i * 19 + 71) & 0xFF);
+    }
+
+    for (int y = 0; y < 40; y += 4) {
+        for (int x = 0; x < 40; x += 4) {
+            const uint8_t *p_a = a + y * 64 + x;
+            const uint8_t *p_b = b + y * 64 + x;
+
+            /* Compute reference scalar SAD */
+            uint32_t ref_sad = 0;
+            for (int r = 0; r < 16; r++) {
+                for (int c = 0; c < 16; c++) {
+                    int d = (int)p_a[r * 64 + c] - (int)p_b[r * 64 + c];
+                    ref_sad += (d < 0) ? -d : d;
+                }
+            }
+
+            uint32_t simd_sad = cpu_simd_sad_16x16(p_a, 64, p_b, 64);
+            assert(simd_sad == ref_sad);
+        }
+    }
+
+    printf("  ✓ SIMD (AVX2/SSE2) vs scalar equivalence verified!\n");
+}
+
 int main(void)
 {
     printf("========================================\n");
@@ -196,6 +230,7 @@ int main(void)
     printf("========================================\n");
 
     test_sad_16x16();
+    test_sad_equivalence_with_scalar();
     test_motion_search();
     test_spatial_predictor_and_boundaries();
 

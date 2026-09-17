@@ -252,11 +252,36 @@ static void test_dynamic_qp_and_rate_control(void) {
     printf("[test_hevc_encode] Dynamic QP and rate control OK.\n");
 }
 
+static void test_hevc_governor(void) {
+    printf("[test_hevc_encode] Testing dynamic governor integration...\n");
+    uint32_t width = 64, height = 64;
+    hevc_encoder_t *enc = hevc_encoder_create(NULL, width, height, 30, 2000000);
+    assert(enc);
+
+    /* Default governor tier must be Tier 0 (GPU Full) */
+    assert(hevc_encoder_get_governor_tier(enc) == 0);
+
+    /* Raw frame encoding must work cleanly without governor regressions */
+    size_t out_cap = (size_t)width * height * 2;
+    uint8_t *out_buf = malloc(out_cap);
+    uint8_t *y_plane = calloc(1, (size_t)width * height);
+    uint8_t *uv_plane = calloc(1, (size_t)width * (height / 2));
+    assert(out_buf && y_plane && uv_plane);
+
+    int w = hevc_encoder_encode_raw(enc, y_plane, (int)width, uv_plane, (int)width, out_buf, out_cap);
+    assert(w > 0);
+
+    free(y_plane); free(uv_plane); free(out_buf);
+    hevc_encoder_destroy(enc);
+    printf("[test_hevc_encode] Dynamic governor integration OK.\n");
+}
+
 int main(void) {
     test_transform_round_trip();
     test_mpm_derivation();
     test_multi_frame_gop();
     test_dynamic_qp_and_rate_control();
+    test_hevc_governor();
 
     printf("[test_hevc_encode] ALL HEVC BITSTREAM STRUCTURE TESTS PASSED!\n");
     return 0;

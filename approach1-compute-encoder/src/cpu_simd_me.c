@@ -21,10 +21,47 @@
 #define STATIC_MB_THRESHOLD 512
 #define EARLY_TERMINATION_COST 768
 
-uint32_t cpu_simd_sad_16x16(const uint8_t *src, int src_stride,
-                            const uint8_t *ref, int ref_stride)
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+#define HAS_AVX2_KRNL 1
+#include <immintrin.h>
+
+__attribute__((target("avx2")))
+static uint32_t cpu_simd_sad_16x16_avx2(const uint8_t *src, int src_stride,
+                                        const uint8_t *ref, int ref_stride)
 {
+    __m256i acc0 = _mm256_setzero_si256();
+    __m256i acc1 = _mm256_setzero_si256();
+    for (int r = 0; r < 16; r += 4) {
+        __m128i s0 = _mm_loadu_si128((const __m128i *)(src + r * src_stride));
+        __m128i s1 = _mm_loadu_si128((const __m128i *)(src + (r + 1) * src_stride));
+        __m128i rf0 = _mm_loadu_si128((const __m128i *)(ref + r * ref_stride));
+        __m128i rf1 = _mm_loadu_si128((const __m128i *)(ref + (r + 1) * ref_stride));
+        __m256i s_pair0 = _mm256_set_m128i(s1, s0);
+        __m256i rf_pair0 = _mm256_set_m128i(rf1, rf0);
+        acc0 = _mm256_add_epi64(acc0, _mm256_sad_epu8(s_pair0, rf_pair0));
+
+        __m128i s2 = _mm_loadu_si128((const __m128i *)(src + (r + 2) * src_stride));
+        __m128i s3 = _mm_loadu_si128((const __m128i *)(src + (r + 3) * src_stride));
+        __m128i rf2 = _mm_loadu_si128((const __m128i *)(ref + (r + 2) * ref_stride));
+        __m128i rf3 = _mm_loadu_si128((const __m128i *)(ref + (r + 3) * ref_stride));
+        __m256i s_pair1 = _mm256_set_m128i(s3, s2);
+        __m256i rf_pair1 = _mm256_set_m128i(rf3, rf2);
+        acc1 = _mm256_add_epi64(acc1, _mm256_sad_epu8(s_pair1, rf_pair1));
+    }
+    __m256i acc = _mm256_add_epi64(acc0, acc1);
+    __m128i low128 = _mm256_castsi256_si128(acc);
+    __m128i high128 = _mm256_extracti128_si256(acc, 1);
+    __m128i sum128 = _mm_add_epi64(low128, high128);
+    uint32_t a = (uint32_t)_mm_cvtsi128_si32(sum128);
+    uint32_t b = (uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(sum128, 8));
+    return a + b;
+}
+#endif
+
 #if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+static uint32_t cpu_simd_sad_16x16_sse2(const uint8_t *src, int src_stride,
+                                        const uint8_t *ref, int ref_stride)
+{
     __m128i acc0 = _mm_setzero_si128();
     __m128i acc1 = _mm_setzero_si128();
     for (int r = 0; r < 16; r += 2) {
@@ -39,7 +76,12 @@ uint32_t cpu_simd_sad_16x16(const uint8_t *src, int src_stride,
     uint32_t lo = (uint32_t)_mm_cvtsi128_si32(acc);
     uint32_t hi = (uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(acc, 8));
     return lo + hi;
-#else
+}
+#endif
+
+static uint32_t cpu_simd_sad_16x16_scalar(const uint8_t *src, int src_stride,
+                                          const uint8_t *ref, int ref_stride)
+{
     uint32_t sad = 0;
     for (int r = 0; r < 16; r++) {
         const uint8_t *s = src + r * src_stride;
@@ -50,7 +92,37 @@ uint32_t cpu_simd_sad_16x16(const uint8_t *src, int src_stride,
         }
     }
     return sad;
+}
+
+typedef uint32_t (*sad_16x16_fn_t)(const uint8_t *src, int src_stride,
+                                   const uint8_t *ref, int ref_stride);
+
+static sad_16x16_fn_t g_sad_fn = NULL;
+
+static inline sad_16x16_fn_t cpu_simd_get_sad_fn(void)
+{
+    if (g_sad_fn) {
+        return g_sad_fn;
+    }
+#if defined(HAS_AVX2_KRNL)
+    if (__builtin_cpu_supports("avx2")) {
+        g_sad_fn = cpu_simd_sad_16x16_avx2;
+        return g_sad_fn;
+    }
 #endif
+#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+    g_sad_fn = cpu_simd_sad_16x16_sse2;
+#else
+    g_sad_fn = cpu_simd_sad_16x16_scalar;
+#endif
+    return g_sad_fn;
+}
+
+uint32_t cpu_simd_sad_16x16(const uint8_t *src, int src_stride,
+                            const uint8_t *ref, int ref_stride)
+{
+    sad_16x16_fn_t fn = cpu_simd_get_sad_fn();
+    return fn(src, src_stride, ref, ref_stride);
 }
 
 void cpu_simd_me_config_init(cpu_simd_me_config_t *cfg, uint32_t width, uint32_t height)
@@ -94,6 +166,8 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
     const int max_x = (int)(width_mbs * 16);
     const int max_y = (int)(height_mbs * 16);
 
+    sad_16x16_fn_t sad_fn = cpu_simd_get_sad_fn();
+
 #ifdef _OPENMP
 #pragma omp parallel for num_threads(threads) schedule(static)
 #endif
@@ -107,7 +181,7 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
             const uint8_t *ref_mb_zero = ref_y + py * ref_pitch + px;
 
             /* 1. Fast Zero-Motion Check (SAD at (0, 0)) */
-            uint32_t zero_sad = cpu_simd_sad_16x16(curr_mb, src_pitch, ref_mb_zero, ref_pitch);
+            uint32_t zero_sad = sad_fn(curr_mb, src_pitch, ref_mb_zero, ref_pitch);
 
             /* Early exit if block is static (saves execution time on video/game content) */
             if (zero_sad <= STATIC_MB_THRESHOLD) {
@@ -135,7 +209,7 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
                         if (test_rx >= 0 && test_rx + 16 <= max_x &&
                             test_ry >= 0 && test_ry + 16 <= max_y) {
                             const uint8_t *cand_ref = ref_y + test_ry * ref_pitch + test_rx;
-                            uint32_t cand_sad = cpu_simd_sad_16x16(curr_mb, src_pitch, cand_ref, ref_pitch);
+                            uint32_t cand_sad = sad_fn(curr_mb, src_pitch, cand_ref, ref_pitch);
                             uint32_t cost = cand_sad + lambda_motion * (uint32_t)(abs(left_mv.x) + abs(left_mv.y));
                             if (cost < best_cost) {
                                 best_cost = cost;
@@ -174,7 +248,7 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
                     }
 
                     const uint8_t *cand_ref = ref_y + test_ref_y * ref_pitch + test_ref_x;
-                    uint32_t cand_sad = cpu_simd_sad_16x16(curr_mb, src_pitch, cand_ref, ref_pitch);
+                    uint32_t cand_sad = sad_fn(curr_mb, src_pitch, cand_ref, ref_pitch);
                     uint32_t cost = cand_sad + lambda_motion * (uint32_t)(abs(cand_x) + abs(cand_y));
 
                     if (cost < best_cost) {

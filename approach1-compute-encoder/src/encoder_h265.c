@@ -72,6 +72,8 @@
 #include "bitstream.h"
 #include "hevc_cabac.h"
 #include "hevc_intra.h"
+#include "dynamic_governor.h"
+#include "cpu_simd_me.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -349,6 +351,10 @@ struct hevc_encoder {
 
     uint8_t *scratch_out;
     size_t   scratch_out_cap;
+
+    /* Dynamic asymmetric CPU/GPU load balancing governor & SIMD ME config */
+    dynamic_governor_t governor;
+    cpu_simd_me_config_t me_cfg;
 };
 
 static uint32_t round_up16(uint32_t v) { return (v + 15u) & ~15u; }
@@ -440,6 +446,9 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
         hevc_encoder_destroy(enc);
         return NULL;
     }
+
+    dynamic_governor_init(&enc->governor);
+    cpu_simd_me_config_init(&enc->me_cfg, width, height);
 
     return enc;
 }
@@ -554,6 +563,11 @@ void hevc_encoder_set_max_frame_size(hevc_encoder_t *encoder, uint32_t max_frame
 uint32_t hevc_encoder_get_max_frame_size(const hevc_encoder_t *encoder)
 {
     return encoder ? encoder->max_frame_bits : 0;
+}
+
+int hevc_encoder_get_governor_tier(const hevc_encoder_t *encoder)
+{
+    return encoder ? (int)dynamic_governor_get_tier(&encoder->governor) : 0;
 }
 
 void hevc_encoder_destroy(hevc_encoder_t *encoder)
@@ -1402,18 +1416,63 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
     encoder->num_gpu_mvs = 0;
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
 
+    governor_tier_t tier = dynamic_governor_get_tier(&encoder->governor);
+
+    /* Dynamic Governor Tier 3: Emergency Failover.
+     * When GPU is in severe lockup/contention (>15.5ms), skip submitting new GPU work
+     * this frame to avoid worsening GPU stalls and keep stream deadline intact. */
+    if (!is_idr && tier == GOV_TIER_3_FAILOVER) {
+        dynamic_governor_notify_failover_handled(&encoder->governor);
+        if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
+            gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
+                                       encoder->dl_y, (int)encoder->width,
+                                       encoder->dl_uv, (int)encoder->width,
+                                       (int)encoder->width, (int)encoder->height);
+        } else {
+            memset(encoder->dl_y, 128, (size_t)encoder->width * encoder->height);
+            memset(encoder->dl_uv, 128, (size_t)(encoder->width / 2) * (encoder->height / 2) * 2);
+        }
+        return encode_core(encoder, output_buf, output_size);
+    }
+
     /* Preserve the existing driver's Vulkan image-layout-transition and
      * staging/fence contract (see va_backend.c's bc250_EndPicture() comment).
      * By passing is_intra = (is_idr ? 1 : 0), the GPU computes motion
      * estimation for each 16x16 CTU on P-slices across its 40 CUs! */
     if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
-        gpu_compute_begin_picture(gpu_ctx, input_surface);
-        gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height,
-                                     encoder->qp, is_idr ? 1 : 0, 1);
-        gpu_compute_end_picture(gpu_ctx);
-        gpu_compute_sync(gpu_ctx);
+        gpu_mv_t *cpu_mvs = NULL;
+        int me_mode = (tier == GOV_TIER_1_GPU_FAST) ? 1 : 0;
 
-        if (!is_idr && encoder->has_ref && encoder->gpu_mvs) {
+        /* Dynamic Governor Tier 2: CPU SIMD Motion Estimation Offload.
+         * If GPU is saturated (>12ms), download the frame first and run AVX2/SSE2 ME on Zen 2 CPU. */
+        if (!is_idr && tier == GOV_TIER_2_CPU_OFFLOAD && encoder->has_ref && encoder->gpu_mvs) {
+            gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
+                                       encoder->dl_y, (int)encoder->width,
+                                       encoder->dl_uv, (int)encoder->width,
+                                       (int)encoder->width, (int)encoder->height);
+
+            if (cpu_simd_me_search_frame(encoder->dl_y, (int)encoder->width,
+                                         encoder->prev_recon_y, (int)encoder->coded_width,
+                                         encoder->width, encoder->height,
+                                         encoder->gpu_mvs,
+                                         &encoder->me_cfg) == 0) {
+                encoder->num_gpu_mvs = encoder->width_ctu * encoder->height_ctu;
+                cpu_mvs = encoder->gpu_mvs;
+                me_mode = 2; /* Inform shader to bypass Vulkan ME and take CPU MVs */
+            }
+        }
+
+        if (gpu_compute_begin_picture(gpu_ctx, input_surface) == 0) {
+            gpu_compute_dispatch_encode_ext(gpu_ctx, input_surface, encoder->width, encoder->height,
+                                            encoder->qp, is_idr ? 1 : 0, 1, me_mode, cpu_mvs);
+            gpu_compute_end_picture(gpu_ctx);
+            if (gpu_compute_sync(gpu_ctx) == 0) {
+                double last_gpu_lat = gpu_compute_get_last_latency_ms(gpu_ctx);
+                dynamic_governor_update(&encoder->governor, last_gpu_lat);
+            }
+        }
+
+        if (!is_idr && encoder->has_ref && encoder->gpu_mvs && me_mode != 2) {
             void *mv_data = NULL;
             size_t mv_size = 0;
             if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0 && mv_data) {
@@ -1424,10 +1483,12 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
             }
         }
 
-        gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
-                                   encoder->dl_y, (int)encoder->width,
-                                   encoder->dl_uv, (int)encoder->width,
-                                   (int)encoder->width, (int)encoder->height);
+        if (me_mode != 2) {
+            gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
+                                       encoder->dl_y, (int)encoder->width,
+                                       encoder->dl_uv, (int)encoder->width,
+                                       (int)encoder->width, (int)encoder->height);
+        }
     } else {
         memset(encoder->dl_y, 128, (size_t)encoder->width * encoder->height);
         memset(encoder->dl_uv, 128, (size_t)(encoder->width / 2) * (encoder->height / 2) * 2);
