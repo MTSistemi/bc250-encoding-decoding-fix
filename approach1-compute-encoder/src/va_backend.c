@@ -5,6 +5,14 @@
  *
  * va_backend.c - Complete VA-API Backend Driver Implementation for AMD BC-250
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "va_backend.h"
 #include <stdlib.h>
 #include <string.h>
@@ -1669,6 +1677,18 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
     data->max_height = BC250_MAX_HEIGHT;
     ctx->pDriverData = data;
     ctx->str_vendor = "AMD BC-250 RDNA2 Compute VA-API Driver";
+
+#ifdef _OPENMP
+    /* OpenMP Thread Pool & Wait Policy Management:
+     * When loaded into a host process like Steam (via 32-bit or 64-bit libva),
+     * GCC libgomp default behavior is to spin-wait (ACTIVE) across all host logical cores
+     * (16 threads on BC-250), consuming 600%+ host CPU between video frames.
+     * Force passive waiting and limit default threads to 2 (preserving 75% Zen 2 headroom). */
+    setenv("OMP_WAIT_POLICY", "PASSIVE", 0);
+    setenv("GOMP_SPINCOUNT", "0", 0);
+    omp_set_dynamic(0);
+    omp_set_num_threads(2);
+#endif
 
     /* libva's core vaInitialize() validates these counts and the vtable
      * completeness before returning control to the driver's caller - both

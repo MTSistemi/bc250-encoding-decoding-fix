@@ -76,6 +76,8 @@ The driver monitors Vulkan encode compute latency in real-time. When intense 3D 
 | `BC250_GOVERNOR_ENABLE` | `1` / `0` | `1` (Enabled) | Enable or disable dynamic CPU/GPU load balancing. |
 | `BC250_GOVERNOR_STATS` | `1` or `N` | `0` (Disabled) | Print live telemetry stats every `N` frames to `stderr` (1 = every 60 frames). |
 | `BC250_CPU_CORES` | `6,7` or `c1,c2` | Unpinned | Pin encoder worker threads to specific CPU cores. |
+| `BC250_MAX_CPU_THREADS` | `1` to `8` | `2` | Cap maximum OpenMP worker threads for slice entropy coding (protects host game headroom). |
+| `BC250_DISABLE_OPENMP` | `1` / `0` | `0` | Force strictly single-threaded slice encoding without OpenMP thread pool overhead. |
 | `BC250_SLICES_PER_FRAME` | `1` to `16` | `1` (or `4` recommended) | Divide frame into independent slices for multi-threaded decoding. |
 | `BC250_FORCE_TIER` | `0`, `1`, `2`, `3` | `-1` (Auto) | Force a specific governor tier for benchmarking/debugging. |
 | `BC250_HEVC_QP` | `1` to `51` | `27` | Base quantization parameter for HEVC encoder. |
@@ -116,3 +118,12 @@ Verify `/dev/dri/renderD128` exists and permissions allow read/write:
 ls -l /dev/dri/render*
 ```
 If multiple GPUs exist in the system, set `DRI_PRIME` or point Sunshine to the BC-250 render node.
+
+### 3. Steam Link & Steam Remote Play Setup
+Steam client runs as a 32-bit process on Linux and requires the companion 32-bit driver installed in the 32-bit DRI directory:
+```bash
+sudo install -Dm755 bc250_drv_video.so /usr/lib32/dri/bc250_drv_video.so
+# Debian/Ubuntu multiarch:
+sudo install -Dm755 bc250_drv_video.so /usr/lib/i386-linux-gnu/dri/bc250_drv_video.so
+```
+In `streaming_log.txt` (or Steam console output), verify that Steam loads `/usr/lib32/dri/bc250_drv_video.so`. The driver automatically enforces passive OpenMP thread waiting (`OMP_WAIT_POLICY=PASSIVE`, `GOMP_SPINCOUNT=0`) and caps slice worker threads to 2 (`BC250_MAX_CPU_THREADS=2`) to guarantee low host CPU usage.

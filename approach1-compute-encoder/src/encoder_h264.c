@@ -2614,10 +2614,21 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
     slice_output_t slices[16];
     memset(slices, 0, sizeof(slices));
 
+    int threads = (num_slices < 2) ? 1 : (num_slices > 2 ? 2 : num_slices);
+    const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
+    if (env_threads) {
+        int t = atoi(env_threads);
+        if (t >= 1 && t <= 8) threads = (num_slices < t) ? num_slices : t;
+    }
+    const char *env_no_omp = getenv("BC250_DISABLE_OPENMP");
+    if (env_no_omp && (strcmp(env_no_omp, "0") != 0 && strcmp(env_no_omp, "false") != 0)) {
+        threads = 1;
+    }
+
     int num_threads_used = 1;
 
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if(num_slices > 1)
+#pragma omp parallel for schedule(static) num_threads(threads) if(threads > 1 && num_slices > 1)
 #endif
     for (int s = 0; s < num_slices; s++) {
 #ifdef _OPENMP
@@ -3182,8 +3193,19 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
     raw_slice_output_t slices[16];
     memset(slices, 0, sizeof(slices));
 
+    int threads = (num_slices < 2) ? 1 : (num_slices > 2 ? 2 : num_slices);
+    const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
+    if (env_threads) {
+        int t = atoi(env_threads);
+        if (t >= 1 && t <= 8) threads = (num_slices < t) ? num_slices : t;
+    }
+    const char *env_no_omp = getenv("BC250_DISABLE_OPENMP");
+    if (env_no_omp && (strcmp(env_no_omp, "0") != 0 && strcmp(env_no_omp, "false") != 0)) {
+        threads = 1;
+    }
+
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if(num_slices > 1)
+#pragma omp parallel for schedule(static) num_threads(threads) if(threads > 1 && num_slices > 1)
 #endif
     for (int s = 0; s < num_slices; s++) {
         uint32_t start_mb = (uint32_t)(s * encoder->total_mbs / num_slices);
