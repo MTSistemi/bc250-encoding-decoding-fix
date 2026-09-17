@@ -1,4 +1,4 @@
-/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.3 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only
@@ -275,7 +275,11 @@ static size_t write_pps(uint8_t *buf, size_t buf_size, int init_qp) {
     bs_write1(&bs, 0);   /* tiles_enabled_flag */
     bs_write1(&bs, 0);   /* entropy_coding_sync_enabled_flag */
     bs_write1(&bs, 1);   /* pps_loop_filter_across_slices_enabled_flag */
-    bs_write1(&bs, 0);   /* deblocking_filter_control_present_flag (defaults apply: enabled, offsets 0) */
+    bs_write1(&bs, 1);   /* deblocking_filter_control_present_flag = 1 (we need to disable deblock) */
+    bs_write1(&bs, 0);   /* deblocking_filter_override_enabled_flag = 0 */
+    bs_write1(&bs, 1);   /* pps_deblocking_filter_disabled_flag = 1 (encoder has no deblock filter;
+                           * leaving this enabled causes reference-frame mismatch drift on P-frames
+                           * because the decoder deblocks its reference but our encoder doesn't) */
     bs_write1(&bs, 0);   /* pps_scaling_list_data_present_flag */
     bs_write1(&bs, 0);   /* lists_modification_present_flag */
     bs_write_ue(&bs, 0); /* log2_parallel_merge_level_minus2 */

@@ -1,4 +1,4 @@
-/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.3 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: GPL-3.0-only
@@ -1684,8 +1684,8 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
      * GCC libgomp default behavior is to spin-wait (ACTIVE) across all host logical cores
      * (16 threads on BC-250), consuming 600%+ host CPU between video frames.
      * Force passive waiting and limit default threads to 2 (preserving 75% Zen 2 headroom). */
-    setenv("OMP_WAIT_POLICY", "PASSIVE", 0);
-    setenv("GOMP_SPINCOUNT", "0", 0);
+    setenv("OMP_WAIT_POLICY", "PASSIVE", 1);
+    setenv("GOMP_SPINCOUNT", "0", 1);
     omp_set_dynamic(0);
     omp_set_num_threads(2);
 #endif

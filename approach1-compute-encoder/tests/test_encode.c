@@ -1,4 +1,4 @@
-/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.3 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * test_encode.c - End-to-end H.264 bitstream syntax & decode test
  */

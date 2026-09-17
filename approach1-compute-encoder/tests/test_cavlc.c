@@ -1,4 +1,4 @@
-/* bc250-encoding-decoding-fix v0.4.2 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-encoding-decoding-fix v0.4.3 - https://github.com/simpmix/bc250-encoding-decoding-fix */
 /*
  * test_cavlc.c - Spec-conformance unit tests for H.264 CAVLC entropy engine
  *                Tests ITU-T H.264 Section 9.2 tables, trailing ones,
