@@ -125,13 +125,13 @@ static void test_spatial_predictor_and_boundaries(void)
     memset(ref, 120, width * height);
     memset(cur, 120, width * height);
 
-    /* Move both mb(1, 1) and mb(2, 1) by (+3, +2) */
-    int shift_x = 3;
+    /* Move both mb(1, 1) and mb(2, 1) by (+2, +2) */
+    int shift_x = 2;
     int shift_y = 2;
     for (int mbx = 1; mbx <= 2; mbx++) {
         for (int y = 0; y < 16; y++) {
             for (int x = 0; x < 16; x++) {
-                cur[(16 + y) * pitch + (mbx * 16 + x)] = (uint8_t)((x * 17 + y * 11 + mbx * 23) % 256);
+                cur[(16 + y) * pitch + (mbx * 16 + x)] = (uint8_t)((x * 13 + y * 7 + mbx * 30) % 256);
                 ref[(16 + shift_y + y) * pitch + (mbx * 16 + shift_x + x)] = cur[(16 + y) * pitch + (mbx * 16 + x)];
             }
         }
@@ -149,6 +149,9 @@ static void test_spatial_predictor_and_boundaries(void)
 
     int rc = cpu_simd_me_search_frame(cur, pitch, ref, pitch, width, height, mvs, &cfg);
     assert(rc == 0);
+
+    printf("  Predictor test: mvs[5]=(%d,%d,sad=%u), mvs[6]=(%d,%d,sad=%u)\n",
+           mvs[5].mvx, mvs[5].mvy, mvs[5].sad, mvs[6].mvx, mvs[6].mvy, mvs[6].sad);
 
     /* mb(1, 1) index: 1 * 4 + 1 = 5 */
     /* mb(2, 1) index: 1 * 4 + 2 = 6 */
