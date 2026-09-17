@@ -117,16 +117,16 @@ static void test_governor_telemetry_stats(void)
     for (int i = 0; i < 5; i++) {
         dynamic_governor_update(&gov, 5.0);
     }
-    for (int i = 0; i < 5; i++) {
-        dynamic_governor_update(&gov, 13.0);
+    for (int i = 0; i < 10; i++) {
+        dynamic_governor_update(&gov, 14.0);
     }
 
     governor_stats_t stats;
     dynamic_governor_get_stats(&gov, &stats);
-    assert(stats.total_frames == 10);
+    assert(stats.total_frames == 15);
     assert(stats.total_tier0_frames >= 4);
     assert(stats.total_offload_frames >= 1);
-    assert(stats.last_latency_ms == 13.0);
+    assert(stats.last_latency_ms == 14.0);
 
     /* Test NULL safety */
     dynamic_governor_get_stats(NULL, &stats);

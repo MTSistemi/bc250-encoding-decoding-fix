@@ -80,44 +80,42 @@ governor_tier_t dynamic_governor_update(dynamic_governor_t *gov, double gpu_late
     if (gpu_latency_ms >= gov->tier3_threshold_ms) {
         gov->current_tier = GOV_TIER_3_FAILOVER;
         gov->stable_frames_count = 0;
+    } else if (gov->current_tier == GOV_TIER_3_FAILOVER) {
+        /* Drop from Tier 3 to Tier 2 immediately after the emergency frame */
+        gov->current_tier = GOV_TIER_2_CPU_OFFLOAD;
+        gov->stable_frames_count = 0;
     } else if (metric >= gov->tier2_threshold_ms) {
         /* Upward tier transitions happen immediately to prevent dropped frames */
-        if (gov->current_tier != GOV_TIER_2_CPU_OFFLOAD) {
+        if (gov->current_tier < GOV_TIER_2_CPU_OFFLOAD) {
             gov->current_tier = GOV_TIER_2_CPU_OFFLOAD;
+            gov->stable_frames_count = 0;
+        } else {
+            gov->stable_frames_count = 0;
+        }
+    } else if (gov->current_tier == GOV_TIER_2_CPU_OFFLOAD) {
+        /* Downward tier transitions from Tier 2 require hysteresis to avoid fluttering */
+        gov->stable_frames_count++;
+        if (gov->stable_frames_count >= gov->step_down_hysteresis) {
+            gov->current_tier = (metric >= gov->tier1_threshold_ms) ? GOV_TIER_1_GPU_FAST : GOV_TIER_0_GPU_FULL;
             gov->stable_frames_count = 0;
         }
     } else if (metric >= gov->tier1_threshold_ms) {
+        /* Upward tier transition to Tier 1 */
         if (gov->current_tier < GOV_TIER_1_GPU_FAST) {
             gov->current_tier = GOV_TIER_1_GPU_FAST;
             gov->stable_frames_count = 0;
+        } else {
+            gov->stable_frames_count = 0;
+        }
+    } else if (gov->current_tier == GOV_TIER_1_GPU_FAST) {
+        /* Downward tier transitions from Tier 1 require hysteresis */
+        gov->stable_frames_count++;
+        if (gov->stable_frames_count >= gov->step_down_hysteresis) {
+            gov->current_tier = GOV_TIER_0_GPU_FULL;
+            gov->stable_frames_count = 0;
         }
     } else {
-        /* Downward tier transitions require hysteresis to avoid fluttering */
-        if (gov->current_tier == GOV_TIER_3_FAILOVER) {
-            /* Drop from Tier 3 to Tier 2 immediately after the emergency frame */
-            gov->current_tier = GOV_TIER_2_CPU_OFFLOAD;
-            gov->stable_frames_count = 0;
-        } else if (gov->current_tier == GOV_TIER_2_CPU_OFFLOAD) {
-            if (metric < gov->tier2_threshold_ms) {
-                gov->stable_frames_count++;
-                if (gov->stable_frames_count >= gov->step_down_hysteresis) {
-                    gov->current_tier = (metric >= gov->tier1_threshold_ms) ? GOV_TIER_1_GPU_FAST : GOV_TIER_0_GPU_FULL;
-                    gov->stable_frames_count = 0;
-                }
-            } else {
-                gov->stable_frames_count = 0;
-            }
-        } else if (gov->current_tier == GOV_TIER_1_GPU_FAST) {
-            if (metric < gov->tier1_threshold_ms) {
-                gov->stable_frames_count++;
-                if (gov->stable_frames_count >= gov->step_down_hysteresis) {
-                    gov->current_tier = GOV_TIER_0_GPU_FULL;
-                    gov->stable_frames_count = 0;
-                }
-            } else {
-                gov->stable_frames_count = 0;
-            }
-        }
+        gov->stable_frames_count = 0;
     }
 
     if (gov->current_tier == GOV_TIER_0_GPU_FULL) gov->total_tier0_frames++;
