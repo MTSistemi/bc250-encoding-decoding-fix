@@ -2614,7 +2614,7 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
     slice_output_t slices[16];
     memset(slices, 0, sizeof(slices));
 
-    int threads = (num_slices < 2) ? 1 : (num_slices > 2 ? 2 : num_slices);
+    int threads = 1;
     const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
     if (env_threads) {
         int t = atoi(env_threads);
@@ -3193,7 +3193,7 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
     raw_slice_output_t slices[16];
     memset(slices, 0, sizeof(slices));
 
-    int threads = (num_slices < 2) ? 1 : (num_slices > 2 ? 2 : num_slices);
+    int threads = 1;
     const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
     if (env_threads) {
         int t = atoi(env_threads);

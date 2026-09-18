@@ -239,14 +239,14 @@ void hevc_cabac_encode_bin(hevc_cabac_t *cb, int ctx_idx, uint32_t bin) {
     cb->low = low << num_bits;
     cb->range = range << num_bits;
     cb->bits_left += num_bits;
-    if (cb->bits_left >= 0) cabac_write_out(cb);
+    while (cb->bits_left >= 0) cabac_write_out(cb);
 }
 
 void hevc_cabac_encode_bypass(hevc_cabac_t *cb, uint32_t bin) {
     cb->low <<= 1;
     if (bin) cb->low += cb->range;
     cb->bits_left++;
-    if (cb->bits_left >= 0) cabac_write_out(cb);
+    while (cb->bits_left >= 0) cabac_write_out(cb);
 }
 
 void hevc_cabac_encode_bypass_bins(hevc_cabac_t *cb, uint32_t value, int num_bins) {
@@ -257,12 +257,12 @@ void hevc_cabac_encode_bypass_bins(hevc_cabac_t *cb, uint32_t value, int num_bin
         cb->low += cb->range * pattern;
         value -= pattern << num_bins;
         cb->bits_left += 8;
-        if (cb->bits_left >= 0) cabac_write_out(cb);
+        while (cb->bits_left >= 0) cabac_write_out(cb);
     }
     cb->low <<= num_bins;
     cb->low += cb->range * value;
     cb->bits_left += num_bins;
-    if (cb->bits_left >= 0) cabac_write_out(cb);
+    while (cb->bits_left >= 0) cabac_write_out(cb);
 }
 
 void hevc_cabac_encode_terminate(hevc_cabac_t *cb, uint32_t bin) {
@@ -279,7 +279,7 @@ void hevc_cabac_encode_terminate(hevc_cabac_t *cb, uint32_t bin) {
         cb->range <<= 1;
         cb->bits_left++;
     }
-    if (cb->bits_left >= 0) cabac_write_out(cb);
+    while (cb->bits_left >= 0) cabac_write_out(cb);
 }
 
 void hevc_cabac_finish(hevc_cabac_t *cb) {

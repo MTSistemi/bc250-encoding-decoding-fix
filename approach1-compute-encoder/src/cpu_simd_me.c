@@ -142,7 +142,12 @@ void cpu_simd_me_config_init(cpu_simd_me_config_t *cfg, uint32_t width, uint32_t
     cfg->width_in_mbs = (width + 15) / 16;
     cfg->height_in_mbs = (height + 15) / 16;
     cfg->search_radius = 8;
-    cfg->num_threads = 2; /* Strictly limit to 2 worker threads on Zen 2 */
+    cfg->num_threads = 1; /* Default to 1 worker thread to preserve CPU headroom */
+    const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
+    if (env_threads && *env_threads) {
+        int t = atoi(env_threads);
+        if (t > 0 && t <= 8) cfg->num_threads = t;
+    }
     cfg->core_ids[0] = -1;
     cfg->core_ids[1] = -1;
 
@@ -206,7 +211,7 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
     if (max_rad < 2) max_rad = 2;
     if (max_rad > 16) max_rad = 16;
 
-    int threads = (cfg && cfg->num_threads > 0) ? cfg->num_threads : 2;
+    int threads = (cfg && cfg->num_threads > 0) ? cfg->num_threads : 1;
     if (threads > 2) threads = 2; /* Cap at 2 threads to guarantee game CPU headroom */
 
     const ivec2_t search_pattern[8] = {
@@ -220,7 +225,7 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
     sad_16x16_fn_t sad_fn = cpu_simd_get_sad_fn();
 
 #ifdef _OPENMP
-#pragma omp parallel num_threads(threads)
+#pragma omp parallel num_threads(threads) if(threads > 1)
     {
         cpu_simd_apply_thread_affinity(omp_get_thread_num(), cfg);
 #pragma omp for schedule(static)

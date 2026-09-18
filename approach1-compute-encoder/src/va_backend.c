@@ -1683,11 +1683,18 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
      * When loaded into a host process like Steam (via 32-bit or 64-bit libva),
      * GCC libgomp default behavior is to spin-wait (ACTIVE) across all host logical cores
      * (16 threads on BC-250), consuming 600%+ host CPU between video frames.
-     * Force passive waiting and limit default threads to 2 (preserving 75% Zen 2 headroom). */
+     * Force passive waiting and limit default threads to 1 (preserving maximum Zen 2 headroom).
+     * Multi-threading can be explicitly enabled by the user via BC250_MAX_CPU_THREADS. */
     setenv("OMP_WAIT_POLICY", "PASSIVE", 1);
     setenv("GOMP_SPINCOUNT", "0", 1);
     omp_set_dynamic(0);
-    omp_set_num_threads(2);
+    const char *max_t = getenv("BC250_MAX_CPU_THREADS");
+    int def_threads = 1;
+    if (max_t && *max_t) {
+        int v = atoi(max_t);
+        if (v > 0 && v <= 8) def_threads = v;
+    }
+    omp_set_num_threads(def_threads);
 #endif
 
     /* libva's core vaInitialize() validates these counts and the vtable

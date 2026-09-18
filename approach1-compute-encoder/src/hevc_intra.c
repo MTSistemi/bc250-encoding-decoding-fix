@@ -125,12 +125,16 @@ static int zorder_available(int nx, int ny, int width, int height, int is_luma, 
  * be positionally-plausible but z-scan-unavailable (see zorder_rank()'s
  * comment above). */
 static void gather_neighbors(const uint8_t *plane, int stride, int width, int height,
-                              int x0, int y0, int is_luma, uint8_t left[5], uint8_t top[5], uint8_t *corner) {
+                              int x0, int y0, int is_luma, uint8_t left[5], uint8_t top[5], uint8_t *corner,
+                              int *avail_left_out, int *avail_top_out) {
     long long cur_rank = zorder_rank(x0, y0, width, is_luma);
     int avail_left = zorder_available(x0 - 1, y0, width, height, is_luma, cur_rank);
     int avail_top = zorder_available(x0, y0 - 1, width, height, is_luma, cur_rank);
     int avail_corner = zorder_available(x0 - 1, y0 - 1, width, height, is_luma, cur_rank);
     int avail_top_right = zorder_available(x0 + 4, y0 - 1, width, height, is_luma, cur_rank);
+
+    if (avail_left_out) *avail_left_out = avail_left;
+    if (avail_top_out) *avail_top_out = avail_top;
 
     uint8_t sv[10];
     uint8_t sa[10];
@@ -190,7 +194,8 @@ static void gather_neighbors(const uint8_t *plane, int stride, int width, int he
 void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
                       int x0, int y0, int mode, int is_luma, uint8_t pred_out[16]) {
     uint8_t left[5], top[5], corner;
-    gather_neighbors(recon_plane, stride, width, height, x0, y0, is_luma, left, top, &corner);
+    int avail_left = 0, avail_top = 0;
+    gather_neighbors(recon_plane, stride, width, height, x0, y0, is_luma, left, top, &corner, &avail_left, &avail_top);
 
     switch (mode) {
     case HEVC_MODE_PLANAR:
@@ -203,12 +208,27 @@ void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int hei
         break;
 
     case HEVC_MODE_DC: {
-        int dc = (left[0] + left[1] + left[2] + left[3] + top[0] + top[1] + top[2] + top[3] + 4) >> 3;
+        int dc;
+        if (avail_left && avail_top) {
+            dc = (left[0] + left[1] + left[2] + left[3] + top[0] + top[1] + top[2] + top[3] + 4) >> 3;
+        } else if (avail_top) {
+            dc = (top[0] + top[1] + top[2] + top[3] + 2) >> 2;
+        } else if (avail_left) {
+            dc = (left[0] + left[1] + left[2] + left[3] + 2) >> 2;
+        } else {
+            dc = 128;
+        }
         for (int i = 0; i < 16; i++) pred_out[i] = (uint8_t)dc;
         if (is_luma) {
-            pred_out[0] = (uint8_t)((left[0] + 2 * dc + top[0] + 2) >> 2);
-            for (int x = 1; x < 4; x++) pred_out[x] = (uint8_t)((top[x] + 3 * dc + 2) >> 2);
-            for (int y = 1; y < 4; y++) pred_out[y * 4] = (uint8_t)((left[y] + 3 * dc + 2) >> 2);
+            if (avail_left && avail_top) {
+                pred_out[0] = (uint8_t)((left[0] + 2 * dc + top[0] + 2) >> 2);
+                for (int x = 1; x < 4; x++) pred_out[x] = (uint8_t)((top[x] + 3 * dc + 2) >> 2);
+                for (int y = 1; y < 4; y++) pred_out[y * 4] = (uint8_t)((left[y] + 3 * dc + 2) >> 2);
+            } else if (avail_top) {
+                for (int x = 0; x < 4; x++) pred_out[x] = (uint8_t)((top[x] + 3 * dc + 2) >> 2);
+            } else if (avail_left) {
+                for (int y = 0; y < 4; y++) pred_out[y * 4] = (uint8_t)((left[y] + 3 * dc + 2) >> 2);
+            }
         }
         break;
     }

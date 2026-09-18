@@ -81,11 +81,12 @@
 #include <emmintrin.h>
 #endif
 
+#define NAL_UNIT_CODED_SLICE_TRAIL_R     1
+#define NAL_UNIT_CODED_SLICE_IDR_W_RADL 19
 #define NAL_UNIT_VPS               32
 #define NAL_UNIT_SPS               33
 #define NAL_UNIT_PPS               34
-#define NAL_UNIT_CODED_SLICE_TRAIL_R     1
-#define NAL_UNIT_CODED_SLICE_IDR_W_RADL 19
+#define NAL_UNIT_AUD               35
 
 #define HEVC_CTU_SIZE 16
 #define HEVC_CU_SIZE   8
@@ -141,6 +142,22 @@ static void write_profile_tier_level(bitstream_t *bs, int level_idc) {
     bs_write_u(bs, 16, 0);
     bs_write_u(bs, 12, 0); /* reserved_zero_44bits */
     bs_write_u(bs, 8, level_idc);
+}
+
+static size_t write_aud_hevc(uint8_t *buf, size_t buf_size, bool is_idr) {
+    uint8_t rbsp[8];
+    bitstream_t bs;
+    bs_init(&bs, rbsp, sizeof(rbsp));
+    /* pic_type: 0 for I-slices only, 1 for P and I slices */
+    bs_write_u(&bs, 3, is_idr ? 0 : 1);
+    bs_rbsp_trailing_bits(&bs);
+
+    bitstream_t out_bs;
+    bs_init(&out_bs, buf, buf_size);
+    bs_write_nal_header_hevc(&out_bs, NAL_UNIT_AUD);
+    size_t off = bs_bytes_written(&out_bs);
+    if (off >= buf_size) return 0;
+    return off + bs_rbsp_to_ebsp(buf + off, buf_size - off, rbsp, bs_bytes_written(&bs));
 }
 
 static size_t write_vps(uint8_t *buf, size_t buf_size) {
@@ -274,7 +291,7 @@ static size_t write_pps(uint8_t *buf, size_t buf_size, int init_qp) {
     bs_write1(&bs, 0);   /* transquant_bypass_enable_flag */
     bs_write1(&bs, 0);   /* tiles_enabled_flag */
     bs_write1(&bs, 0);   /* entropy_coding_sync_enabled_flag */
-    bs_write1(&bs, 1);   /* pps_loop_filter_across_slices_enabled_flag */
+    bs_write1(&bs, 0);   /* pps_loop_filter_across_slices_enabled_flag = 0 */
     bs_write1(&bs, 1);   /* deblocking_filter_control_present_flag = 1 (we need to disable deblock) */
     bs_write1(&bs, 0);   /* deblocking_filter_override_enabled_flag = 0 */
     bs_write1(&bs, 1);   /* pps_deblocking_filter_disabled_flag = 1 (encoder has no deblock filter;
@@ -1150,7 +1167,8 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     }
 
     bs_write_se(&slice_bs, slice_qp_delta); /* slice_qp_delta relative to active PPS */
-    bs_write1(&slice_bs, 1);   /* slice_loop_filter_across_slices_enabled_flag */
+    /* When pps_loop_filter_across_slices_enabled_flag is 0 and deblocking is disabled,
+     * slice_loop_filter_across_slices_enabled_flag is NOT present in slice header per Rec. ITU-T H.265 7.3.6.1. */
 
     bs_rbsp_trailing_bits(&slice_bs);
 
@@ -1173,6 +1191,7 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     bs_rbsp_trailing_bits(&slice_bs);
 
     size_t total = 0;
+    total += write_aud_hevc(encoder->scratch_out + total, encoder->scratch_out_cap - total, is_idr);
     if (write_param_sets) {
         total += write_vps(encoder->scratch_out + total, encoder->scratch_out_cap - total);
         total += write_sps(encoder->scratch_out + total, encoder->scratch_out_cap - total,
