@@ -223,7 +223,7 @@ static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_
 
     bs_write_ue(&bs, 0); /* bit_depth_luma_minus8 */
     bs_write_ue(&bs, 0); /* bit_depth_chroma_minus8 */
-    bs_write_ue(&bs, 0); /* log2_max_pic_order_cnt_lsb_minus4 (log2=4; unused - every frame is IDR) */
+    bs_write_ue(&bs, 4); /* log2_max_pic_order_cnt_lsb_minus4 = 4 -> log2=8 (0..255) */
 
     bs_write1(&bs, 1); /* sps_sub_layer_ordering_info_present_flag */
     bs_write_ue(&bs, 1); /* sps_max_dec_pic_buffering_minus1 = 1 (1 ref + 1 current pic) */
@@ -723,6 +723,24 @@ static inline uint32_t compute_sad_4x4_chroma(const uint8_t *src_cb,
 #endif
 }
 
+static inline uint32_t hevc_cu_rank(uint32_t width_ctu, int cux, int cuy) {
+    uint32_t ctu_col = (uint32_t)cux / 2;
+    uint32_t ctu_row = (uint32_t)cuy / 2;
+    uint32_t cu_sub = ((uint32_t)cuy & 1) * 2 + ((uint32_t)cux & 1);
+    return (ctu_row * width_ctu + ctu_col) * 4 + cu_sub;
+}
+
+static inline bool hevc_cu_is_available(uint32_t width_ctu, uint32_t height_ctu,
+                                        int cur_cux, int cur_cuy,
+                                        int nb_cux, int nb_cuy)
+{
+    if (nb_cux < 0 || nb_cuy < 0) return false;
+    if (nb_cux >= (int)(width_ctu * 2) || nb_cuy >= (int)(height_ctu * 2)) return false;
+    uint32_t cur_rank = hevc_cu_rank(width_ctu, cur_cux, cur_cuy);
+    uint32_t nb_rank = hevc_cu_rank(width_ctu, nb_cux, nb_cuy);
+    return nb_rank < cur_rank;
+}
+
 /* Derives spatial merge candidates matching ITU-T H.265 Section 8.5.3.2.2.
  * Output cand_mvs has exactly 5 candidates (padded with (0,0)), in 1/4-pel units.
  * All candidates are strictly derived from spatial neighbors or zero-vectors,
@@ -731,98 +749,91 @@ static int derive_merge_candidates(const hevc_encoder_t *enc,
                                    int cux, int cuy,
                                    hevc_mv_t cand_mvs[5])
 {
-    int num_cand = 0;
     uint32_t w_cu = enc->width_ctu * 2;
     uint32_t h_cu = enc->height_ctu * 2;
-    int cu_in_ctu = (cuy & 1) * 2 + (cux & 1); /* 0=TL, 1=TR, 2=BL, 3=BR */
 
     hevc_mv_t spatial_cand[5];
     int num_spatial = 0;
 
-    /* 1. Candidate A1 (Left): (cu_x - 1, cu_y + 7) -> CU (cux - 1, cuy) */
-    bool a1_avail = false;
+    /* 1. Candidate A1 (Left): (cux - 1, cuy) */
+    bool a1_has_inter = false;
     hevc_mv_t mv_a1 = {0, 0};
-    if (cux > 0) {
+    if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux - 1, cuy)) {
         uint32_t a1_idx = (uint32_t)cuy * w_cu + (uint32_t)(cux - 1);
         if (enc->cu_is_inter[a1_idx]) {
-            a1_avail = true;
+            a1_has_inter = true;
             mv_a1.x = enc->mv_x_map[a1_idx];
             mv_a1.y = enc->mv_y_map[a1_idx];
             spatial_cand[num_spatial++] = mv_a1;
         }
     }
 
-    /* 2. Candidate B1 (Above): (cu_x + 7, cu_y - 1) -> CU (cux, cuy - 1) */
-    bool b1_avail = false;
+    /* 2. Candidate B1 (Above): (cux, cuy - 1) */
+    bool b1_has_inter = false;
     hevc_mv_t mv_b1 = {0, 0};
-    if (cuy > 0) {
+    if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux, cuy - 1)) {
         uint32_t b1_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)cux;
         if (enc->cu_is_inter[b1_idx]) {
+            b1_has_inter = true;
             mv_b1.x = enc->mv_x_map[b1_idx];
             mv_b1.y = enc->mv_y_map[b1_idx];
             /* Pruning: B1 against A1 */
-            if (!a1_avail || mv_b1.x != mv_a1.x || mv_b1.y != mv_a1.y) {
-                b1_avail = true;
+            if (!a1_has_inter || mv_b1.x != mv_a1.x || mv_b1.y != mv_a1.y) {
                 spatial_cand[num_spatial++] = mv_b1;
             }
         }
     }
 
-    /* 3. Candidate B0 (Above-Right): (cu_x + 8, cu_y - 1) -> CU (cux + 1, cuy - 1) */
+    /* 3. Candidate B0 (Above-Right): (cux + 1, cuy - 1) */
+    bool b0_has_inter = false;
     hevc_mv_t mv_b0 = {0, 0};
-    bool b0_pos_avail = false;
-    if (cuy > 0 && (cux + 1) < (int)w_cu) {
-        if (cu_in_ctu != 3) {
-            b0_pos_avail = true;
-        }
-    }
-    if (b0_pos_avail) {
+    if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux + 1, cuy - 1)) {
         uint32_t b0_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)(cux + 1);
         if (enc->cu_is_inter[b0_idx]) {
+            b0_has_inter = true;
             mv_b0.x = enc->mv_x_map[b0_idx];
             mv_b0.y = enc->mv_y_map[b0_idx];
             /* Pruning: B0 against B1 */
-            if (!b1_avail || mv_b0.x != mv_b1.x || mv_b0.y != mv_b1.y) {
+            if (!b1_has_inter || mv_b0.x != mv_b1.x || mv_b0.y != mv_b1.y) {
                 spatial_cand[num_spatial++] = mv_b0;
             }
         }
     }
 
-    /* 4. Candidate A0 (Below-Left): (cu_x - 1, cu_y + 8) -> CU (cux - 1, cuy + 1) */
+    /* 4. Candidate A0 (Below-Left): (cux - 1, cuy + 1) */
+    bool a0_has_inter = false;
     hevc_mv_t mv_a0 = {0, 0};
-    bool a0_pos_avail = false;
-    if (cux > 0 && (cuy + 1) < (int)h_cu) {
-        if (cu_in_ctu == 0) {
-            a0_pos_avail = true;
-        }
-    }
-    if (a0_pos_avail) {
+    if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux - 1, cuy + 1)) {
         uint32_t a0_idx = (uint32_t)(cuy + 1) * w_cu + (uint32_t)(cux - 1);
         if (enc->cu_is_inter[a0_idx]) {
+            a0_has_inter = true;
             mv_a0.x = enc->mv_x_map[a0_idx];
             mv_a0.y = enc->mv_y_map[a0_idx];
             /* Pruning: A0 against A1 */
-            if (!a1_avail || mv_a0.x != mv_a1.x || mv_a0.y != mv_a1.y) {
+            if (!a1_has_inter || mv_a0.x != mv_a1.x || mv_a0.y != mv_a1.y) {
                 spatial_cand[num_spatial++] = mv_a0;
             }
         }
     }
 
-    /* 5. Candidate B2 (Above-Left): (cu_x - 1, cu_y - 1) -> CU (cux - 1, cuy - 1) */
-    if (num_spatial < 4 && cux > 0 && cuy > 0) {
-        uint32_t b2_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)(cux - 1);
-        if (enc->cu_is_inter[b2_idx]) {
-            hevc_mv_t mv_b2;
-            mv_b2.x = enc->mv_x_map[b2_idx];
-            mv_b2.y = enc->mv_y_map[b2_idx];
-            /* Pruning: B2 against A1 and B1 */
-            if ((!a1_avail || mv_b2.x != mv_a1.x || mv_b2.y != mv_a1.y) &&
-                (!b1_avail || mv_b2.x != mv_b1.x || mv_b2.y != mv_b1.y)) {
-                spatial_cand[num_spatial++] = mv_b2;
+    /* 5. Candidate B2 (Above-Left): (cux - 1, cuy - 1) */
+    if (num_spatial < 4) {
+        if (hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy, cux - 1, cuy - 1)) {
+            uint32_t b2_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)(cux - 1);
+            if (enc->cu_is_inter[b2_idx]) {
+                hevc_mv_t mv_b2;
+                mv_b2.x = enc->mv_x_map[b2_idx];
+                mv_b2.y = enc->mv_y_map[b2_idx];
+                /* Pruning: B2 against A1 and B1 */
+                if ((!a1_has_inter || mv_b2.x != mv_a1.x || mv_b2.y != mv_a1.y) &&
+                    (!b1_has_inter || mv_b2.x != mv_b1.x || mv_b2.y != mv_b1.y)) {
+                    spatial_cand[num_spatial++] = mv_b2;
+                }
             }
         }
     }
 
+    int num_cand = 0;
     for (int i = 0; i < num_spatial && num_cand < 5; i++) {
         cand_mvs[num_cand++] = spatial_cand[i];
     }
@@ -1160,7 +1171,7 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     bs_write_ue(&slice_bs, is_idr ? 2 : 1); /* slice_type: 2 = I, 1 = P */
 
     if (!is_idr) {
-        bs_write_u(&slice_bs, 4, encoder->poc & 0xF); /* slice_pic_order_cnt_lsb */
+        bs_write_u(&slice_bs, 8, encoder->poc & 0xFF); /* slice_pic_order_cnt_lsb */
         bs_write1(&slice_bs, 1);                       /* short_term_ref_pic_set_sps_flag = 1 */
         bs_write1(&slice_bs, 0);                       /* num_ref_idx_active_override_flag = 0 */
         bs_write_ue(&slice_bs, 0);                      /* five_minus_max_num_merge_cand = 0 */

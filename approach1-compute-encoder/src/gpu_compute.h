@@ -37,6 +37,7 @@ typedef struct {
 typedef struct {
     VkDeviceMemory memory;
     VkDeviceSize size;
+    void *mapped_ptr;
 } gpu_memory_t;
 
 /* Real, Vulkan-derived NV12 plane layout for an already-created+bound

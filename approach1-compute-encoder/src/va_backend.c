@@ -300,11 +300,21 @@ VAStatus bc250_CreateSurfaces(VADriverContextP ctx, int width, int height, int f
                 break;
             }
 
+            void *mapped = NULL;
+            if (surf->memory.memory && vkMapMemory(data->gpu.device, surf->memory.memory, 0, surf->memory.size, 0, &mapped) == VK_SUCCESS) {
+                surf->mapped_ptr = mapped;
+                surf->memory.mapped_ptr = mapped;
+            } else {
+                surf->mapped_ptr = NULL;
+                surf->memory.mapped_ptr = NULL;
+            }
+
             surf->allocated = 1;
             surf->width = width;
             surf->height = height;
             surf->format = format;
             surf->ref_count = 1;
+            surf->is_exported = 0;
 
             surfaces[allocated++] = i;
         }
@@ -340,9 +350,15 @@ static void bc250_surface_unref(bc250_driver_data *data, VASurfaceID id) {
         surf->ref_count--;
     }
     if (surf->ref_count <= 0) {
+        if (surf->mapped_ptr && surf->memory.memory) {
+            vkUnmapMemory(data->gpu.device, surf->memory.memory);
+            surf->mapped_ptr = NULL;
+            surf->memory.mapped_ptr = NULL;
+        }
         gpu_compute_destroy_image(&data->gpu, surf->image, surf->memory);
         surf->allocated = 0;
         surf->pending_destroy = 0;
+        surf->is_exported = 0;
     }
 }
 
@@ -498,8 +514,12 @@ VAStatus bc250_CreateBuffer(VADriverContextP ctx, VAContextID context, VABufferT
     (void)context;
 
     DRIVER_LOCK(data);
-    for (int i = 0; i < MAX_BUFFERS; i++) {
+    int start_idx = data->next_buffer_hint;
+    if (start_idx < 0 || start_idx >= MAX_BUFFERS) start_idx = 0;
+    for (int count = 0; count < MAX_BUFFERS; count++) {
+        int i = (start_idx + count) % MAX_BUFFERS;
         if (!data->buffers[i].allocated) {
+            data->next_buffer_hint = (i + 1) % MAX_BUFFERS;
             bc250_buffer *b = &data->buffers[i];
             b->type = type;
             b->size = size;
@@ -658,7 +678,7 @@ VAStatus bc250_DestroyBuffer(VADriverContextP ctx, VABufferID buffer_id) {
     }
     bc250_buffer *b = &data->buffers[buffer_id];
     if (b->is_derived) {
-        if (b->gpu_mem) {
+        if (b->gpu_mem != VK_NULL_HANDLE) {
             /* Unmap while the surface's VkDeviceMemory is still guaranteed
              * alive (it can't have been freed yet: this buffer's own
              * reference, taken in bc250_DeriveImage(), is still held at
@@ -1020,25 +1040,18 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
          * the dma-buf bc250_ExportSurfaceHandle() exported for this same
          * surface (see gpu_compute_wait_for_image_ready()'s doc comment in
          * gpu_compute.h for the full story). Queue an explicit GPU-side wait
-         * for that write before the encode dispatch below reads the surface -
-         * a no-op (returns -1, has_pending_wait_semaphore stays false) if
-         * VK_KHR_external_semaphore_fd wasn't available at device creation. */
-        gpu_compute_wait_for_image_ready(&data->gpu, surf->memory);
+         * for that write before the encode dispatch below reads the surface.
+         * For surfaces not exported via dma-buf (e.g. standard FFmpeg hwupload),
+         * skip this to avoid unnecessary syscall and error overhead. */
+        if (surf->is_exported) {
+            gpu_compute_wait_for_image_ready(&data->gpu, surf->memory);
+        }
 
         int written = -1;
         gpu_compute_debug_dump_real_input(&data->gpu, &surf->image, surf->memory, surf->width, surf->height);
         if (c->h264_enc && bc250_pipeline_enabled()) {
             /* Pipelined: submit THIS frame's GPU work first, then finish the
-             * PREVIOUS frame on the CPU. That order is the entire point - the
-             * GPU chews on frame N+1 while the CPU entropy-codes frame N,
-             * instead of the CPU idling ~4.2ms on a fence and the GPU then
-             * idling ~8ms through shadow_copy+CAVLC (DEVLOG 21.4's "no overlap"
-             * note, and the per-stage profile that confirmed it).
-             *
-             * The current frame's bitstream is NOT produced here; it is
-             * produced by whichever call next needs it - the following
-             * EndPicture, or bc250_SyncSurface()/bc250_MapBuffer() if the
-             * client reads before submitting another frame. */
+             * PREVIOUS frame on the CPU. */
             h264_pending_frame_t just_submitted;
             bool submitted = (h264_encoder_submit_frame_ext(c->h264_enc, &data->gpu,
                                                             surf->image, surf->memory, &just_submitted) == 0);
@@ -1050,15 +1063,33 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
                 c->pending_frame = just_submitted;
                 c->pending_coded_buf_id = c->coded_buf_id;
             }
-            /* written stays -1: nothing to report for this frame yet. The
-             * segment header is filled in by the deferred finish. */
         } else if (c->h264_enc) {
+            /* Synchronous H.264 encode: drop DRIVER_LOCK so concurrent FFmpeg
+             * filter/hwupload threads can derive/map/unmap next frames without
+             * stalling on the 10-15ms encoding duration. Pin surface ref_count
+             * to guarantee lifetime across the unlocked section. */
+            VASurfaceID target_surf_id = c->current_render_target;
+            surf->ref_count++;
+            DRIVER_UNLOCK(data);
+
             written = h264_encoder_encode_frame_ext(c->h264_enc, &data->gpu, surf->image, surf->memory, dest, max_payload);
+
+            DRIVER_LOCK(data);
+            bc250_surface_unref(data, target_surf_id);
         } else if (c->hevc_enc) {
+            /* Synchronous HEVC encode: drop DRIVER_LOCK with surface pinned */
+            VASurfaceID target_surf_id = c->current_render_target;
+            surf->ref_count++;
+            DRIVER_UNLOCK(data);
+
             written = hevc_encoder_encode_frame(c->hevc_enc, &data->gpu, surf->image, surf->memory, dest, max_payload);
+
+            DRIVER_LOCK(data);
+            bc250_surface_unref(data, target_surf_id);
         }
 
-        if (written > 0) {
+        if (written > 0 && VALID_ID(c->coded_buf_id, MAX_BUFFERS) && data->buffers[c->coded_buf_id].allocated) {
+            coded_buf = &data->buffers[c->coded_buf_id];
             VACodedBufferSegment *seg = (VACodedBufferSegment *)coded_buf->data;
             seg->size = (unsigned int)written;
             seg->bit_offset = 0;
@@ -1074,7 +1105,9 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
             seg->next = NULL;
         }
     } else {
-        gpu_compute_wait_for_image_ready(&data->gpu, surf->memory);
+        if (surf->is_exported) {
+            gpu_compute_wait_for_image_ready(&data->gpu, surf->memory);
+        }
         gpu_compute_begin_picture(&data->gpu, surf->image);
         gpu_compute_dispatch_encode(&data->gpu, surf->image, c->width, c->height, 26, 0, 1);
         gpu_compute_end_picture(&data->gpu);
@@ -1086,10 +1119,10 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
      * It receives gpu_image_t by value, so that transition only affects its
      * local copy -- surf here is a real pointer into data->surfaces[], so we
      * persist the real post-encode layout onto the surface's stored image
-     * state ourselves. This is what lets the next bc250_EndPicture() call for
-     * this surface pass the correct real old layout (GENERAL, not a hardcoded
-     * and spec-incorrect UNDEFINED) into gpu_compute_dispatch_encode(). */
-    surf->image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+     * state ourselves. */
+    if (VALID_ID(c->current_render_target, MAX_SURFACES) && data->surfaces[c->current_render_target].allocated) {
+        data->surfaces[c->current_render_target].image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+    }
 
     DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
@@ -1105,15 +1138,17 @@ VAStatus bc250_SyncSurface(VADriverContextP ctx, VASurfaceID render_target) {
         DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
-    /* A sync is a promise that this surface is done being read and its coded
-     * output is available, so any deferred frame has to be completed here
-     * rather than left in flight. Finishing unconditionally (there is at most
-     * one pending frame) only ever costs the overlap, never correctness. */
-    if (bc250_pipeline_enabled()) {
-        for (int i = 0; i < MAX_CONTEXTS; i++) {
-            if (data->contexts[i].allocated && data->contexts[i].has_pending_frame)
-                bc250_finish_pending_frame(data, &data->contexts[i]);
-        }
+    /* In non-pipelined mode (default), the synchronous encode call in bc250_EndPicture()
+     * has already waited for GPU completion and finalized bitstream generation.
+     * Returning success immediately avoids redundant fence waits and lock overhead. */
+    if (!bc250_pipeline_enabled()) {
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_SUCCESS;
+    }
+
+    for (int i = 0; i < MAX_CONTEXTS; i++) {
+        if (data->contexts[i].allocated && data->contexts[i].has_pending_frame)
+            bc250_finish_pending_frame(data, &data->contexts[i]);
     }
     int slot = gpu_compute_submitted_slot(&data->gpu);
     DRIVER_UNLOCK(data);
@@ -1294,13 +1329,19 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
     }
 
     if (buf && surf->memory.memory) {
-        void *mapped = NULL;
-        if (vkMapMemory(data->gpu.device, surf->memory.memory, 0, surf->memory.size, 0, &mapped) == VK_SUCCESS) {
+        void *mapped = surf->mapped_ptr;
+        int needs_unmap = 0;
+        if (!mapped) {
+            if (vkMapMemory(data->gpu.device, surf->memory.memory, 0, surf->memory.size, 0, &mapped) == VK_SUCCESS) {
+                needs_unmap = 1;
+            }
+        }
+        if (mapped) {
             if (buf->data) free(buf->data);
             buf->data = mapped;
             buf->mapped = 1;
             buf->is_derived = 1;
-            buf->gpu_mem = surf->memory.memory;
+            buf->gpu_mem = needs_unmap ? surf->memory.memory : VK_NULL_HANDLE;
             /* This derived image now aliases the surface's own Vulkan
              * memory directly (buf->data / buf->gpu_mem above). Take a
              * reference on the surface so vaDestroySurfaces() cannot free
@@ -1504,6 +1545,7 @@ VAStatus bc250_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id,
         desc->layers[0].pitch[1] = layout.uv_pitch;
     }
 
+    surf->is_exported = 1;
     DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
 }

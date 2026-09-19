@@ -1521,6 +1521,7 @@ int gpu_compute_create_image(gpu_context_t *ctx, int width, int height, int form
         VkDeviceSize total_size = uv_offset + uv_req.size;
 
         memory->size = total_size;
+        memory->mapped_ptr = NULL;
 
         uint32_t mem_bits = y_req.memoryTypeBits & uv_req.memoryTypeBits;
         if (mem_bits == 0) mem_bits = y_req.memoryTypeBits | uv_req.memoryTypeBits;
@@ -1650,7 +1651,9 @@ int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory) {
      * around afterward. */
     close(dmabuf_fd);
     if (ioctl_ret != 0) {
-        fprintf(stderr, "[bc250-gpu] DMA_BUF_IOCTL_EXPORT_SYNC_FILE failed: %s\n", strerror(errno));
+        if (getenv("BC250_DEBUG_DMABUF")) {
+            fprintf(stderr, "[bc250-gpu] DMA_BUF_IOCTL_EXPORT_SYNC_FILE failed: %s\n", strerror(errno));
+        }
         return -1;
     }
 
@@ -1663,7 +1666,9 @@ int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory) {
     };
     VkResult result = ctx->import_semaphore_fd_khr(ctx->device, &import_info);
     if (result != VK_SUCCESS) {
-        fprintf(stderr, "[bc250-gpu] vkImportSemaphoreFdKHR failed: %d\n", result);
+        if (getenv("BC250_DEBUG_DMABUF")) {
+            fprintf(stderr, "[bc250-gpu] vkImportSemaphoreFdKHR failed: %d\n", result);
+        }
         /* Import failed - the fd wasn't consumed, so it's still ours to close. */
         close(sync_file_info.fd);
         return -1;
@@ -1782,9 +1787,13 @@ int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t
     VkSubresourceLayout layout_uv;
     vkGetImageSubresourceLayout(ctx->device, image->uv_plane, &subresource_uv, &layout_uv);
 
-    uint8_t *mapped = NULL;
-    if (vkMapMemory(ctx->device, memory.memory, 0, memory.size, 0, (void **)&mapped) != VK_SUCCESS) {
-        return -1;
+    uint8_t *mapped = (uint8_t *)memory.mapped_ptr;
+    int needs_unmap = 0;
+    if (!mapped) {
+        if (vkMapMemory(ctx->device, memory.memory, 0, memory.size, 0, (void **)&mapped) != VK_SUCCESS) {
+            return -1;
+        }
+        needs_unmap = 1;
     }
 
     uint8_t *dst_y = mapped + layout_y.offset;
@@ -1797,7 +1806,9 @@ int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t
         memcpy(dst_uv + (size_t)r * layout_uv.rowPitch, uv_plane + (size_t)r * uv_pitch, width);
     }
 
-    vkUnmapMemory(ctx->device, memory.memory);
+    if (needs_unmap) {
+        vkUnmapMemory(ctx->device, memory.memory);
+    }
     return 0;
 }
 
@@ -1821,9 +1832,13 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
     VkSubresourceLayout layout_uv;
     vkGetImageSubresourceLayout(ctx->device, image->uv_plane, &subresource_uv, &layout_uv);
 
-    uint8_t *mapped = NULL;
-    if (vkMapMemory(ctx->device, memory.memory, 0, memory.size, 0, (void **)&mapped) != VK_SUCCESS) {
-        return -1;
+    uint8_t *mapped = (uint8_t *)memory.mapped_ptr;
+    int needs_unmap = 0;
+    if (!mapped) {
+        if (vkMapMemory(ctx->device, memory.memory, 0, memory.size, 0, (void **)&mapped) != VK_SUCCESS) {
+            return -1;
+        }
+        needs_unmap = 1;
     }
 
     const uint8_t *src_y = mapped + layout_y.offset;
@@ -1836,7 +1851,9 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
         memcpy(uv_plane + (size_t)r * uv_pitch, src_uv + (size_t)r * layout_uv.rowPitch, width);
     }
 
-    vkUnmapMemory(ctx->device, memory.memory);
+    if (needs_unmap) {
+        vkUnmapMemory(ctx->device, memory.memory);
+    }
     return 0;
 }
 

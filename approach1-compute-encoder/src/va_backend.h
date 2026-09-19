@@ -63,6 +63,8 @@ struct bc250_surface {
     int height;
     gpu_image_t image;
     gpu_memory_t memory;
+    void *mapped_ptr;        /* Persistent host-visible memory mapping */
+    int is_exported;         /* 1 if exported via vaExportSurfaceHandle (e.g. Sunshine) */
     int ref_count;
     /* Set by bc250_DestroySurfaces() the moment the application asks to
      * destroy this surface. From that point on the VASurfaceID is invalid
@@ -183,6 +185,7 @@ typedef struct {
     bc250_buffer buffers[MAX_BUFFERS];
     bc250_image images[MAX_IMAGES];
 
+    int next_buffer_hint;
     int max_width;
     int max_height;
 } bc250_driver_data;
