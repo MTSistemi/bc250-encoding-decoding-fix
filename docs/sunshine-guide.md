@@ -61,24 +61,30 @@ Open the Sunshine Web Configuration (`https://localhost:47990`) and set:
 The driver monitors Vulkan encode compute latency in real-time. When intense 3D scenes cause GPU contention, it shifts gears automatically:
 
 ```
-+--------------------------------------------------------------------------------+
-|  Tier 0: GPU Full ME   (< 8 ms)   - Full diamond search + subpel on 40 CUs     |
-|  Tier 1: GPU Fast ME   (>= 8 ms)  - Scaled search radius on GPU (~1 ms)        |
-|  Tier 2: CPU SIMD ME   (Optional) - Opt-in via BC250_ENABLE_CPU_ME=1           |
-|  Tier 3: Failover P-Skip (> 15.5ms) - Emergency bypass to prevent stream drop  |
-+--------------------------------------------------------------------------------+
++------------------------------------------------------------------------------------------------+
+|  Tier 0: GPU Full ME   (< 14 ms in Sunshine / < 8 ms default) - Full diamond search on 40 CUs  |
+|  Tier 1: GPU Fast ME   (>= 14 ms Sunshine / >= 8 ms default)  - Scaled search radius on GPU    |
+|  Tier 2: CPU SIMD ME   (Optional) - Opt-in via BC250_ENABLE_CPU_ME=1                          |
+|  Tier 3: Failover P-Skip (> 45 ms Sunshine / > 15.5 ms default) - Emergency bypass trip-wire   |
++------------------------------------------------------------------------------------------------+
 ```
+
+> [!NOTE]
+> **Sunshine Zero-Stutter Auto-Tuning (`v0.4.3`+)**: When Sunshine launches the encoder, the driver automatically auto-tunes the Tier 3 failover trip-wire from 15.5ms to **45.0ms** and grants 2 CPU worker threads for parallel slice entropy coding. This completely eliminates the `0.5 / 32 / 22 ms` frame latency oscillation caused by false-positive failover trips during complex frame encoding.
 
 ### Environment Variable Reference
 
 | Variable | Values | Default | Purpose |
 | :--- | :--- | :--- | :--- |
 | `BC250_GOVERNOR_ENABLE` | `1` / `0` | `1` (Enabled) | Enable or disable dynamic CPU/GPU load balancing. |
+| `BC250_GOVERNOR_TIER1_MS` | Float (`ms`) | `14.0` (Sunshine) / `8.0` | GPU latency threshold to transition into Tier 1 Fast ME. |
+| `BC250_GOVERNOR_TIER2_MS` | Float (`ms`) | `22.0` (Sunshine) / `12.0` | GPU latency threshold to transition into Tier 2 CPU SIMD offload. |
+| `BC250_GOVERNOR_TIER3_MS` | Float (`ms`) | `45.0` (Sunshine) / `15.5` | Emergency trip-wire threshold to emit failover P-Skip frame. |
 | `BC250_ENABLE_CPU_ME` | `1` / `0` | `0` (Disabled) | Opt-in to Tier 2 CPU SIMD ME offload. Keep `0` (default) for smooth zero-stutter GPU ME. |
 | `BC250_GOVERNOR_HYSTERESIS` | `1` to `30` | `4` | Number of stable frames required to step down tier (fast recovery from scene changes). |
 | `BC250_GOVERNOR_STATS` | `1` or `N` | `0` (Disabled) | Print live telemetry stats every `N` frames to `stderr` (1 = every 60 frames). |
 | `BC250_CPU_CORES` | `6,7` or `c1,c2` | Unpinned | Pin encoder worker threads to specific CPU cores. |
-| `BC250_MAX_CPU_THREADS` | `1` to `8` | `2` | Cap maximum OpenMP worker threads for slice entropy coding (protects host game headroom). |
+| `BC250_MAX_CPU_THREADS` | `1` to `8` | `2` (Sunshine) / `1` | Cap maximum OpenMP worker threads for slice entropy coding (protects host game headroom). |
 | `BC250_DISABLE_OPENMP` | `1` / `0` | `0` | Force strictly single-threaded slice encoding without OpenMP thread pool overhead. |
 | `BC250_SLICES_PER_FRAME` | `1` to `16` | `1` (or `4` recommended) | Divide frame into independent slices for multi-threaded decoding. |
 | `BC250_FORCE_TIER` | `0`, `1`, `2`, `3` | `-1` (Auto) | Force a specific governor tier for benchmarking/debugging. |
@@ -93,12 +99,11 @@ When `BC250_GOVERNOR_STATS=60` is set, Sunshine logs show the governor adapting 
 ```
 [bc250-gov] Frame 60: Tier 0 (GPU Full ME) | GPU: 4.82 ms | EMA: 5.10 ms | Offload: 0 | Failover: 0
 [bc250-gov] Frame 120: Tier 0 (GPU Full ME) | GPU: 5.15 ms | EMA: 5.08 ms | Offload: 0 | Failover: 0
-[bc250-gov] Frame 180: Tier 1 (GPU Fast ME) | GPU: 8.42 ms | EMA: 8.11 ms | Offload: 0 | Failover: 0
-[bc250-gov] Frame 240: Tier 2 (CPU SIMD Offload) | GPU: 12.80 ms | EMA: 12.35 ms | Offload: 18 | Failover: 0
-[bc250-gov] Frame 300: Tier 0 (GPU Full ME) | GPU: 4.90 ms | EMA: 5.25 ms | Offload: 22 | Failover: 0
+[bc250-gov] Frame 180: Tier 1 (GPU Fast ME) | GPU: 14.42 ms | EMA: 14.11 ms | Offload: 0 | Failover: 0
+[bc250-gov] Frame 240: Tier 0 (GPU Full ME) | GPU: 4.90 ms | EMA: 5.25 ms | Offload: 0 | Failover: 0
 ```
 
-Notice that as GPU contention rises, the encoder offloads motion estimation to CPU SIMD threads without dropping a single frame, and steps down smoothly with 15-frame hysteresis once GPU contention subsides.
+Notice that as GPU contention rises, the encoder scales search radius smoothly without dropping a single frame, and steps down smoothly with 4-frame hysteresis once GPU contention subsides.
 
 ---
 
