@@ -1923,6 +1923,12 @@ static void copia_da_wc(uint8_t *dst, const uint8_t *src, size_t n) {
     memcpy(dst, src, n);
 }
 
+/* Public wrapper: the H.264 path's shadow_copy() reads the same kind of
+ * write-combining staging memory and was paying the same price. */
+void gpu_compute_copy_from_wc(void *dst, const void *src, size_t n) {
+    copia_da_wc((uint8_t *)dst, (const uint8_t *)src, n);
+}
+
 int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,
                              uint8_t *y_plane, int y_pitch,
                              uint8_t *uv_plane, int uv_pitch,

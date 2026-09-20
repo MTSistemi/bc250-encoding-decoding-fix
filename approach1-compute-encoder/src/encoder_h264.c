@@ -424,7 +424,11 @@ static const void *shadow_copy(void **shadow_ptr, size_t *cap, const void *src, 
         *shadow_ptr = newbuf;
         *cap = size;
     }
-    memcpy(*shadow_ptr, src, size);
+    /* The source is mapped write-combining staging memory: an ordinary load
+     * fetches part of a line at a time. Measured on a BC-250, this memcpy was
+     * 14% of the H.264 encoder thread. MOVNTDQA reads a whole line into a fill
+     * buffer, and degrades to an ordinary load if the memory turns out cached. */
+    gpu_compute_copy_from_wc(*shadow_ptr, src, size);
     return *shadow_ptr;
 }
 
