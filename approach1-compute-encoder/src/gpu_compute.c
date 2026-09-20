@@ -788,6 +788,63 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         .timelineSemaphore = VK_TRUE
     };
 
+    /* 16-bit has to be ENABLED, not merely supported.
+     *
+     * deblock_filter, intra_wavefront, quantize and reconstruct declare Int16
+     * and StorageBuffer16BitAccess: quantized levels are stored as int16_t,
+     * as the buffer sizing above explains. That comment notes the device
+     * supports it - but supporting a feature and enabling it are different
+     * things in Vulkan, and a shader may only use what vkCreateDevice was
+     * asked for. Without these three the SPIR-V is invalid, and the
+     * validation layers say so in as many words:
+     *
+     *   vkCreateShaderModule(): SPIR-V Capability Int16 was declared, but one
+     *   of the following requirements is required
+     *   (VkPhysicalDeviceFeatures::shaderInt16)
+     *
+     * What happens when it is used anyway is undefined, and on RADV it is not
+     * subtle. Measured on a BC-250: HEVC segfaults inside libvulkan_radeon.so
+     * on v0.4.3, and on v0.4.2 it encodes an almost black picture - 5.3 dB
+     * PSNR against the source, where libx265 gives 61.8 dB on the same clip.
+     * H.264 survives because its hot path happens not to hit those shaders in
+     * the same way; that is luck, not design.
+     *
+     * The device is asked what it actually has rather than assumed at: one
+     * that lacks these still gets a working H.264 path and a line in the log
+     * saying why, instead of failing somewhere further along.
+     */
+    VkPhysicalDeviceVulkan11Features have11 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES
+    };
+    VkPhysicalDeviceFeatures2 have2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &have11
+    };
+    vkGetPhysicalDeviceFeatures2(ctx->physical_device, &have2);
+
+    VkPhysicalDeviceVulkan11Features features11 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+        .pNext = &features12,
+        .storageBuffer16BitAccess = have11.storageBuffer16BitAccess,
+        .uniformAndStorageBuffer16BitAccess = have11.uniformAndStorageBuffer16BitAccess
+    };
+    VkPhysicalDeviceFeatures2 features2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &features11
+    };
+    features2.features.shaderInt16 = have2.features.shaderInt16;
+
+    if (!have2.features.shaderInt16 || !have11.storageBuffer16BitAccess ||
+        !have11.uniformAndStorageBuffer16BitAccess) {
+        fprintf(stderr, "[bc250-gpu] warning: this device does not offer 16-bit "
+                        "shader support (shaderInt16=%d storageBuffer16=%d "
+                        "uniformAndStorageBuffer16=%d) - the shaders that use it "
+                        "will misbehave\n",
+                (int)have2.features.shaderInt16,
+                (int)have11.storageBuffer16BitAccess,
+                (int)have11.uniformAndStorageBuffer16BitAccess);
+    }
+
     /* VK_KHR_external_memory_fd (provides vkGetMemoryFdKHR) and
      * VK_EXT_external_memory_dma_buf (adds the DMA_BUF handle type these
      * NV12 images are created/allocated with - see gpu_compute_create_image())
@@ -888,7 +945,7 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
 
     VkDeviceCreateInfo dev_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = &features12,
+        .pNext = &features2,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &q_info,
         .enabledExtensionCount = device_ext_count,
