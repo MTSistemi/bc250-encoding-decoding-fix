@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <immintrin.h>
 #include <errno.h>
 #include <time.h>
 #include <unistd.h>
@@ -1869,6 +1870,59 @@ int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t
     return 0;
 }
 
+/* Reading a mapped surface back is a read from WRITE-COMBINING memory.
+ *
+ * The frame the HEVC encoder works on comes out of the VA surface through
+ * gpu_compute_download_nv12(), which used to memcpy row by row. WC memory has
+ * no cache line to fill, so an ordinary load fetches a few bytes at a time and
+ * the copy crawls: measured on a BC-250, 230 MB/s, which came to 40% of the
+ * entire HEVC encode - more than the transform, the quantiser, the intra
+ * prediction and CABAC put together.
+ *
+ * MOVNTDQA is the instruction for this case: it reads a full line into a fill
+ * buffer and hands it over in one go. On memory that IS cached it behaves like
+ * an ordinary load, so this is safe whichever way the driver ends up mapping
+ * the surface, and it does not need to be told which one happened.
+ *
+ * Dispatched at runtime like cpu_simd_me.c does, so a build that runs
+ * somewhere without AVX2 still works.
+ */
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx2")))
+static void copia_da_wc_avx2(uint8_t *dst, const uint8_t *src, size_t n) {
+    size_t i = 0;
+    /* MOVNTDQA needs a 32-byte aligned source: walk up to it normally. */
+    size_t testa = (size_t)((0u - (uintptr_t)src) & 31u);
+    if (testa > n) testa = n;
+    if (testa) { memcpy(dst, src, testa); i = testa; }
+    for (; i + 128 <= n; i += 128) {
+        __m256i a = _mm256_stream_load_si256((const __m256i *)(src + i));
+        __m256i b = _mm256_stream_load_si256((const __m256i *)(src + i + 32));
+        __m256i c = _mm256_stream_load_si256((const __m256i *)(src + i + 64));
+        __m256i d = _mm256_stream_load_si256((const __m256i *)(src + i + 96));
+        _mm256_storeu_si256((__m256i *)(dst + i), a);
+        _mm256_storeu_si256((__m256i *)(dst + i + 32), b);
+        _mm256_storeu_si256((__m256i *)(dst + i + 64), c);
+        _mm256_storeu_si256((__m256i *)(dst + i + 96), d);
+    }
+    for (; i + 32 <= n; i += 32) {
+        _mm256_storeu_si256((__m256i *)(dst + i),
+                            _mm256_stream_load_si256((const __m256i *)(src + i)));
+    }
+    if (i < n) memcpy(dst + i, src + i, n - i);
+    _mm_sfence();
+}
+#endif
+
+static void copia_da_wc(uint8_t *dst, const uint8_t *src, size_t n) {
+#if defined(__x86_64__) || defined(_M_X64)
+    static int ha_avx2 = -1;
+    if (ha_avx2 < 0) ha_avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
+    if (ha_avx2) { copia_da_wc_avx2(dst, src, n); return; }
+#endif
+    memcpy(dst, src, n);
+}
+
 int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,
                              uint8_t *y_plane, int y_pitch,
                              uint8_t *uv_plane, int uv_pitch,
@@ -1900,12 +1954,12 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
 
     const uint8_t *src_y = mapped + layout_y.offset;
     for (int r = 0; r < height; r++) {
-        memcpy(y_plane + (size_t)r * y_pitch, src_y + (size_t)r * layout_y.rowPitch, width);
+        copia_da_wc(y_plane + (size_t)r * y_pitch, src_y + (size_t)r * layout_y.rowPitch, (size_t)width);
     }
 
     const uint8_t *src_uv = mapped + uv_offset + layout_uv.offset;
     for (int r = 0; r < height / 2; r++) {
-        memcpy(uv_plane + (size_t)r * uv_pitch, src_uv + (size_t)r * layout_uv.rowPitch, width);
+        copia_da_wc(uv_plane + (size_t)r * uv_pitch, src_uv + (size_t)r * layout_uv.rowPitch, (size_t)width);
     }
 
     if (needs_unmap) {
