@@ -2394,6 +2394,71 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     return gpu_compute_dispatch_encode_ext(ctx, render_target, width, height, qp, is_intra, num_slices, 0, NULL);
 }
 
+int gpu_compute_dispatch_me_only(gpu_context_t *ctx, gpu_image_t render_target, int width, int height) {
+    if (!ctx || !ctx->motion_est_pipeline) return -1;
+
+    VkCommandBuffer cmd_buf = ctx->cmd_bufs[ctx->current_buf];
+    uint32_t width_mbs = ((uint32_t)width + 15) / 16;
+    uint32_t height_mbs = ((uint32_t)height + 15) / 16;
+
+    if (render_target.y_plane) {
+        transition_image_layout(cmd_buf, render_target.y_plane, render_target.current_layout, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    if (render_target.uv_plane) {
+        transition_image_layout(cmd_buf, render_target.uv_plane, render_target.current_layout, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    render_target.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkImageView ref_view = render_target.y_view;
+    if (ctx->has_recon_frame && ctx->recon_image.y_view != VK_NULL_HANDLE) {
+        ref_view = ctx->recon_image.y_view;
+    }
+
+    if (render_target.y_view) {
+        update_storage_image_descriptor(ctx->device, ctx->me_desc_set, 0, render_target.y_view);
+        update_storage_image_descriptor(ctx->device, ctx->me_desc_set, 1, ref_view);
+    }
+
+    uint32_t pc[8] = {
+        (uint32_t)width,
+        (uint32_t)height,
+        width_mbs,
+        height_mbs,
+        27, /* qp */
+        0,  /* is_intra = 0 for ME */
+        0,  /* color_space */
+        0   /* lambda_motion */
+    };
+
+    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->motion_est_pipeline);
+    vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->motion_est_layout, 0, 1, &ctx->me_desc_set, 0, NULL);
+    vkCmdPushConstants(cmd_buf, ctx->motion_est_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
+    insert_compute_barrier(cmd_buf);
+
+    VkBufferCopy mv_copy_region = { .srcOffset = 0, .dstOffset = 0, .size = ctx->mv_staging_size };
+    vkCmdCopyBuffer(cmd_buf, ctx->mv_buffer, ctx->mv_staging_buffers[ctx->current_buf], 1, &mv_copy_region);
+
+    /* Update recon_image with current frame's pixels for next frame's reference */
+    if (ctx->recon_image.y_plane && render_target.y_plane) {
+        transition_image_layout(cmd_buf, ctx->recon_image.y_plane, ctx->recon_image.current_layout, VK_IMAGE_LAYOUT_GENERAL);
+        ctx->recon_image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkImageCopy copy_region = {
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .srcOffset = { 0, 0, 0 },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .dstOffset = { 0, 0, 0 },
+            .extent = { (uint32_t)width, (uint32_t)height, 1 }
+        };
+        vkCmdCopyImage(cmd_buf, render_target.y_plane, VK_IMAGE_LAYOUT_GENERAL,
+                       ctx->recon_image.y_plane, VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region);
+        ctx->has_recon_frame = true;
+    }
+
+    return 0;
+}
+
 int gpu_compute_end_picture(gpu_context_t *ctx) {
     struct timespec e0, e1, s0, s1;
     if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &e0);

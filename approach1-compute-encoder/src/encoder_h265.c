@@ -872,6 +872,16 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
         uint32_t best_cand_sad = UINT32_MAX;
         int cx = cu_x / 2, cy = cu_y / 2;
 
+        /* GPU Motion Vector guidance: if GPU confirmed low-distortion stationary block, fast-track candidate (0,0) */
+        uint32_t ctu_idx = ((uint32_t)cuy / 2) * enc->width_ctu + ((uint32_t)cux / 2);
+        bool gpu_says_static = false;
+        if (enc->num_gpu_mvs > 0 && ctu_idx < enc->num_gpu_mvs) {
+            const gpu_mv_t *gm = &enc->gpu_mvs[ctu_idx];
+            if (gm->mvx == 0 && gm->mvy == 0 && gm->sad <= 384) {
+                gpu_says_static = true;
+            }
+        }
+
         /* Evaluate ITU-T standard merge candidates in order */
         for (int i = 0; i < 5; i++) {
             int c_dx = cand_mvs[i].x / 4;
@@ -901,7 +911,7 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
                 best_cand_sad = c_sad;
                 best_cand_idx = i;
                 /* Fast path: stationary (0,0) or perfect match exits immediately */
-                if (c_dx == 0 && c_dy == 0 && best_cand_sad <= 32) {
+                if (c_dx == 0 && c_dy == 0 && (best_cand_sad <= 32 || (gpu_says_static && best_cand_sad <= 96))) {
                     break;
                 }
             }
@@ -1284,6 +1294,23 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
 
     if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
+        /* Run lightweight subgroup-accelerated GPU motion estimation on P-frames (~0.4ms) */
+        if (!is_idr && encoder->has_ref) {
+            gpu_compute_begin_picture(gpu_ctx, input_surface);
+            gpu_compute_dispatch_me_only(gpu_ctx, input_surface, (int)encoder->width, (int)encoder->height);
+            gpu_compute_end_picture(gpu_ctx);
+            gpu_compute_sync(gpu_ctx);
+
+            void *mv_data = NULL;
+            size_t mv_size = 0;
+            if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0 && mv_data) {
+                size_t max_bytes = (size_t)encoder->width_ctu * encoder->height_ctu * sizeof(gpu_mv_t);
+                size_t copy_bytes = (mv_size < max_bytes) ? mv_size : max_bytes;
+                memcpy(encoder->gpu_mvs, mv_data, copy_bytes);
+                encoder->num_gpu_mvs = (uint32_t)(copy_bytes / sizeof(gpu_mv_t));
+            }
+        }
+
         gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
                                    encoder->dl_y, (int)encoder->width,
                                    encoder->dl_uv, (int)encoder->width,

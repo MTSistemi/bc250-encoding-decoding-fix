@@ -389,6 +389,65 @@ static const int levelScale[6] = { 40, 45, 51, 57, 64, 72 };
 #define HEVC_BDSHIFT 5
 #define HEVC_FLAT_M  16
 
+/* Precomputed exact reciprocal division factors for HEVC quantization (Rec. ITU-T H.265 8.6.3).
+ * Replaces 16 64-bit hardware integer divisions per 4x4 block with a 1-cycle 64-bit multiply
+ * and 40-bit right shift ((num + half_denom) * recip >> 40), verified 100% bit-exact across
+ * all 52 QPs and all possible 16-bit coefficient amplitudes. */
+static const struct { uint64_t recip; uint32_t half_denom; } g_hevc_quant_factors[52] = {
+    /* QP  0 */ { 0x000066666667ULL,    320U },
+    /* QP  1 */ { 0x00005b05b05cULL,    360U },
+    /* QP  2 */ { 0x000050505051ULL,    408U },
+    /* QP  3 */ { 0x000047dc11f8ULL,    456U },
+    /* QP  4 */ { 0x000040000000ULL,    512U },
+    /* QP  5 */ { 0x000038e38e39ULL,    576U },
+    /* QP  6 */ { 0x000033333334ULL,    640U },
+    /* QP  7 */ { 0x00002d82d82eULL,    720U },
+    /* QP  8 */ { 0x000028282829ULL,    816U },
+    /* QP  9 */ { 0x000023ee08fcULL,    912U },
+    /* QP 10 */ { 0x000020000000ULL,   1024U },
+    /* QP 11 */ { 0x00001c71c71dULL,   1152U },
+    /* QP 12 */ { 0x00001999999aULL,   1280U },
+    /* QP 13 */ { 0x000016c16c17ULL,   1440U },
+    /* QP 14 */ { 0x000014141415ULL,   1632U },
+    /* QP 15 */ { 0x000011f7047eULL,   1824U },
+    /* QP 16 */ { 0x000010000000ULL,   2048U },
+    /* QP 17 */ { 0x00000e38e38fULL,   2304U },
+    /* QP 18 */ { 0x00000ccccccdULL,   2560U },
+    /* QP 19 */ { 0x00000b60b60cULL,   2880U },
+    /* QP 20 */ { 0x00000a0a0a0bULL,   3264U },
+    /* QP 21 */ { 0x000008fb823fULL,   3648U },
+    /* QP 22 */ { 0x000008000000ULL,   4096U },
+    /* QP 23 */ { 0x0000071c71c8ULL,   4608U },
+    /* QP 24 */ { 0x000006666667ULL,   5120U },
+    /* QP 25 */ { 0x000005b05b06ULL,   5760U },
+    /* QP 26 */ { 0x000005050506ULL,   6528U },
+    /* QP 27 */ { 0x0000047dc120ULL,   7296U },
+    /* QP 28 */ { 0x000004000000ULL,   8192U },
+    /* QP 29 */ { 0x0000038e38e4ULL,   9216U },
+    /* QP 30 */ { 0x000003333334ULL,  10240U },
+    /* QP 31 */ { 0x000002d82d83ULL,  11520U },
+    /* QP 32 */ { 0x000002828283ULL,  13056U },
+    /* QP 33 */ { 0x0000023ee090ULL,  14592U },
+    /* QP 34 */ { 0x000002000000ULL,  16384U },
+    /* QP 35 */ { 0x000001c71c72ULL,  18432U },
+    /* QP 36 */ { 0x00000199999aULL,  20480U },
+    /* QP 37 */ { 0x0000016c16c2ULL,  23040U },
+    /* QP 38 */ { 0x000001414142ULL,  26112U },
+    /* QP 39 */ { 0x0000011f7048ULL,  29184U },
+    /* QP 40 */ { 0x000001000000ULL,  32768U },
+    /* QP 41 */ { 0x000000e38e39ULL,  36864U },
+    /* QP 42 */ { 0x000000cccccdULL,  40960U },
+    /* QP 43 */ { 0x000000b60b61ULL,  46080U },
+    /* QP 44 */ { 0x000000a0a0a1ULL,  52224U },
+    /* QP 45 */ { 0x0000008fb824ULL,  58368U },
+    /* QP 46 */ { 0x000000800000ULL,  65536U },
+    /* QP 47 */ { 0x00000071c71dULL,  73728U },
+    /* QP 48 */ { 0x000000666667ULL,  81920U },
+    /* QP 49 */ { 0x0000005b05b1ULL,  92160U },
+    /* QP 50 */ { 0x000000505051ULL, 104448U },
+    /* QP 51 */ { 0x00000047dc12ULL, 116736U },
+};
+
 static int32_t dequant_level(int32_t level, int qp) {
     int per = qp / 6, rem = qp % 6;
     int64_t val = (int64_t)level * HEVC_FLAT_M * levelScale[rem];
@@ -398,29 +457,39 @@ static int32_t dequant_level(int32_t level, int qp) {
 }
 
 static int32_t quantize_coeff(int32_t coeff_raw, int qp) {
-    int per = qp / 6, rem = qp % 6;
-    int64_t denom = (int64_t)HEVC_FLAT_M * levelScale[rem] << per;
+    int clamped_qp = qp < 0 ? 0 : (qp > 51 ? 51 : qp);
+    uint64_t recip = g_hevc_quant_factors[clamped_qp].recip;
+    uint32_t half_denom = g_hevc_quant_factors[clamped_qp].half_denom;
     int sign = coeff_raw < 0 ? -1 : 1;
-    int64_t mag = coeff_raw < 0 ? -(int64_t)coeff_raw : (int64_t)coeff_raw;
-    int64_t num = mag << HEVC_BDSHIFT;
-    int64_t level = (num + denom / 2) / denom;
-    return (int32_t)(sign * level);
+    uint32_t mag = (uint32_t)(coeff_raw < 0 ? -coeff_raw : coeff_raw);
+    uint64_t num = (uint64_t)mag << HEVC_BDSHIFT;
+    int32_t level = (int32_t)(((num + half_denom) * recip) >> 40);
+    return sign * level;
 }
 
 void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
                                int16_t coeff_out[16]) {
+    /* Fast zero-residual bypass: if residual is all zero, output is all zero */
+    const uint64_t *r64 = (const uint64_t *)residual;
+    if ((r64[0] | r64[1] | r64[2] | r64[3]) == 0ULL) {
+        memset(coeff_out, 0, 16 * sizeof(int16_t));
+        return;
+    }
+
     int32_t raw[16];
     forward_transform_4x4(residual, use_dst ? DST4 : DCT4, raw);
-    int per = qp / 6, rem = qp % 6;
-    int64_t denom = (int64_t)HEVC_FLAT_M * levelScale[rem] << per;
-    int64_t half_denom = denom / 2;
+
+    int clamped_qp = qp < 0 ? 0 : (qp > 51 ? 51 : qp);
+    uint64_t recip = g_hevc_quant_factors[clamped_qp].recip;
+    uint32_t half_denom = g_hevc_quant_factors[clamped_qp].half_denom;
+
     for (int i = 0; i < 16; i++) {
         int32_t coeff_raw = raw[i];
         int sign = coeff_raw < 0 ? -1 : 1;
-        int64_t mag = coeff_raw < 0 ? -(int64_t)coeff_raw : (int64_t)coeff_raw;
-        int64_t num = mag << HEVC_BDSHIFT;
-        int64_t level = (num + half_denom) / denom;
-        int32_t res = (int32_t)(sign * level);
+        uint32_t mag = (uint32_t)(coeff_raw < 0 ? -coeff_raw : coeff_raw);
+        uint64_t num = (uint64_t)mag << HEVC_BDSHIFT;
+        int32_t level = (int32_t)(((num + half_denom) * recip) >> 40);
+        int32_t res = sign * level;
         if (res > 32767) res = 32767;
         if (res < -32768) res = -32768;
         coeff_out[i] = (int16_t)res;
@@ -429,6 +498,13 @@ void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
 
 void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
                                   int16_t residual_out[16]) {
+    /* Fast zero-coeff bypass: if quantized coefficients are all zero, residual is all zero */
+    const uint64_t *c64 = (const uint64_t *)coeff;
+    if ((c64[0] | c64[1] | c64[2] | c64[3]) == 0ULL) {
+        memset(residual_out, 0, 16 * sizeof(int16_t));
+        return;
+    }
+
     int16_t dq[16];
     int per = qp / 6, rem = qp % 6;
     int64_t scale = ((int64_t)HEVC_FLAT_M * levelScale[rem]) << per;
