@@ -208,27 +208,34 @@ void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int hei
         break;
 
     case HEVC_MODE_DC: {
-        int dc;
-        if (avail_left && avail_top) {
-            dc = (left[0] + left[1] + left[2] + left[3] + top[0] + top[1] + top[2] + top[3] + 4) >> 3;
-        } else if (avail_top) {
-            dc = (top[0] + top[1] + top[2] + top[3] + 2) >> 2;
-        } else if (avail_left) {
-            dc = (left[0] + left[1] + left[2] + left[3] + 2) >> 2;
-        } else {
-            dc = 128;
-        }
+        /* No branching on availability here, deliberately.
+         *
+         * gather_neighbors() has already run the reference sample
+         * substitution of Rec. ITU-T H.265 8.4.4.2.2: it scans bottom-left to
+         * top-right, takes the first available sample and fills every
+         * unavailable one from its neighbour (all 128 when the block has no
+         * neighbours at all). By the time we get here left[] and top[] are
+         * full, and there is no longer any such thing as an unavailable
+         * reference - which is exactly the state 8.4.4.2.5 assumes when it
+         * computes dcVal over BOTH edges and applies the boundary filter for
+         * luma below 32x32.
+         *
+         * Branching on avail_left/avail_top computed dcVal from one edge with
+         * different rounding, and filtered only that edge. A decoder does
+         * neither, so every block touching a picture edge came out a few
+         * units off - and since this encoder predicts DC everywhere, that
+         * difference then rode the prediction chain across the whole picture.
+         * Measured on a BC-250 before this: the encoder's own reconstruction
+         * reached 53.7 dB against the source while the decoded stream sat at
+         * 24.1 dB, and the two disagreed on 56% of pixels.
+         */
+        int dc = (left[0] + left[1] + left[2] + left[3] +
+                  top[0] + top[1] + top[2] + top[3] + 4) >> 3;
         for (int i = 0; i < 16; i++) pred_out[i] = (uint8_t)dc;
         if (is_luma) {
-            if (avail_left && avail_top) {
-                pred_out[0] = (uint8_t)((left[0] + 2 * dc + top[0] + 2) >> 2);
-                for (int x = 1; x < 4; x++) pred_out[x] = (uint8_t)((top[x] + 3 * dc + 2) >> 2);
-                for (int y = 1; y < 4; y++) pred_out[y * 4] = (uint8_t)((left[y] + 3 * dc + 2) >> 2);
-            } else if (avail_top) {
-                for (int x = 0; x < 4; x++) pred_out[x] = (uint8_t)((top[x] + 3 * dc + 2) >> 2);
-            } else if (avail_left) {
-                for (int y = 0; y < 4; y++) pred_out[y * 4] = (uint8_t)((left[y] + 3 * dc + 2) >> 2);
-            }
+            pred_out[0] = (uint8_t)((left[0] + 2 * dc + top[0] + 2) >> 2);
+            for (int x = 1; x < 4; x++) pred_out[x] = (uint8_t)((top[x] + 3 * dc + 2) >> 2);
+            for (int y = 1; y < 4; y++) pred_out[y * 4] = (uint8_t)((left[y] + 3 * dc + 2) >> 2);
         }
         break;
     }
