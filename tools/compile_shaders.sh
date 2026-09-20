@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix
+# bc250-encoding-decoding-fix v0.4.3 - https://github.com/simpmix/bc250-encoding-decoding-fix
 #
 # compile_shaders.sh - Compiles all compute shaders to SPIR-V binaries
 #
@@ -33,9 +33,9 @@ for shader in "$SHADER_SRC_DIR"/*.comp; do
     out_spv="$OUTPUT_DIR/${fname}.spv"
     echo "  -> Compiling $fname -> ${fname}.spv"
     if [ "$COMPILER" = "glslangValidator" ]; then
-        glslangValidator -V "$shader" -o "$out_spv"
+        glslangValidator -V --target-env vulkan1.1 "$shader" -o "$out_spv"
     else
-        glslc -c "$shader" -o "$out_spv"
+        glslc --target-env=vulkan1.1 -c "$shader" -o "$out_spv"
     fi
 done
 

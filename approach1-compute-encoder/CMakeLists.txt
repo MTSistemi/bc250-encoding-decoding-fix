@@ -162,7 +162,7 @@ foreach(SHADER ${SHADERS})
     if(GLSLANG_VALIDATOR)
         add_custom_command(
             OUTPUT ${SPV_FILE}
-            COMMAND ${GLSLANG_VALIDATOR} -V ${SHADER} -o ${SPV_FILE}
+            COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.1 ${SHADER} -o ${SPV_FILE}
             DEPENDS ${SHADER}
             COMMENT "Compiling compute shader ${SHADER_NAME} with glslangValidator"
         )
@@ -170,7 +170,7 @@ foreach(SHADER ${SHADERS})
     elseif(GLSLC)
         add_custom_command(
             OUTPUT ${SPV_FILE}
-            COMMAND ${GLSLC} -c ${SHADER} -o ${SPV_FILE}
+            COMMAND ${GLSLC} --target-env=vulkan1.1 -c ${SHADER} -o ${SPV_FILE}
             DEPENDS ${SHADER}
             COMMENT "Compiling compute shader ${SHADER_NAME} with glslc"
         )
