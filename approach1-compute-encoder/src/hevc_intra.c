@@ -122,8 +122,11 @@ static long long zorder_rank(int x, int y, int width, int is_luma) {
     return rank;
 }
 
-static int zorder_available(int nx, int ny, int width, int height, int is_luma, long long cur_rank) {
-    if (nx < 0 || ny < 0 || nx >= width || ny >= height) return 0;
+/* y_min is the first pixel row of the current slice: anything above it belongs
+ * to another slice and a decoder will not have it, so neither may we. */
+static int zorder_available(int nx, int ny, int width, int height, int is_luma,
+                            int y_min, long long cur_rank) {
+    if (nx < 0 || ny < y_min || nx >= width || ny >= height) return 0;
     return zorder_rank(nx, ny, width, is_luma) < cur_rank;
 }
 
@@ -139,13 +142,14 @@ static int zorder_available(int nx, int ny, int width, int height, int is_luma, 
  * be positionally-plausible but z-scan-unavailable (see zorder_rank()'s
  * comment above). */
 static void gather_neighbors(const uint8_t *plane, int stride, int width, int height,
-                              int x0, int y0, int is_luma, uint8_t left[5], uint8_t top[5], uint8_t *corner,
+                              int x0, int y0, int is_luma, int y_min,
+                              uint8_t left[5], uint8_t top[5], uint8_t *corner,
                               int *avail_left_out, int *avail_top_out) {
     long long cur_rank = zorder_rank(x0, y0, width, is_luma);
-    int avail_left = zorder_available(x0 - 1, y0, width, height, is_luma, cur_rank);
-    int avail_top = zorder_available(x0, y0 - 1, width, height, is_luma, cur_rank);
-    int avail_corner = zorder_available(x0 - 1, y0 - 1, width, height, is_luma, cur_rank);
-    int avail_top_right = zorder_available(x0 + 4, y0 - 1, width, height, is_luma, cur_rank);
+    int avail_left = zorder_available(x0 - 1, y0, width, height, is_luma, y_min, cur_rank);
+    int avail_top = zorder_available(x0, y0 - 1, width, height, is_luma, y_min, cur_rank);
+    int avail_corner = zorder_available(x0 - 1, y0 - 1, width, height, is_luma, y_min, cur_rank);
+    int avail_top_right = zorder_available(x0 + 4, y0 - 1, width, height, is_luma, y_min, cur_rank);
 
     if (avail_left_out) *avail_left_out = avail_left;
     if (avail_top_out) *avail_top_out = avail_top;
@@ -206,10 +210,11 @@ static void gather_neighbors(const uint8_t *plane, int stride, int width, int he
 /* ===================== prediction (8.4.4.2.5-8.4.4.2.7) ===================== */
 
 void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
-                      int x0, int y0, int mode, int is_luma, uint8_t pred_out[16]) {
+                      int x0, int y0, int mode, int is_luma, int y_min,
+                      uint8_t pred_out[16]) {
     uint8_t left[5], top[5], corner;
     int avail_left = 0, avail_top = 0;
-    gather_neighbors(recon_plane, stride, width, height, x0, y0, is_luma, left, top, &corner, &avail_left, &avail_top);
+    gather_neighbors(recon_plane, stride, width, height, x0, y0, is_luma, y_min, left, top, &corner, &avail_left, &avail_top);
 
     switch (mode) {
     case HEVC_MODE_PLANAR:
@@ -280,7 +285,7 @@ void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int hei
     }
 }
 
-int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
+int hevc_choose_luma_mode(int y_min, const uint8_t *src_y, const uint8_t *recon_y, int stride,
                            int width, int height, int x0, int y0) {
     static const int candidates[4] = { HEVC_MODE_PLANAR, HEVC_MODE_DC, HEVC_MODE_HORIZONTAL, HEVC_MODE_VERTICAL };
     int best_mode = HEVC_MODE_DC;
@@ -288,7 +293,7 @@ int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stri
 
     for (int c = 0; c < 4; c++) {
         uint8_t pred[16];
-        hevc_predict_4x4(recon_y, stride, width, height, x0, y0, candidates[c], 1, pred);
+        hevc_predict_4x4(recon_y, stride, width, height, x0, y0, candidates[c], 1, y_min, pred);
         long sad = 0;
         for (int y = 0; y < 4; y++)
             for (int x = 0; x < 4; x++) {
