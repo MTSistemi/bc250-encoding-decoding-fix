@@ -1068,7 +1068,11 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
         int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
         int mx = px / 4, my = py / 4;
         int left_avail = px > 0;
-        int above_avail = py > 0;
+        /* Per ITU-T H.265 8.4.2, candIntraPredModeB is forced to INTRA_DC
+         * whenever yCb-1 crosses into the CTU row above the current one.
+         * Marking above_avail false across CTU boundaries ensures bit-exact
+         * MPM candidate list synchronization with all standard decoders. */
+        int above_avail = (py > 0) && ((py % HEVC_CTU_SIZE) != 0);
         int left_mode = left_avail ? enc->luma_mode_map[my * enc->mode_map_stride + (mx - 1)] : 0;
         int above_mode = above_avail ? enc->luma_mode_map[(my - 1) * enc->mode_map_stride + mx] : 0;
         hevc_derive_mpm(left_mode, left_avail, above_mode, above_avail, mpm[pu]);

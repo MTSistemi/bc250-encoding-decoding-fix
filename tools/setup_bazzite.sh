@@ -152,6 +152,10 @@ LIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib64/dri:/usr/l
 BC250_FAST_MODE=1
 BC250_SLICES_PER_FRAME=4
 BC250_SHADER_DIR=/usr/local/share/bc250/shaders
+OMP_WAIT_POLICY=PASSIVE
+GOMP_SPINCOUNT=0
+OMP_NUM_THREADS=2
+OMP_DYNAMIC=FALSE
 EOF
 $SUDO chmod 644 /etc/environment.d/99-bc250.conf
 echo -e "  ${GREEN}✓ Configured /etc/environment.d/99-bc250.conf${NC}"
@@ -165,6 +169,10 @@ export LIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib64/dri
 export BC250_FAST_MODE=1
 export BC250_SLICES_PER_FRAME=4
 export BC250_SHADER_DIR=/usr/local/share/bc250/shaders
+export OMP_WAIT_POLICY=PASSIVE
+export GOMP_SPINCOUNT=0
+export OMP_NUM_THREADS=2
+export OMP_DYNAMIC=FALSE
 EOF
 $SUDO chmod 644 /etc/profile.d/bc250.sh
 echo -e "  ${GREEN}✓ Configured /etc/profile.d/bc250.sh${NC}"

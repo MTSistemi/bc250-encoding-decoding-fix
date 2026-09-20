@@ -174,11 +174,11 @@ fi
 # path does NOT include /usr/local, so a driver installed only there (the only
 # path that actually succeeds on an ostree system) would otherwise never be found.
 if [ -d "/etc/environment.d" ]; then
-    printf "LIBVA_DRIVER_NAME=bc250\nLIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri:/usr/lib32/dri:/usr/lib/i386-linux-gnu/dri\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\n" | $SUDO tee /etc/environment.d/99-bc250.conf > /dev/null 2>&1 || true
+    printf "LIBVA_DRIVER_NAME=bc250\nLIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri:/usr/lib32/dri:/usr/lib/i386-linux-gnu/dri\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\nOMP_WAIT_POLICY=PASSIVE\nGOMP_SPINCOUNT=0\nOMP_NUM_THREADS=2\nOMP_DYNAMIC=FALSE\n" | $SUDO tee /etc/environment.d/99-bc250.conf > /dev/null 2>&1 || true
     echo -e "  -> Configured system-wide environment in /etc/environment.d/99-bc250.conf"
 elif [ -f "/etc/environment" ]; then
     if ! grep -q "LIBVA_DRIVER_NAME=bc250" /etc/environment 2>/dev/null; then
-        printf "LIBVA_DRIVER_NAME=bc250\nLIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri:/usr/lib32/dri:/usr/lib/i386-linux-gnu/dri\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\n" | $SUDO tee -a /etc/environment > /dev/null 2>&1 || true
+        printf "LIBVA_DRIVER_NAME=bc250\nLIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri:/usr/lib32/dri:/usr/lib/i386-linux-gnu/dri\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\nOMP_WAIT_POLICY=PASSIVE\nGOMP_SPINCOUNT=0\nOMP_NUM_THREADS=2\nOMP_DYNAMIC=FALSE\n" | $SUDO tee -a /etc/environment > /dev/null 2>&1 || true
         echo -e "  -> Configured system-wide environment in /etc/environment"
     fi
 fi

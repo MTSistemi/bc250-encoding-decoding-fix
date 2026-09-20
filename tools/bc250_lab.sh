@@ -477,7 +477,7 @@ run_encode() {
     # wall_s  wall_ms/frame  fps  cpu_s  cpu_ms/frame  maxrss_kb
     local cpu_s=0 rss=0
     if [ -f "${out}.time" ]; then
-        read -r _e _u _s _m < "${out}.time"
+        IFS=' ' read -r _e _u _s _m < "${out}.time"
         cpu_s=$(awk -v u="${_u:-0}" -v s="${_s:-0}" 'BEGIN{printf "%.4f", u+s}')
         rss="${_m:-0}"
     fi
@@ -700,7 +700,7 @@ units() {
     local key="${1:?units <key>}"
     local bd; bd=$(art_dir "$key")
     local ok=0
-    for t in test_bitstream test_cavlc test_encode test_va_api; do
+    for t in test_bitstream test_cavlc test_encode test_hevc_encode test_va_api; do
         if [ ! -x "$bd/tests/$t" ]; then echo "  MISSING $t"; ok=1; continue; fi
         if ( cd "$bd" && LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$bd" \
              BC250_SHADER_DIR="$bd" timeout 300 "./tests/$t" >/tmp/lab_$t.out 2>&1 ); then

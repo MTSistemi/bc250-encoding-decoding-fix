@@ -164,9 +164,9 @@ void cabac_engine_init(cabac_engine_t *cb, uint8_t *p_data, uint8_t *p_end);
  * clamped to 0..51 by the caller. */
 void cabac_context_init(cabac_engine_t *cb, bool is_intra_slice, int cabac_init_idc, int qp);
 
-/* Encode one regular (context-modeled) bin using context ctx_idx, updating
- * that context's adaptive state. */
+#pragma GCC visibility push(hidden)
 void cabac_encode_decision(cabac_engine_t *cb, int ctx_idx, int bit);
+#pragma GCC visibility pop
 
 /* Encode one bypass-coded bin (equiprobable, no context/adaptation). */
 void cabac_encode_bypass(cabac_engine_t *cb, int bit);
@@ -307,6 +307,25 @@ typedef enum {
 void cabac_write_coded_block_flag(cabac_engine_t *cb, cabac_ctx_block_cat_t cat,
                                    int nA, int nB, bool cbf);
 
+/* Per-category tables (ITU-T Table 9-42 restricted to this project's 5 categories).
+ * Defined static here so that cabac_write_residual_block can be static inline
+ * (matching x264's cabac_block_residual_internal architecture). */
+static const int cabac_count_m1[5]   = { 15, 14, 15, 3, 14 };
+static const int cabac_sig_base[5]   = { 105, 120, 134, 149, 152 };
+static const int cabac_last_base[5]  = { 166, 181, 195, 210, 213 };
+static const int cabac_level_base[5] = { 227, 237, 247, 257, 266 };
+
+/* node ctx: 0..3 = abs-level-1 run (with abs-level>1 count==0);
+ *           4..7 = abs-level>1 seen (+3) - see x264's encoder/cabac.c
+ *           coeff_abs_level1_ctx/coeff_abs_levelgt1_ctx/
+ *           coeff_abs_level_transition, copied verbatim. */
+static const uint8_t cabac_level1_ctx[8]   = { 1, 2, 3, 4, 0, 0, 0, 0 };
+static const uint8_t cabac_levelgt1_ctx[8] = { 5, 5, 5, 5, 6, 7, 8, 9 };
+static const uint8_t cabac_level_transition[2][8] = {
+    { 1, 2, 3, 3, 4, 5, 6, 7 },
+    { 4, 4, 4, 4, 5, 6, 7, 7 },
+};
+
 /* residual_block_cabac() for one block ALREADY KNOWN to have cbf=1 (caller
  * must have already called cabac_write_coded_block_flag() with cbf=true and
  * only call this when it returned/was true - a cbf=0 block has no residual
@@ -314,8 +333,70 @@ void cabac_write_coded_block_flag(cabac_engine_t *cb, cabac_ctx_block_cat_t cat,
  * zigzag (or, for CABAC_CAT_CHROMA_DC, raw row-major - no zigzag exists for
  * the 2x2 case) scan order, matching this project's existing CAVLC
  * convention (see cavlc.c's cavlc_write_4x4_block/_ac_block/
- * _chroma_dc_block for the identical scan/ordering contract). */
-void cabac_write_residual_block(cabac_engine_t *cb, cabac_ctx_block_cat_t cat, const int *scanned);
+ * _chroma_dc_block for the identical scan/ordering contract).
+ *
+ * Inlined as static inline __attribute__((always_inline)) matching x264's
+ * cabac_block_residual_internal design. */
+static inline __attribute__((always_inline))
+void cabac_write_residual_block(cabac_engine_t *cb, cabac_ctx_block_cat_t cat, const int *scanned) {
+    int count_m1 = cabac_count_m1[cat];
+    int ctx_sig = cabac_sig_base[cat];
+    int ctx_last = cabac_last_base[cat];
+    int ctx_level = cabac_level_base[cat];
+
+    int last = -1;
+    for (int i = count_m1; i >= 0; i--) {
+        if (scanned[i] != 0) { last = i; break; }
+    }
+    if (last < 0) return; /* caller must gate this call on cbf==1 */
+
+    int coeffs[16];
+    int coeff_idx = -1;
+    int i = 0;
+    for (;;) {
+        if (scanned[i] != 0) {
+            coeffs[++coeff_idx] = scanned[i];
+            cabac_encode_decision(cb, ctx_sig + i, 1);
+            if (i == last) {
+                cabac_encode_decision(cb, ctx_last + i, 1);
+                break;
+            } else {
+                cabac_encode_decision(cb, ctx_last + i, 0);
+            }
+        } else {
+            cabac_encode_decision(cb, ctx_sig + i, 0);
+        }
+        if (++i == count_m1) {
+            coeffs[++coeff_idx] = scanned[i];
+            break;
+        }
+    }
+
+    int node_ctx = 0;
+    do {
+        int coeff = coeffs[coeff_idx];
+        int abs_coeff = coeff < 0 ? -coeff : coeff;
+        int sign = coeff < 0 ? 1 : 0;
+        int ctx = cabac_level1_ctx[node_ctx] + ctx_level;
+
+        if (abs_coeff > 1) {
+            cabac_encode_decision(cb, ctx, 1);
+            ctx = cabac_levelgt1_ctx[node_ctx] + ctx_level;
+            int capped = abs_coeff < 15 ? abs_coeff : 15;
+            for (int k = capped - 2; k > 0; k--)
+                cabac_encode_decision(cb, ctx, 1);
+            if (abs_coeff < 15)
+                cabac_encode_decision(cb, ctx, 0);
+            else
+                cabac_encode_ue_bypass(cb, 0, abs_coeff - 15);
+            node_ctx = cabac_level_transition[1][node_ctx];
+        } else {
+            cabac_encode_decision(cb, ctx, 0);
+            node_ctx = cabac_level_transition[0][node_ctx];
+        }
+        cabac_encode_bypass(cb, sign);
+    } while (--coeff_idx >= 0);
+}
 
 /* Number of coefficients in a block of category `cat` (maxNumCoeff). */
 int cabac_count_coeffs(cabac_ctx_block_cat_t cat);
