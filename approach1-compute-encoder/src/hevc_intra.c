@@ -91,19 +91,32 @@ static inline uint8_t clip8(int v) { return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255
  * available iff it's in-picture AND its rank is strictly less than the
  * current block's.
  */
+/* Shifts, not divisions.
+ *
+ * Every divisor here is a power of two, but all of them are derived from the
+ * is_luma argument, so the compiler cannot prove it and emits real div
+ * instructions - six per call, and this is called five times per 4x4 block
+ * (once for the block itself, four for its neighbours), which comes to about
+ * four million integer divisions per 1080p frame. The profiler put
+ * zorder_available() at 5% of the HEVC encode on a BC-250 on its own, before
+ * counting what it costs inside gather_neighbors().
+ *
+ * x and y are never negative at either call site - zorder_available() bounds
+ * checks first and the cur_rank call passes the block's own coordinates - so
+ * >> and & give exactly what / and % gave. */
 static long long zorder_rank(int x, int y, int width, int is_luma) {
-    int ctu_size = is_luma ? 16 : 8;
-    int width_ctu = (width + ctu_size - 1) / ctu_size;
-    int ctu_col = x / ctu_size, ctu_row = y / ctu_size;
-    int rx = x % ctu_size, ry = y % ctu_size;
-    int half = ctu_size / 2; /* CU size in this plane's pixels */
-    int cu_col = rx / half, cu_row = ry / half;
+    const int sh = is_luma ? 4 : 3;              /* ctu_size = 1 << sh */
+    const int ctu_size = 1 << sh;
+    const int hs = sh - 1;                       /* CU size  = 1 << hs */
+    int width_ctu = (width + ctu_size - 1) >> sh;
+    int ctu_col = x >> sh, ctu_row = y >> sh;
+    int rx = x & (ctu_size - 1), ry = y & (ctu_size - 1);
+    int cu_col = rx >> hs, cu_row = ry >> hs;
     long long rank = ((long long)ctu_row * width_ctu + ctu_col) * 4 + (cu_row * 2 + cu_col);
     if (is_luma) {
-        int rx2 = rx % half, ry2 = ry % half;
-        int quarter = half / 2; /* PU size (4) */
-        int pu_col = rx2 / quarter, pu_row = ry2 / quarter;
-        rank = rank * 4 + (pu_row * 2 + pu_col);
+        const int qs = hs - 1;                   /* PU size = 1 << qs = 4 */
+        int rx2 = rx & ((1 << hs) - 1), ry2 = ry & ((1 << hs) - 1);
+        rank = rank * 4 + ((ry2 >> qs) * 2 + (rx2 >> qs));
     }
     return rank;
 }

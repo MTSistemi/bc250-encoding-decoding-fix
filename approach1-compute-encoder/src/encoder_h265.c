@@ -77,6 +77,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <immintrin.h>
 #if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
 #endif
@@ -1177,6 +1178,45 @@ static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int 
  * (GPU-surface readback) and hevc_encoder_encode_raw() (direct host
  * pointers, no GPU involved - see encoder_h265.h) fill those in their own
  * way and then share everything from here on. */
+/* Split NV12's interleaved chroma into separate Cb and Cr planes.
+ *
+ * This ran one byte at a time: 518400 iterations per 1080p frame, inside
+ * encode_core(), which the profiler put at the top of the HEVC encode once
+ * the surface readback had been dealt with. PSHUFB gathers the even bytes
+ * into one half of a register and the odd bytes into the other, so sixteen
+ * samples of each plane come out per pair of loads.
+ *
+ * Runtime-dispatched like cpu_simd_me.c, and the scalar tail keeps widths
+ * that are not a multiple of sixteen working.
+ */
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("ssse3")))
+static void deinterleava_uv_ssse3(uint8_t *cb, uint8_t *cr,
+                                  const uint8_t *uv, size_t n) {
+    const __m128i sh = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14,
+                                     1, 3, 5, 7, 9, 11, 13, 15);
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m128i a = _mm_loadu_si128((const __m128i *)(uv + 2 * i));
+        __m128i b = _mm_loadu_si128((const __m128i *)(uv + 2 * i + 16));
+        a = _mm_shuffle_epi8(a, sh);
+        b = _mm_shuffle_epi8(b, sh);
+        _mm_storeu_si128((__m128i *)(cb + i), _mm_unpacklo_epi64(a, b));
+        _mm_storeu_si128((__m128i *)(cr + i), _mm_unpackhi_epi64(a, b));
+    }
+    for (; i < n; i++) { cb[i] = uv[2 * i]; cr[i] = uv[2 * i + 1]; }
+}
+#endif
+
+static void deinterleava_uv(uint8_t *cb, uint8_t *cr, const uint8_t *uv, size_t n) {
+#if defined(__x86_64__) || defined(_M_X64)
+    static int ha_ssse3 = -1;
+    if (ha_ssse3 < 0) ha_ssse3 = __builtin_cpu_supports("ssse3") ? 1 : 0;
+    if (ha_ssse3) { deinterleava_uv_ssse3(cb, cr, uv, n); return; }
+#endif
+    for (size_t i = 0; i < n; i++) { cb[i] = uv[2 * i]; cr[i] = uv[2 * i + 1]; }
+}
+
 static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t output_size)
 {
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
@@ -1201,10 +1241,8 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     uint32_t ccw = encoder->coded_width / 2, cch = encoder->coded_height / 2;
     for (uint32_t y = 0; y < ch2; y++) {
         const uint8_t *uvrow = encoder->dl_uv + (size_t)y * encoder->width;
-        for (uint32_t x = 0; x < cw2; x++) {
-            encoder->src_cb[y * ccw + x] = uvrow[x * 2 + 0];
-            encoder->src_cr[y * ccw + x] = uvrow[x * 2 + 1];
-        }
+        deinterleava_uv(&encoder->src_cb[y * ccw], &encoder->src_cr[y * ccw],
+                        uvrow, cw2);
     }
     pad_replicate(encoder->src_cb, ccw, cch, encoder->src_cb, ccw, cw2, ch2);
     pad_replicate(encoder->src_cr, ccw, cch, encoder->src_cr, ccw, cw2, ch2);
@@ -1297,9 +1335,22 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     /* Update reference buffers for subsequent P-frames */
     size_t luma_size = (size_t)encoder->coded_width * encoder->coded_height;
     size_t chroma_size = (size_t)(encoder->coded_width / 2) * (encoder->coded_height / 2);
-    memcpy(encoder->prev_recon_y, encoder->recon_y, luma_size);
-    memcpy(encoder->prev_recon_cb, encoder->recon_cb, chroma_size);
-    memcpy(encoder->prev_recon_cr, encoder->recon_cr, chroma_size);
+    /* The reference picture changes hands, it does not get copied.
+     *
+     * This was three megabytes of memcpy per 1080p frame. prev_recon_* is only
+     * ever READ (motion search and the skip path's copy) and recon_* is only
+     * ever WRITTEN - every pixel of the coded area, by one CU or another - so
+     * swapping the pointers leaves both sides holding exactly what the copy
+     * used to give them. Both buffers stay allocated and are freed together,
+     * so nothing changes for hevc_encoder_destroy().
+     */
+    {
+        uint8_t *t;
+        t = encoder->prev_recon_y;  encoder->prev_recon_y  = encoder->recon_y;  encoder->recon_y  = t;
+        t = encoder->prev_recon_cb; encoder->prev_recon_cb = encoder->recon_cb; encoder->recon_cb = t;
+        t = encoder->prev_recon_cr; encoder->prev_recon_cr = encoder->recon_cr; encoder->recon_cr = t;
+    }
+    (void)luma_size; (void)chroma_size;
     encoder->has_ref = true;
     encoder->poc++;
 
