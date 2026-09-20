@@ -877,8 +877,7 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             int c_dx = cand_mvs[i].x / 4;
             int c_dy = cand_mvs[i].y / 4;
 
-            /* Ensure displacement is an even integer to prevent chroma subpel interpolation drift */
-            if ((c_dx & 1) != 0 || (c_dy & 1) != 0) continue;
+            /* Check frame bounds */
             if (cu_x + c_dx < 0 || cu_x + c_dx + 8 > (int)cw ||
                 cu_y + c_dy < 0 || cu_y + c_dy + 8 > (int)ch) continue;
 
@@ -892,10 +891,12 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             }
             if (dup) continue;
 
+            int cdx = (c_dx >= 0) ? (c_dx >> 1) : ((c_dx - 1) >> 1);
+            int cdy = (c_dy >= 0) ? (c_dy >> 1) : ((c_dy - 1) >> 1);
             uint32_t c_sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, c_dx, c_dy) +
                              compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
                                                     enc->prev_recon_cb, enc->prev_recon_cr,
-                                                    ccw, cx, cy, c_dx / 2, c_dy / 2);
+                                                    ccw, cx, cy, cdx, cdy);
             if (c_sad < best_cand_sad) {
                 best_cand_sad = c_sad;
                 best_cand_idx = i;
@@ -907,8 +908,8 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
         }
 
         uint32_t threshold = 96 * (1 + (enc->qp / 8));
-        if (enc->quality_level >= 5) {
-            threshold = threshold * 3 / 2;
+        if (enc->quality_level >= 4) {
+            threshold = threshold * 2;
         }
         static int s_skip_override = -2;
         if (s_skip_override == -2) {
@@ -944,7 +945,8 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
                    HEVC_CU_SIZE);
         }
         int cx = cu_x / 2, cy = cu_y / 2;
-        int cdx = chosen_dx / 2, cdy = chosen_dy / 2;
+        int cdx = (chosen_dx >= 0) ? (chosen_dx >> 1) : ((chosen_dx - 1) >> 1);
+        int cdy = (chosen_dy >= 0) ? (chosen_dy >> 1) : ((chosen_dy - 1) >> 1);
         for (int y = 0; y < HEVC_PU_SIZE; y++) {
             memcpy(&enc->recon_cb[(cy + y) * ccw + cx],
                    &enc->prev_recon_cb[(cy + cdy + y) * ccw + (cx + cdx)],
@@ -975,12 +977,10 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     int16_t luma_coeff[4][16];
     int cbf_luma[4];
 
-    /* Step 1: decide + reconstruct all 4 luma PUs in z-order (needed so
-     * each later PU's neighbor gathering sees real reconstructed samples
-     * from the earlier PUs of the SAME CU, exactly like a real decoder). */
+    /* Step 1: decide + reconstruct all 4 luma PUs in z-order */
     for (int pu = 0; pu < 4; pu++) {
         int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-        int mode = hevc_choose_luma_mode(enc->src_y, enc->recon_y, (int)cw, (int)cw, (int)ch, px, py);
+        int mode = (enc->quality_level >= 4) ? HEVC_MODE_DC : hevc_choose_luma_mode(enc->src_y, enc->recon_y, (int)cw, (int)cw, (int)ch, px, py);
         pu_modes[pu] = mode;
 
         uint8_t pred[16];
@@ -996,19 +996,21 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
         memcpy(luma_coeff[pu], coeff, sizeof(coeff));
         cbf_luma[pu] = any_nonzero16(coeff);
 
-        int16_t recon_residual[16];
-        hevc_dequant_itransform_4x4(coeff, qp, 1, recon_residual);
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                enc->recon_y[(py + y) * cw + (px + x)] = clip8i(pred[y * 4 + x] + recon_residual[y * 4 + x]);
+        if (cbf_luma[pu]) {
+            int16_t recon_residual[16];
+            hevc_dequant_itransform_4x4(coeff, qp, 1, recon_residual);
+            for (int y = 0; y < 4; y++)
+                for (int x = 0; x < 4; x++)
+                    enc->recon_y[(py + y) * cw + (px + x)] = clip8i(pred[y * 4 + x] + recon_residual[y * 4 + x]);
+        } else {
+            for (int y = 0; y < 4; y++)
+                memcpy(&enc->recon_y[(py + y) * cw + px], &pred[y * 4], 4);
+        }
 
         enc->luma_mode_map[(py / 4) * enc->mode_map_stride + (px / 4)] = (int8_t)mode;
     }
 
-    /* Chroma: one 4x4 Cb + one 4x4 Cr per CU, DC prediction only (matching
-     * this codebase's existing H.264 "chroma directional modes not
-     * implemented" precedent), DCT-II (never DST - DST is luma-4x4-intra
-     * only, per spec). */
+    /* Chroma: one 4x4 Cb + one 4x4 Cr per CU, DC prediction only */
     int cx = cu_x / 2, cy = cu_y / 2;
     uint8_t pred_cb[16], pred_cr[16];
     hevc_predict_4x4(enc->recon_cb, ccw, ccw, cch, cx, cy, HEVC_MODE_DC, 0, pred_cb);
@@ -1027,14 +1029,27 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     int cbf_cb = any_nonzero16(coeff_cb);
     int cbf_cr = any_nonzero16(coeff_cr);
 
-    int16_t rres_cb[16], rres_cr[16];
-    hevc_dequant_itransform_4x4(coeff_cb, qp, 0, rres_cb);
-    hevc_dequant_itransform_4x4(coeff_cr, qp, 0, rres_cr);
-    for (int y = 0; y < 4; y++)
-        for (int x = 0; x < 4; x++) {
-            enc->recon_cb[(cy + y) * ccw + (cx + x)] = clip8i(pred_cb[y * 4 + x] + rres_cb[y * 4 + x]);
-            enc->recon_cr[(cy + y) * ccw + (cx + x)] = clip8i(pred_cr[y * 4 + x] + rres_cr[y * 4 + x]);
-        }
+    if (cbf_cb) {
+        int16_t rres_cb[16];
+        hevc_dequant_itransform_4x4(coeff_cb, qp, 0, rres_cb);
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 4; x++)
+                enc->recon_cb[(cy + y) * ccw + (cx + x)] = clip8i(pred_cb[y * 4 + x] + rres_cb[y * 4 + x]);
+    } else {
+        for (int y = 0; y < 4; y++)
+            memcpy(&enc->recon_cb[(cy + y) * ccw + cx], &pred_cb[y * 4], 4);
+    }
+
+    if (cbf_cr) {
+        int16_t rres_cr[16];
+        hevc_dequant_itransform_4x4(coeff_cr, qp, 0, rres_cr);
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 4; x++)
+                enc->recon_cr[(cy + y) * ccw + (cx + x)] = clip8i(pred_cr[y * 4 + x] + rres_cr[y * 4 + x]);
+    } else {
+        for (int y = 0; y < 4; y++)
+            memcpy(&enc->recon_cr[(cy + y) * ccw + cx], &pred_cr[y * 4], 4);
+    }
 
     /* Step 2: emit the 4 PUs' real intra_luma_pred_mode syntax. ITU-T
      * H.265 7.3.8.5's coding_unit() codes this as TWO separate passes over
@@ -1264,40 +1279,7 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
     encoder->num_gpu_mvs = 0;
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
 
-    governor_tier_t tier = dynamic_governor_get_tier(&encoder->governor);
-
-    /* Dynamic Governor Tier 3: Emergency Failover.
-     * When GPU is in severe lockup/contention (>15.5ms), skip submitting new GPU work
-     * this frame to avoid worsening GPU stalls and keep stream deadline intact. */
-    if (!is_idr && tier == GOV_TIER_3_FAILOVER) {
-        dynamic_governor_notify_failover_handled(&encoder->governor);
-        if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
-            gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
-                                       encoder->dl_y, (int)encoder->width,
-                                       encoder->dl_uv, (int)encoder->width,
-                                       (int)encoder->width, (int)encoder->height);
-        } else {
-            memset(encoder->dl_y, 128, (size_t)encoder->width * encoder->height);
-            memset(encoder->dl_uv, 128, (size_t)(encoder->width / 2) * (encoder->height / 2) * 2);
-        }
-        return encode_core(encoder, output_buf, output_size);
-    }
-
-    /* Preserve the existing driver's Vulkan image-layout-transition and
-     * staging/fence contract (see va_backend.c's bc250_EndPicture() comment).
-     * By passing is_intra = (is_idr ? 1 : 0), the GPU computes motion
-     * estimation for each 16x16 CTU on P-slices across its 40 CUs! */
     if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
-        if (gpu_compute_begin_picture(gpu_ctx, input_surface) == 0) {
-            gpu_compute_dispatch_encode_ext(gpu_ctx, input_surface, encoder->width, encoder->height,
-                                            encoder->qp, is_idr ? 1 : 0, 1, 0, NULL);
-            gpu_compute_end_picture(gpu_ctx);
-            if (gpu_compute_sync(gpu_ctx) == 0) {
-                double last_gpu_lat = gpu_compute_get_last_latency_ms(gpu_ctx);
-                dynamic_governor_update(&encoder->governor, last_gpu_lat);
-            }
-        }
-
         gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
                                    encoder->dl_y, (int)encoder->width,
                                    encoder->dl_uv, (int)encoder->width,

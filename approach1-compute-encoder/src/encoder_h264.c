@@ -6,6 +6,10 @@
  * encoder_h264.c - H.264/AVC Compute Shader Encoder Implementation
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -2107,6 +2111,25 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                                          output_buf, output_size);
 }
 
+static int get_default_slice_threads(int num_slices) {
+    int threads = 1;
+    const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
+    if (env_threads) {
+        int t = atoi(env_threads);
+        if (t >= 1 && t <= 8) return (num_slices < t) ? num_slices : t;
+    }
+    const char *env_no_omp = getenv("BC250_DISABLE_OPENMP");
+    if (env_no_omp && (strcmp(env_no_omp, "0") != 0 && strcmp(env_no_omp, "false") != 0)) {
+        return 1;
+    }
+#if defined(__linux__)
+    if (program_invocation_short_name && strcmp(program_invocation_short_name, "sunshine") == 0) {
+        return (num_slices < 2) ? 1 : 2;
+    }
+#endif
+    return threads;
+}
+
 int h264_encoder_finish_frame(h264_encoder_t *encoder,
                               bc250_gpu_context_t *gpu_ctx,
                               uint8_t *output_buf, size_t output_size,
@@ -2614,17 +2637,7 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
     slice_output_t slices[16];
     memset(slices, 0, sizeof(slices));
 
-    int threads = 1;
-    const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
-    if (env_threads) {
-        int t = atoi(env_threads);
-        if (t >= 1 && t <= 8) threads = (num_slices < t) ? num_slices : t;
-    }
-    const char *env_no_omp = getenv("BC250_DISABLE_OPENMP");
-    if (env_no_omp && (strcmp(env_no_omp, "0") != 0 && strcmp(env_no_omp, "false") != 0)) {
-        threads = 1;
-    }
-
+    int threads = get_default_slice_threads(num_slices);
     int num_threads_used = 1;
 
 #ifdef _OPENMP
@@ -3193,16 +3206,7 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
     raw_slice_output_t slices[16];
     memset(slices, 0, sizeof(slices));
 
-    int threads = 1;
-    const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
-    if (env_threads) {
-        int t = atoi(env_threads);
-        if (t >= 1 && t <= 8) threads = (num_slices < t) ? num_slices : t;
-    }
-    const char *env_no_omp = getenv("BC250_DISABLE_OPENMP");
-    if (env_no_omp && (strcmp(env_no_omp, "0") != 0 && strcmp(env_no_omp, "false") != 0)) {
-        threads = 1;
-    }
+    int threads = get_default_slice_threads(num_slices);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(threads) if(threads > 1 && num_slices > 1)

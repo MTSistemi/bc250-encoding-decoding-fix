@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 
 #define BC250_MAX_WIDTH 3840
 #define BC250_MAX_HEIGHT 2160
@@ -1138,25 +1139,22 @@ VAStatus bc250_SyncSurface(VADriverContextP ctx, VASurfaceID render_target) {
         DRIVER_UNLOCK(data);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
-    /* In non-pipelined mode (default), the synchronous encode call in bc250_EndPicture()
-     * has already waited for GPU completion and finalized bitstream generation.
-     * Returning success immediately avoids redundant fence waits and lock overhead. */
-    if (!bc250_pipeline_enabled()) {
-        DRIVER_UNLOCK(data);
-        return VA_STATUS_SUCCESS;
-    }
-
-    for (int i = 0; i < MAX_CONTEXTS; i++) {
-        if (data->contexts[i].allocated && data->contexts[i].has_pending_frame)
-            bc250_finish_pending_frame(data, &data->contexts[i]);
+    if (bc250_pipeline_enabled()) {
+        for (int i = 0; i < MAX_CONTEXTS; i++) {
+            if (data->contexts[i].allocated && data->contexts[i].has_pending_frame)
+                bc250_finish_pending_frame(data, &data->contexts[i]);
+        }
     }
     int slot = gpu_compute_submitted_slot(&data->gpu);
     DRIVER_UNLOCK(data);
 
     /* Unlocked wait for GPU fence: prevents blocking concurrent encoder_thread
      * actions while filter_thread waits on GPU completion. */
-    int sync_res = gpu_compute_sync_slot(&data->gpu, slot);
-    return (sync_res == 0) ? VA_STATUS_SUCCESS : VA_STATUS_ERROR_OPERATION_FAILED;
+    if (slot >= 0) {
+        int sync_res = gpu_compute_sync_slot(&data->gpu, slot);
+        if (sync_res != 0) return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    return VA_STATUS_SUCCESS;
 }
 
 VAStatus bc250_QuerySurfaceStatus(VADriverContextP ctx, VASurfaceID render_target, VASurfaceStatus *status) {
@@ -1736,6 +1734,11 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
         int v = atoi(max_t);
         if (v > 0 && v <= 8) def_threads = v;
     }
+#if defined(__linux__)
+    else if (program_invocation_short_name && strcmp(program_invocation_short_name, "sunshine") == 0) {
+        def_threads = 2;
+    }
+#endif
     omp_set_num_threads(def_threads);
 #endif
 

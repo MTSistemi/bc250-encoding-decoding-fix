@@ -6,6 +6,10 @@
  * dynamic_governor.c - Real-time dynamic CPU/GPU load governor for BC-250
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <errno.h>
 #include "dynamic_governor.h"
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +27,33 @@ void dynamic_governor_init(dynamic_governor_t *gov)
     gov->enabled = true;
     gov->forced_tier = -1;
     gov->cpu_offload_enabled = false;
+
+#if defined(__linux__)
+    if (program_invocation_short_name && strcmp(program_invocation_short_name, "sunshine") == 0) {
+        /* In Sunshine, frame pacing is managed by the network stream loop.
+         * Premature Tier 3 P_Skip failover causes 0.5ms / 32ms latency oscillation.
+         * Auto-tune thresholds for Sunshine streaming. */
+        gov->tier1_threshold_ms = 14.0;
+        gov->tier2_threshold_ms = 22.0;
+        gov->tier3_threshold_ms = 45.0;
+    }
+#endif
+
+    const char *env_t1 = getenv("BC250_GOVERNOR_TIER1_MS");
+    if (env_t1) {
+        double v = atof(env_t1);
+        if (v > 0) gov->tier1_threshold_ms = v;
+    }
+    const char *env_t2 = getenv("BC250_GOVERNOR_TIER2_MS");
+    if (env_t2) {
+        double v = atof(env_t2);
+        if (v > 0) gov->tier2_threshold_ms = v;
+    }
+    const char *env_t3 = getenv("BC250_GOVERNOR_TIER3_MS");
+    if (env_t3) {
+        double v = atof(env_t3);
+        if (v > 0) gov->tier3_threshold_ms = v;
+    }
 
     const char *env_enable = getenv("BC250_GOVERNOR_ENABLE");
     if (env_enable && (strcmp(env_enable, "0") == 0 || strcmp(env_enable, "false") == 0)) {
