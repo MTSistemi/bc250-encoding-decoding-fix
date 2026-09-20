@@ -2454,6 +2454,32 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
 int gpu_compute_dispatch_me_only(gpu_context_t *ctx, gpu_image_t render_target, int width, int height) {
     if (!ctx || !ctx->motion_est_pipeline) return -1;
 
+    /* The buffers have to be allocated here as well.
+     *
+     * gpu_compute_dispatch_encode_ext() carries a comment saying its
+     * allocation is "the ONLY place they get allocated" and that "proceeding
+     * with VK_NULL_HANDLE buffers is what turned an out-of-memory into a
+     * SEGV". This function is a second door into the same buffers, and it
+     * walked past that check: the only caller is the HEVC encoder, which
+     * therefore dispatched motion estimation with an OutputMV descriptor
+     * nobody had written and then copied from a null mv_buffer.
+     *
+     * Measured on a BC-250: SIGSEGV in radv_CmdCopyBuffer2, with the
+     * validation layers naming both halves - "the descriptor ... variable
+     * OutputMV is being used in dispatch but has never been updated" and
+     * "vkCmdCopyBuffer(): srcBuffer is VK_NULL_HANDLE".
+     *
+     * Same condition and same failure handling as the encode path, so the two
+     * doors behave alike.
+     */
+    if (ctx->staging_buffers[0] == VK_NULL_HANDLE ||
+        ctx->frame_width != (uint32_t)width ||
+        ctx->frame_height != (uint32_t)height) {
+        if (allocate_encoding_buffers(ctx, (uint32_t)width, (uint32_t)height) != 0) {
+            return -1;
+        }
+    }
+
     VkCommandBuffer cmd_buf = ctx->cmd_bufs[ctx->current_buf];
     uint32_t width_mbs = ((uint32_t)width + 15) / 16;
     uint32_t height_mbs = ((uint32_t)height + 15) / 16;
