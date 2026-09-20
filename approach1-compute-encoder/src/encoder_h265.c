@@ -394,15 +394,35 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     enc->fps = fps ? fps : 30;
     enc->bitrate = bitrate;
     enc->qp = 27;
+    bool qp_pinned = false;
     {
         const char *qp_env = getenv("BC250_HEVC_QP");
         if (qp_env) {
             int q = atoi(qp_env);
-            if (q >= 1 && q <= 51) enc->qp = q;
+            if (q >= 1 && q <= 51) { enc->qp = q; qp_pinned = true; }
         }
     }
     enc->pps_init_qp = enc->qp;
-    rc_init(&enc->rc, RC_CQP, bitrate, (double)enc->fps, width, height);
+    /* The rate control was built and then switched off.
+     *
+     * encode_core() already asks rc_get_frame_qp() for this frame's QP, the
+     * tail already calls rc_update_stats() with the bits produced, and the
+     * slice header already writes slice_qp_delta so a per-frame QP reaches
+     * the decoder. All three are guarded by `rc.mode != RC_CQP`, and this
+     * call passed RC_CQP - so none of them ever ran: every frame went out at
+     * QP 27 no matter what bitrate the caller asked for, and asking for more
+     * bitrate changed nothing.
+     *
+     * Measured on a BC-250 at 1920x1080, testsrc, 8 Mbit/s requested: the
+     * stream came out at 1.5 Mbit/s and 25.3 dB PSNR, where h264_vaapi on the
+     * same clip and the same request gives 51.4 dB. The H.264 path defaults
+     * to RC_LOW_LATENCY (see its rc_init() call), so HEVC now does the same.
+     *
+     * BC250_HEVC_QP still pins the QP: somebody who names a QP is asking for
+     * constant QP, and that is what RC_CQP is for.
+     */
+    rc_init(&enc->rc, qp_pinned ? RC_CQP : RC_LOW_LATENCY, bitrate,
+            (double)enc->fps, width, height);
     enc->rc.current_qp = enc->qp;
     enc->rc.base_qp = enc->qp;
     enc->quality_level = 4;
@@ -496,8 +516,24 @@ void hevc_encoder_set_qp(hevc_encoder_t *encoder, int qp)
         if (qp < 0) qp = 0;
         if (qp > 51) qp = 51;
         encoder->qp = qp;
-        encoder->rc.base_qp = qp;
-        encoder->rc.current_qp = qp;
+        /* In a bitrate-driven mode the loop owns its own state.
+         *
+         * va_backend.c calls this for EVERY picture, with pic_init_qp out of
+         * the VAEncPictureParameterBufferHEVC - and pic_init_qp is the PPS's
+         * starting QP, not an instruction to restart rate control. Resetting
+         * base_qp and current_qp here handed the feedback loop its starting
+         * value again before every single frame, so it could never walk
+         * anywhere: measured on a BC-250, QP stayed at 30 for the whole
+         * sequence while the stream ran at 1.3 Mbit/s against an 8 Mbit/s
+         * request. The H.264 path has no per-picture call like this.
+         *
+         * In RC_CQP there is no loop to protect and the caller's QP is the
+         * whole point, so that path is untouched.
+         */
+        if (encoder->rc.mode == RC_CQP) {
+            encoder->rc.base_qp = qp;
+            encoder->rc.current_qp = qp;
+        }
     }
 }
 
