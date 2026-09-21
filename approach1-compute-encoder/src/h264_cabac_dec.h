@@ -91,7 +91,12 @@ static inline bool h264d_cabac_overrun(const h264d_cabac_t *c)
 static inline size_t h264d_cabac_byte_pos(const h264d_cabac_t *c)
 {
     const ptrdiff_t bit = (c->ptr - c->start) * 8 - c->cache_bits;
-    return (size_t)((bit + 7) / 8);
+    /* ⚠️ Negative until the engine has handed out as many bits as it read
+     * ahead when it filled its cache, which on a substream shorter than
+     * the cache is most of the substream. Rounding that up and returning
+     * it as a size_t gives a number near the top of the range, and every
+     * comparison against it then means the opposite of what it says. */
+    return bit <= 0 ? 0 : (size_t)((bit + 7) / 8);
 }
 
 static inline uint32_t h264d_cabac_bits(h264d_cabac_t *c, int n)

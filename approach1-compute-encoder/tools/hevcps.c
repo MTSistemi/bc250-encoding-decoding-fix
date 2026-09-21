@@ -132,6 +132,54 @@ static void scrivi_immagine(FILE *f, hevcd_t *d, const hevc_sps_t *sps)
                    1, (size_t)(w / 2), f);
 }
 
+/* 7.4.7.1: the entry point offsets count the NAL unit's bytes, the
+ * emulation prevention ones included. The decoder reads the payload with
+ * those already removed, so each offset has to lose however many of them
+ * it has passed.
+ *
+ * ⚠️ The rule for which 0x03 is an emulation prevention byte is the one
+ * in br_extract_rbsp and not "every 0x03 after two zeros": a 0x03
+ * followed by a byte above 0x03 is ordinary payload. Counting them any
+ * other way moves the offsets by the wrong amount on exactly the streams
+ * where it matters.
+ */
+static void sposta_entry_point(hevc_slice_t *s, const uint8_t *grezzo,
+                               size_t n_grezzo, size_t primo)
+{
+    if (s->num_entry_point_offsets <= 0) return;
+
+    size_t i = 0, r = 0, zeri = 0, i0 = 0, r0 = 0;
+    bool partito = false;
+    int k = 0;
+
+    while (i < n_grezzo && k < s->num_entry_point_offsets) {
+        if (!partito && r == primo) {
+            i0 = i; r0 = r; partito = true;
+        }
+        if (partito && (size_t)(i - i0) == (size_t)s->entry_point[k]) {
+            s->entry_point[k] = (uint32_t)(r - r0);
+            k++;
+            continue;
+        }
+        const uint8_t c = grezzo[i];
+        if (zeri >= 2 && c == 0x03
+            && !(i + 1 < n_grezzo && grezzo[i + 1] > 0x03)) {
+            zeri = 0;
+            i++;
+            continue;                 /* removed, so the payload stands still */
+        }
+        zeri = (c == 0x00) ? zeri + 1 : 0;
+        i++;
+        r++;
+    }
+    /* An offset past the end of the NAL is a broken stream; leave the
+     * rest where the payload ended and let the row check refuse it. */
+    while (k < s->num_entry_point_offsets) {
+        s->entry_point[k] = (uint32_t)(r - r0);
+        k++;
+    }
+}
+
 /* Why a slice could not be walked through. */
 static const char *motivo_slice(int e)
 {
@@ -156,7 +204,7 @@ static const char *motivo_slice(int e)
  * NAL. One bin read against the wrong context almost never lands there. */
 static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
                           const hevc_pps_t *pps, const hevc_slice_t *sl,
-                          const uint8_t *rbsp, size_t n, bool senza_escape)
+                          const uint8_t *rbsp, size_t n)
 {
     /* ⚠️ P and B slices are read through, not reconstructed. Their
      * samples are meaningless until motion compensation exists; what the
@@ -276,11 +324,10 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
                 return 6;                  /* the bit is defined to be one */
 
             const size_t usati = h264d_cabac_byte_pos(&d->cabac);
-            if (usati >= resto) return 3;
 
             /* Where the header says this row ends. */
             size_t salto = usati;
-            if (senza_escape && sl->num_entry_point_offsets > 0) {
+            if (sl->num_entry_point_offsets > 0) {
                 const int riga = addr / sps->ctb_width;
                 if (riga < sl->num_entry_point_offsets) {
                     const uint32_t fin = sl->entry_point[riga];
@@ -498,12 +545,14 @@ int main(int argc, char **argv)
 
             if (!solo_intestazioni) {
                 const hevc_sps_t *sp = &sps[pps[s.pps_id].sps_id];
+                sposta_entry_point(&s, buf + inizio, (size_t)(fine - inizio),
+                                   s.data_bit_offset >> 3);
                 if (s.first_slice_in_pic && immagine_aperta) {
                     scrivi_immagine(fo, dec, sp);
                     immagine_aperta = false;
                 }
                 const int e = percorri_slice(dec, sp, &pps[s.pps_id], &s,
-                                             rbsp, n, n == (size_t)(fine - inizio));
+                                             rbsp, n);
                 if (e == 4) {
                     slice_saltate++;
                     if (immagine_aperta) scrivi_immagine(fo, dec, sp);
