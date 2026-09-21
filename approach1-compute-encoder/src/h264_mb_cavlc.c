@@ -146,7 +146,7 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
             int16_t tmp[16];
 
             if (!((m->cbp >> i8) & 1)) {
-                memset(d->res->coeff[0][b], 0, sizeof(d->res->coeff[0][b]));
+                memset(d->res->luma[b], 0, sizeof(d->res->luma[b]));
                 m->nnz[0][b] = 0;
                 continue;
             }
@@ -159,13 +159,13 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
                 for (int c = 0; c < 16; c++)
                     otto[4 * c + i4] = tmp[c];
             } else {
-                memset(d->res->coeff[0][b], 0, sizeof(d->res->coeff[0][b]));
+                memset(d->res->luma[b], 0, sizeof(d->res->luma[b]));
                 if (i16)
                     for (int c = 0; c < 15; c++)
-                        d->res->coeff[0][b][h264d_zigzag4[c + 1]] = tmp[c];
+                        d->res->luma[b][h264d_zigzag4[c + 1]] = tmp[c];
                 else
                     for (int c = 0; c < 16; c++)
-                        d->res->coeff[0][b][h264d_zigzag4[c]] = tmp[c];
+                        d->res->luma[b][h264d_zigzag4[c]] = tmp[c];
             }
         }
 
@@ -192,7 +192,7 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
     }
     for (int p = 0; p < 2; p++) {
         for (int b = 0; b < 4; b++) {
-            memset(d->res->coeff[p + 1][b], 0, sizeof(d->res->coeff[p + 1][b]));
+            memset(d->res->croma[p][b], 0, sizeof(d->res->croma[p][b]));
             if (cbp_c != 2) {
                 m->nnz[p + 1][b] = 0;
                 continue;
@@ -202,7 +202,7 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
                                                15, tmp);
             m->nnz[p + 1][b] = (uint8_t)nz;
             for (int c = 0; c < 15; c++)
-                d->res->coeff[p + 1][b][h264d_zigzag4[c + 1]] = tmp[c];
+                d->res->croma[p][b][h264d_zigzag4[c + 1]] = tmp[c];
         }
     }
 }

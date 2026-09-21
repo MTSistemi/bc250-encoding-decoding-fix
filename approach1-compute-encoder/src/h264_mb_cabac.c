@@ -755,7 +755,7 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
             const int b = zscan[k];
             const int b8 = ((b >> 3) << 1) | ((b >> 1) & 1);
             if (!((m->cbp >> b8) & 1)) {
-                memset(d->res->coeff[0][b], 0, sizeof(d->res->coeff[0][b]));
+                memset(d->res->luma[b], 0, sizeof(d->res->luma[b]));
                 m->nnz[0][b] = 0;
                 continue;
             }
@@ -770,15 +770,15 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
             int nz = leggi_residuo(d, cat, n, tmp, inc, true);
             /* An Intra_16x16 block codes only its fifteen AC coefficients;
              * the DC comes from the separate block above. */
-            memset(d->res->coeff[0][b], 0, sizeof(d->res->coeff[0][b]));
+            memset(d->res->luma[b], 0, sizeof(d->res->luma[b]));
             if (i16) {
                 /* The AC coefficients start at scan position 1: position 0
                  * is the DC, which came from its own block. */
                 for (int k = 0; k < 15; k++)
-                    d->res->coeff[0][b][h264d_zigzag4[k + 1]] = tmp[k];
+                    d->res->luma[b][h264d_zigzag4[k + 1]] = tmp[k];
             } else {
                 for (int k = 0; k < 16; k++)
-                    d->res->coeff[0][b][h264d_zigzag4[k]] = tmp[k];
+                    d->res->luma[b][h264d_zigzag4[k]] = tmp[k];
             }
             m->nnz[0][b] = (uint8_t)nz;
         }
@@ -805,7 +805,7 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
     for (int p = 0; p < 2; p++) {
         for (int b = 0; b < 4; b++) {
             if (cbp_c != 2) {
-                memset(d->res->coeff[p + 1][b], 0, sizeof(d->res->coeff[p + 1][b]));
+                memset(d->res->croma[p][b], 0, sizeof(d->res->croma[p][b]));
                 m->nnz[p + 1][b] = 0;
                 continue;
             }
@@ -816,9 +816,9 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
                     + 2 * cbf_vicino(d, bmb, pb, p + 1, false, intra);
             int16_t tmp[16];
             int nz = leggi_residuo(d, CAT_CHROMA_AC, 15, tmp, inc, true);
-            memset(d->res->coeff[p + 1][b], 0, sizeof(d->res->coeff[p + 1][b]));
+            memset(d->res->croma[p][b], 0, sizeof(d->res->croma[p][b]));
             for (int k = 0; k < 15; k++)
-                d->res->coeff[p + 1][b][h264d_zigzag4[k + 1]] = tmp[k];
+                d->res->croma[p][b][h264d_zigzag4[k + 1]] = tmp[k];
             m->nnz[p + 1][b] = (uint8_t)nz;
         }
     }
@@ -875,7 +875,6 @@ int h264d_decode_mb_cabac(h264_decoder_t *d)
                 /* âš ï¸ Nothing to zero: a macroblock with no coefficients
                  * has its coded_block_pattern at zero, and reconstruction
                  * reads that before it reads any residual. */
-                h264d_reconstruct_mb(d);
                 return 0;
             }
             /* Clause 8.4.1.1: one 16x16 partition on reference 0, with the
@@ -884,7 +883,6 @@ int h264d_decode_mb_cabac(h264_decoder_t *d)
             int16_t mv[2];
             h264d_skip_mv_p(d, mv);
             posa(m, 0, 0, 4, 4, 0, d->slice.ref_list[0][0], mv[0], mv[1], 0, 0);
-            h264d_reconstruct_mb(d);
             return 0;
         }
     }

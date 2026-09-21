@@ -407,9 +407,9 @@ static void aggiungi_luma(h264_decoder_t *d, h264d_mb_t *m, uint8_t *y, int sy)
         /* An all-zero block adds nothing. nnz counts the coefficients the
          * entropy decoder actually read; for Intra_16x16 the DC arrives
          * separately and is not in that count, so it is tested on its own. */
-        if (m->nnz[0][b] == 0 && (!i16 || d->res->coeff[0][b][0] == 0))
+        if (m->nnz[0][b] == 0 && (!i16 || d->res->luma[b][0] == 0))
             continue;
-        h264d_idct4_add(dst, sy, d->res->coeff[0][b], dq->d4[lista4],
+        h264d_idct4_add(dst, sy, d->res->luma[b], dq->d4[lista4],
                         m->qpy, i16);
     }
 }
@@ -465,7 +465,7 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
             h264d_luma_dc_transform(d->res->dc_luma, m->qpy,
                                     d->dequant->per_resto[m->qpy % 6].d4[0][0]);
             for (int k = 0; k < 16; k++)
-                d->res->coeff[0][k][0] = d->res->dc_luma[k];
+                d->res->luma[k][0] = d->res->dc_luma[k];
 
             if (m16 == d->mb_idx) {
                 fprintf(stderr, "  DC dopo la trasformata:%s", NEWLINE);
@@ -478,7 +478,7 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
                 fprintf(stderr, "  AC del blocco raster 0:%s", NEWLINE);
                 fprintf(stderr, "   ");
                 for (int xx = 1; xx < 16; xx++)
-                    fprintf(stderr, " %4d", d->res->coeff[0][0][xx]);
+                    fprintf(stderr, " %4d", d->res->luma[0][xx]);
                 fprintf(stderr, "%s", NEWLINE);
             }
         } else if (m->transform8x8) {
@@ -521,13 +521,13 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
                     for (int yy = 0; yy < 4; yy++) {
                         fprintf(stderr, "   ");
                         for (int xx = 0; xx < 4; xx++)
-                            fprintf(stderr, " %5d", d->res->coeff[0][b][yy * 4 + xx]);
+                            fprintf(stderr, " %5d", d->res->luma[b][yy * 4 + xx]);
                         fprintf(stderr, "%s", NEWLINE);
                     }
                 }
 
                 if ((m->cbp >> h264d_part8(b)) & 1)
-                    h264d_idct4_add(dst, sy, d->res->coeff[0][b],
+                    h264d_idct4_add(dst, sy, d->res->luma[b],
                                     d->dequant->per_resto[m->qpy % 6].d4[0],
                                     m->qpy, false);
 
@@ -654,11 +654,11 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
          * without this every one of them ran eight inverse transforms over
          * zeros. */
         for (int b = 0; b < 4; b++) {
-            d->res->coeff[p + 1][b][0] = d->res->dc_chroma[p][b];
+            d->res->croma[p][b][0] = d->res->dc_chroma[p][b];
             if (m->nnz[p + 1][b] == 0 && d->res->dc_chroma[p][b] == 0)
                 continue;
             uint8_t *dst = piano + (size_t)((b >> 1) * 4) * sc + (b & 1) * 4;
-            h264d_idct4_add(dst, sc, d->res->coeff[p + 1][b], dqc->d4[lista_c],
+            h264d_idct4_add(dst, sc, d->res->croma[p][b], dqc->d4[lista_c],
                             qpc, true);
         }
     }

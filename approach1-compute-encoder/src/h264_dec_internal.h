@@ -61,7 +61,8 @@ enum {
  * rather than in a union, because the debug dumps read whichever one the
  * macroblock did not use and a union would make that undefined. */
 typedef struct {
-    int16_t coeff[3][16][16];     /* [plane][block][coefficient] */
+    int16_t luma[16][16];         /* [block][coefficient], raster inside */
+    int16_t croma[2][4][16];      /* âš ï¸ four blocks a plane at 4:2:0 */
     int16_t coeff8[4][64];        /* the 8x8 transform's luma blocks */
     int16_t dc_luma[16];
     int16_t dc_chroma[2][4];
