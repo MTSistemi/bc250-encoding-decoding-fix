@@ -150,4 +150,9 @@ void h264d_predict_mv(h264_decoder_t *d, int list, int blk, int w4, int h4,
 /* The vector of a skipped P macroblock, 8.4.1.1. */
 void h264d_skip_mv_p(h264_decoder_t *d, int16_t out[2]);
 
+/* Spatial direct prediction for a B macroblock, 8.4.1.2.2. `maschera` says
+ * which of the four 8x8 partitions to fill in, because a B_8x8 can be
+ * direct in some of them and explicit in the rest. */
+int h264d_direct_spatial(h264_decoder_t *d, h264d_mb_t *m, int maschera);
+
 #endif /* BC250_H264_DEC_INTERNAL_H */

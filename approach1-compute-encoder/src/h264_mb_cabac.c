@@ -222,8 +222,13 @@ static int leggi_ref_idx(h264_decoder_t *d, int lista, int blk8, int cap)
      * every reference sits in a slot above zero, so asking the slot instead
      * made this context read as "the neighbour used a high reference" nearly
      * always. */
-    if (a && !a->intra && a->ref_idx[lista][pa] > 0) inc += 1;
-    if (b && !b->intra && b->ref_idx[lista][pb] > 0) inc += 2;
+    /* ⚠️ A direct neighbour does not count, whatever index the derivation
+     * gave it: it signalled nothing, so there is nothing to have been
+     * large. */
+    if (a && !a->intra && !((a->direct >> pa) & 1) && a->ref_idx[lista][pa] > 0)
+        inc += 1;
+    if (b && !b->intra && !((b->direct >> pb) & 1) && b->ref_idx[lista][pb] > 0)
+        inc += 2;
 
     if (!decidi(d, CTX_REF_IDX + inc))
         return 0;
@@ -516,40 +521,39 @@ static inline bool usa(int pred, int lista)
     return pred == (lista ? H264D_PRED_L1 : H264D_PRED_L0);
 }
 
-/* Clause 7.3.5.1 and 7.3.5.2.
+/* Clause 7.3.5.1 and 7.3.5.2, and the derivation of 8.4.1.
  *
- * ⚠️ Two nested levels, and they are read at different granularities. A
- * macroblock has one, two or four PARTITIONS; each partition has one, two or
- * four SUB-partitions, and only a P_8x8 or B_8x8 has more than one. A
- * reference index is signalled per partition; a motion vector difference per
- * sub-partition. Reading a reference index per sub-partition consumes twelve
- * indices too many on a macroblock cut into 4x4 pieces.
+ * ⚠️ Two nested levels read at different granularities. A macroblock has
+ * one, two or four PARTITIONS; each has one, two or four SUB-partitions,
+ * and only a P_8x8 or B_8x8 has more than one. A reference index is
+ * signalled per partition, a motion vector difference per sub-partition.
  *
- * ⚠️ And the order is passes, not a single walk: every ref_idx_l0, then every
- * ref_idx_l1, then every mvd_l0, then every mvd_l1. That is also what makes
- * the vectors computable inside the mvd passes - by then every partition's
- * reference is known, which is what the prediction of 8.4.1.3 compares
- * against.
+ * ⚠️ And the syntax comes in passes, not in one walk: every ref_idx of list
+ * 0, then every ref_idx of list 1, then every difference of list 0, then of
+ * list 1. That is the order the bitstream holds them in.
+ *
+ * ⚠️ The DERIVATION is a third order again: partition by partition, because
+ * each one's vector is predicted from the ones before it - and a direct
+ * partition is part of that sequence, not a tidying step afterwards.
  */
 static int leggi_movimento(h264_decoder_t *d, h264d_mb_t *m, bool bslice, int t)
 {
-    /* Up to four partitions, each with up to four sub-partitions. */
     struct {
         uint8_t pred;
         uint8_t n;                  /* sub-partitions */
         uint8_t blk[4];             /* raster 4x4 index of each */
         uint8_t w4, h4;             /* size of a sub-partition */
         int8_t  ref[2];
+        int16_t dx[2][4], dy[2][4]; /* the differences as read */
     } parte[4];
     int np = 0;
-
     bool sotto_8x8 = false;
 
     if (m->type == H264D_MB_P_8x8 || m->type == H264D_MB_B_8x8) {
-        /* Every sub_mb_type first, then what they describe. */
         h264d_sub_t sub[4];
         for (int i = 0; i < 4; i++) {
             const int s = bslice ? leggi_sub_mb_type_b(d) : leggi_sub_mb_type_p(d);
+            m->sub_tipo[i] = (int8_t)s;
             sub[i] = bslice ? h264d_sub_b[s >= 0 && s < 13 ? s : 12]
                             : h264d_sub_p[s >= 0 && s < 4 ? s : 3];
             if (sub[i].w4 < 2 || sub[i].h4 < 2)
@@ -600,8 +604,18 @@ static int leggi_movimento(h264_decoder_t *d, h264d_mb_t *m, bool bslice, int t)
 
     m->sub_8x8 = sotto_8x8 ? 1 : 0;
 
+    /* Which 8x8s are direct. The ref_idx context of 9.3.3.1.1.6 does not
+     * count a direct neighbour, whatever index the derivation gives it. */
+    m->direct = 0;
     for (int i = 0; i < np; i++)
+        if (parte[i].pred == H264D_PRED_DIRECT)
+            m->direct |= (uint8_t)(np == 1 ? 0xf : (1 << i));
+
+    for (int i = 0; i < np; i++) {
         parte[i].ref[0] = parte[i].ref[1] = -1;
+        memset(parte[i].dx, 0, sizeof(parte[i].dx));
+        memset(parte[i].dy, 0, sizeof(parte[i].dy));
+    }
 
     /* ---- reference indices, one per partition, list 0 then list 1 ---- */
     for (int lista = 0; lista < (bslice ? 2 : 1); lista++) {
@@ -611,8 +625,8 @@ static int leggi_movimento(h264_decoder_t *d, h264d_mb_t *m, bool bslice, int t)
                 continue;
             const int r = leggi_ref_idx(d, lista, h264d_part8(parte[i].blk[0]), cap);
             parte[i].ref[lista] = (int8_t)r;
-            /* In the store before any vector is predicted: the prediction
-             * of 8.4.1.3 compares references. */
+            /* In the store straight away: the next partition's ref_idx
+             * context asks what this one used. */
             for (int k = 0; k < parte[i].n; k++)
                 posa(m, lista, parte[i].blk[k], parte[i].w4, parte[i].h4,
                      r, d->slice.ref_list[lista][r], 0, 0, 0, 0);
@@ -624,28 +638,50 @@ static int leggi_movimento(h264_decoder_t *d, h264d_mb_t *m, bool bslice, int t)
         for (int i = 0; i < np; i++) {
             if (parte[i].pred == H264D_PRED_DIRECT || !usa(parte[i].pred, lista))
                 continue;
+            for (int k = 0; k < parte[i].n; k++) {
+                const int b = parte[i].blk[k];
+                const int dx = leggi_mvd(d, 0, somma_mvd(d, lista, b, 0));
+                const int dy = leggi_mvd(d, 1, somma_mvd(d, lista, b, 1));
+                parte[i].dx[lista][k] = (int16_t)dx;
+                parte[i].dy[lista][k] = (int16_t)dy;
+                /* The difference goes in now, because the next one's
+                 * context is the sum of its neighbours' differences. The
+                 * vector itself waits for the derivation pass. */
+                const int x4 = b & 3, y4 = b >> 2;
+                for (int yy = 0; yy < parte[i].h4; yy++)
+                    for (int xx = 0; xx < parte[i].w4; xx++) {
+                        const int bb = (y4 + yy) * 4 + x4 + xx;
+                        m->mvd[lista][bb][0] = (int16_t)dx;
+                        m->mvd[lista][bb][1] = (int16_t)dy;
+                    }
+            }
+        }
+    }
+
+    /* ---- the derivation, partition by partition ---- */
+    for (int i = 0; i < np; i++) {
+        if (parte[i].pred == H264D_PRED_DIRECT) {
+            const int maschera = (np == 1) ? 0xf : (1 << i);
+            if (h264d_direct_spatial(d, m, maschera) != 0)
+                return 1;
+            continue;
+        }
+        for (int lista = 0; lista < (bslice ? 2 : 1); lista++) {
+            if (!usa(parte[i].pred, lista))
+                continue;
             const int r = parte[i].ref[lista];
             for (int k = 0; k < parte[i].n; k++) {
                 const int b = parte[i].blk[k];
                 int16_t pmv[2];
                 h264d_predict_mv(d, lista, b, parte[i].w4, parte[i].h4, r, pmv);
-                const int dx = leggi_mvd(d, 0, somma_mvd(d, lista, b, 0));
-                const int dy = leggi_mvd(d, 1, somma_mvd(d, lista, b, 1));
                 posa(m, lista, b, parte[i].w4, parte[i].h4,
                      r, d->slice.ref_list[lista][r],
-                     (int16_t)(pmv[0] + dx), (int16_t)(pmv[1] + dy),
-                     (int16_t)dx, (int16_t)dy);
+                     (int16_t)(pmv[0] + parte[i].dx[lista][k]),
+                     (int16_t)(pmv[1] + parte[i].dy[lista][k]),
+                     parte[i].dx[lista][k], parte[i].dy[lista][k]);
             }
         }
     }
-
-    /* B direct is not derived yet: 8.4.1.2 needs the motion field of the
-     * co-located picture, which means keeping one per reference frame. Until
-     * that store exists a direct partition is refused rather than guessed
-     * at, and the slice layer keeps B slices out entirely. */
-    for (int i = 0; i < np; i++)
-        if (parte[i].pred == H264D_PRED_DIRECT)
-            return 1;
 
     return 0;
 }
@@ -655,7 +691,13 @@ static int leggi_movimento(h264_decoder_t *d, h264d_mb_t *m, bool bslice, int t)
 static void azzera_mb(h264d_mb_t *m)
 {
     memset(m, 0, sizeof(*m));
+    /* ⚠️ Both of them. A partition that does not use a list has to say so
+     * through the INDEX as well as the slot: the vector prediction of
+     * 8.4.1.3 compares indices, so an index left at zero makes a neighbour
+     * that predicts from nothing claim it used reference zero. */
     memset(m->ref, -1, sizeof(m->ref));
+    memset(m->ref_idx, -1, sizeof(m->ref_idx));
+    memset(m->sub_tipo, -1, sizeof(m->sub_tipo));
 }
 
 /* The residual of one macroblock, clause 7.3.5.3. */
@@ -810,8 +852,25 @@ int h264d_decode_mb_cabac(h264_decoder_t *d)
             memset(d->dc_chroma, 0, sizeof(d->dc_chroma));
             memset(d->coeff, 0, sizeof(d->coeff));
             memset(d->coeff8, 0, sizeof(d->coeff8));
-            if (bslice)
-                return 1;       /* B_Skip needs the direct derivation */
+            if (bslice) {
+                /* B_Skip is B_Direct_16x16 with nothing coded at all.
+                 *
+                 * ⚠️ Marked direct, and that matters beyond bookkeeping: the
+                 * ref_idx context of 9.3.3.1.1.6 does not count a skipped or
+                 * direct neighbour. Leaving the flag clear let a run of
+                 * B_Skip macroblocks whose derivation happened to pick
+                 * reference 1 tip the context of the next coded one, which
+                 * desynchronised the slice twenty macroblocks from the end. */
+                m->direct = 0xf;
+                if (h264d_direct_spatial(d, m, 0xf) != 0)
+                    return 1;
+                memset(d->dc_luma, 0, sizeof(d->dc_luma));
+                memset(d->dc_chroma, 0, sizeof(d->dc_chroma));
+                memset(d->coeff, 0, sizeof(d->coeff));
+                memset(d->coeff8, 0, sizeof(d->coeff8));
+                h264d_reconstruct_mb(d);
+                return 0;
+            }
             /* Clause 8.4.1.1: one 16x16 partition on reference 0, with the
              * vector predicted as usual except that it collapses to zero at
              * the picture edge or beside a neighbour that is itself still. */

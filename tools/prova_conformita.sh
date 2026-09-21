@@ -105,28 +105,29 @@ prova "4 slice" "$SRC1" 176x144 \
 echo
 echo "sequenze con fotogrammi P"
 for n in 2 5 15; do
-    prova "$n fotogrammi, niente B" "$SRC1" 176x144 \
-        -frames:v $n -c:v libx264 -profile:v main -qp 26 -bf 0 -g 30
+    prova "$n fotogrammi, niente B" "$SRC1" 176x144         -frames:v $n -c:v libx264 -profile:v main -qp 26 -bf 0 -g 30
 done
-prova "10 fotogrammi, 3 riferimenti" "$SRC1" 176x144 \
-    -frames:v 10 -c:v libx264 -profile:v main -qp 26 -bf 0 -refs 3 -g 30
-prova "10 fotogrammi, high 8x8" "$SRC1" 176x144 \
-    -frames:v 10 -c:v libx264 -profile:v high -qp 26 -bf 0 -g 30
-
-prova "20 fotogrammi, preset lento" "$SRC1" 176x144     -frames:v 20 -c:v libx264 -profile:v high -preset slow -crf 26 -bf 0 -g 8
-prova "12 fotogrammi 320x240" "$SRC2" 320x240     -frames:v 12 -c:v libx264 -profile:v high -crf 24 -bf 0 -g 6
+prova "10 fotogrammi, 3 riferimenti" "$SRC1" 176x144     -frames:v 10 -c:v libx264 -profile:v main -qp 26 -bf 0 -refs 3 -g 30
+prova "10 fotogrammi, high 8x8" "$SRC1" 176x144     -frames:v 10 -c:v libx264 -profile:v high -qp 26 -bf 0 -g 30
 prova "10 fotogrammi, 4 slice" "$SRC1" 176x144     -frames:v 10 -c:v libx264 -profile:v main -qp 26 -bf 0 -g 30 -x264opts slices=4
-
-echo
-echo "CAVLC (baseline)"
-prova "intra CAVLC" "$SRC1" 176x144 \
-    -frames:v 1 -c:v libx264 -profile:v baseline -qp 26
+prova "20 fotogrammi, crf e preset lento" "$SRC1" 176x144     -frames:v 20 -c:v libx264 -profile:v high -preset slow -crf 26 -bf 0 -g 8
+prova "12 fotogrammi 320x240, crf" "$SRC2" 320x240     -frames:v 12 -c:v libx264 -profile:v high -crf 24 -bf 0 -g 6
 
 echo
 echo "fotogrammi B"
-prova "10 fotogrammi con B" "$SRC1" 176x144 \
-    -frames:v 10 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 30
+prova "9 fotogrammi, 2 B, niente piramide" "$SRC1" 176x144     -frames:v 9 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 30 -x264opts b-pyramid=none
+prova "16 fotogrammi, 3 B, niente piramide" "$SRC1" 176x144     -frames:v 16 -c:v libx264 -profile:v main -qp 24 -bf 3 -g 8 -x264opts b-pyramid=none
+prova "12 fotogrammi B, high 8x8" "$SRC1" 176x144     -frames:v 12 -c:v libx264 -profile:v high -qp 26 -bf 2 -g 6 -x264opts b-pyramid=none
+prova "12 fotogrammi B, 320x240" "$SRC2" 320x240     -frames:v 12 -c:v libx264 -profile:v high -qp 24 -bf 2 -g 6 -x264opts b-pyramid=none
+prova "10 fotogrammi, piramide B" "$SRC1" 176x144     -frames:v 10 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 30
+prova "20 fotogrammi, tutti i default di x264" "$SRC1" 176x144     -frames:v 20 -c:v libx264 -profile:v high -preset slow -crf 25 -g 10
 
 echo
-printf 'passate %d, fallite %d, saltate %d\n' "$passate" "$fallite" "$saltate"
+echo "CAVLC (baseline)"
+prova "intra CAVLC" "$SRC1" 176x144     -frames:v 1 -c:v libx264 -profile:v baseline -qp 26
+prova "10 fotogrammi CAVLC" "$SRC1" 176x144     -frames:v 10 -c:v libx264 -profile:v baseline -qp 26 -g 30
+
+echo
+printf 'passate %d, fallite %d, saltate %d
+' "$passate" "$fallite" "$saltate"
 [ "$fallite" -eq 0 ]

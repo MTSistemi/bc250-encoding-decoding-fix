@@ -258,20 +258,65 @@ static int leggi_pps(const uint8_t *rbsp, size_t n)
     return id;
 }
 
-/* Write one frame, cropped the way the stream asks for. */
+/* Pictures held back so they can be written in display order. */
+typedef struct {
+    int poc;
+    int ordine;                 /* decode order, to break ties stably */
+    size_t n;
+    uint8_t *dati;
+} uscita_t;
+
+static uscita_t coda[4096];
+static int n_coda = 0;
+
+/* Copy one frame out, cropped the way the stream asks for, into the queue. */
 static void scrivi(FILE *fo, const h264d_frame_t *f, const sps_t *sp)
 {
+    (void)fo;
     const int w = sp->mb_width * 16 - sp->crop_left - sp->crop_right;
     const int h = sp->mb_height * 16 - sp->crop_top - sp->crop_bottom;
-    for (int y = 0; y < h; y++)
-        fwrite(f->y + (size_t)(y + sp->crop_top) * f->stride_y + sp->crop_left,
-               1, (size_t)w, fo);
+    const size_t n = (size_t)w * h + 2 * (size_t)(w / 2) * (h / 2);
+    if (n_coda >= 4096) return;
+
+    uint8_t *d = malloc(n);
+    if (!d) return;
+    size_t o = 0;
+    for (int y = 0; y < h; y++) {
+        memcpy(d + o, f->y + (size_t)(y + sp->crop_top) * f->stride_y
+                            + sp->crop_left, (size_t)w);
+        o += (size_t)w;
+    }
     for (int p = 0; p < 2; p++) {
         const uint8_t *pl = p ? f->cr : f->cb;
-        for (int y = 0; y < h / 2; y++)
-            fwrite(pl + (size_t)(y + sp->crop_top / 2) * f->stride_c
-                      + sp->crop_left / 2, 1, (size_t)(w / 2), fo);
+        for (int y = 0; y < h / 2; y++) {
+            memcpy(d + o, pl + (size_t)(y + sp->crop_top / 2) * f->stride_c
+                              + sp->crop_left / 2, (size_t)(w / 2));
+            o += (size_t)(w / 2);
+        }
     }
+    coda[n_coda].poc = f->poc;
+    coda[n_coda].ordine = n_coda;
+    coda[n_coda].n = n;
+    coda[n_coda].dati = d;
+    n_coda++;
+}
+
+/* Display order is picture order count order. */
+static void svuota(FILE *fo)
+{
+    for (int a = 0; a + 1 < n_coda; a++)
+        for (int b = 0; b + 1 < n_coda - a; b++)
+            if (coda[b].poc > coda[b + 1].poc
+                || (coda[b].poc == coda[b + 1].poc
+                    && coda[b].ordine > coda[b + 1].ordine)) {
+                uscita_t t = coda[b]; coda[b] = coda[b + 1]; coda[b + 1] = t;
+            }
+    for (int k = 0; k < n_coda; k++) {
+        fwrite(coda[k].dati, 1, coda[k].n, fo);
+        free(coda[k].dati);
+        coda[k].dati = NULL;
+    }
+    n_coda = 0;
 }
 
 /* ---------------------------------------------------------- the driver */
@@ -424,16 +469,18 @@ int main(int argc, char **argv)
         /* Clause 7.3.3.1, read here and applied once the frame store slots
          * are known. A stream that reorders its list is not exotic: x264
          * does it whenever weighted prediction is on, which is by default. */
-        int n_mod = 0;
-        int mod_idc[32], mod_val[32];
-        if (slice_type != 2 && br_read1(&br)) {
+        int n_mod[2] = { 0, 0 };
+        int mod_idc[2][32], mod_val[2][32];
+        const int liste_mod = (slice_type == 1) ? 2 : (slice_type == 0 ? 1 : 0);
+        for (int l = 0; l < liste_mod; l++) {
+            if (!br_read1(&br)) continue;
             for (;;) {
                 const int idc = (int)br_read_ue(&br);
-                if (idc == 3 || n_mod >= 32) break;
+                if (idc == 3 || n_mod[l] >= 32) break;
                 const int v = (int)br_read_ue(&br);
-                mod_idc[n_mod] = idc;
-                mod_val[n_mod] = v;
-                n_mod++;
+                mod_idc[l][n_mod[l]] = idc;
+                mod_val[l][n_mod[l]] = v;
+                n_mod[l]++;
             }
         }
         /* Clause 7.3.3.2. A reference whose flag is clear takes the neutral
@@ -480,11 +527,67 @@ int main(int argc, char **argv)
                 }
             }
         }
+        /* Clause 7.3.3.3. The operations are read here and applied below,
+         * once the current picture's frame_num is the one they are relative
+         * to. */
+        int n_mmco = 0;
+        int mmco_op[32], mmco_val[32];
         if (nal_ref_idc) {
-            if (idr) { br_read1(&br); br_read1(&br); }
-            else if (br_read1(&br)) {       /* adaptive_ref_pic_marking */
-                fprintf(stderr, "marcatura adattiva dei riferimenti, "
-                                "non implementata\n");
+            if (idr) {
+                br_read1(&br);              /* no_output_of_prior_pics */
+                br_read1(&br);              /* long_term_reference_flag */
+            } else if (br_read1(&br)) {
+                for (;;) {
+                    const int op = (int)br_read_ue(&br);
+                    if (op == 0 || n_mmco >= 32) break;
+                    int v = 0;
+                    switch (op) {
+                    case 1: case 3:
+                        v = (int)br_read_ue(&br);       /* difference_of_pic_nums_minus1 */
+                        if (op == 3) br_read_ue(&br);   /* long_term_frame_idx */
+                        break;
+                    case 2:
+                        v = (int)br_read_ue(&br);       /* long_term_pic_num */
+                        break;
+                    case 4:
+                        v = (int)br_read_ue(&br);       /* max_long_term_frame_idx_plus1 */
+                        break;
+                    case 6:
+                        v = (int)br_read_ue(&br);       /* long_term_frame_idx */
+                        break;
+                    case 5:
+                        break;                          /* clear everything */
+                    default:
+                        fprintf(stderr, "operazione di marcatura %d "
+                                        "sconosciuta\n", op);
+                        return 3;
+                    }
+                    mmco_op[n_mmco] = op;
+                    mmco_val[n_mmco] = v;
+                    n_mmco++;
+                }
+            }
+        }
+
+        /* Applied now, because the list these operations name is the one
+         * this picture was decoded against. */
+        for (int k = 0; k < n_mmco; k++) {
+            if (mmco_op[k] == 1) {
+                const int max_pn = 1 << sp->log2_max_frame_num;
+                int pn = frame_num - (mmco_val[k] + 1);
+                if (pn < 0) pn += max_pn;
+                int dove = -1;
+                for (int c = 0; c < n_rif; c++)
+                    if (rifs[c].frame_num == pn) { dove = c; break; }
+                if (dove >= 0) {
+                    for (int c = dove; c + 1 < n_rif; c++) rifs[c] = rifs[c + 1];
+                    n_rif--;
+                }
+            } else if (mmco_op[k] == 5) {
+                n_rif = 0;
+            } else {
+                fprintf(stderr, "marcatura con operazione %d, "
+                                "non implementata\n", mmco_op[k]);
                 return 3;
             }
         }
@@ -527,7 +630,16 @@ int main(int argc, char **argv)
                     fotogrammi++;
                 }
             }
-            if (idr) n_rif = 0;
+            /* ⚠️ An IDR restarts the picture order count at zero, so the
+             * queue has to go out before it. Sorting the two groups of
+             * pictures together interleaves them: with a group of eight,
+             * picture 8 has the same count as picture 0 and lands second.
+             * That is also why a nine-picture clip failed where an
+             * eight-picture one passed - one group against two. */
+            if (idr) {
+                svuota(fo);
+                n_rif = 0;
+            }
             superficie_corrente = prossima_superficie++;
 
             h264d_pic_t pic;
@@ -576,41 +688,70 @@ int main(int argc, char **argv)
                           ? rifs[k].frame_num - max_pic_num
                           : rifs[k].frame_num;
 
-        /* The initial list, clause 8.2.4.2.1: short-term references by
-         * descending PicNum, which without frame_num gaps is reverse decode
-         * order - the order `rifs` already holds. It is then cut to the
-         * number of active indices the slice declared. */
-        /* ⚠️ The list is as long as num_ref_idx says, even when the frame
-         * store holds fewer pictures than that. Reordering may put the same
-         * picture at several indices, and x264 does exactly that for
-         * weighted prediction: the same reference twice, once with an offset
-         * of its own. Capping the list at the number of distinct pictures
-         * left the tail pointing at whatever slot 0 happened to be, which
-         * was right only while slot 0 was still a reference. */
-        rif_t lista0[34];
-        int n_attivo = sl.num_ref_idx[0];
-        if (n_attivo > 32) n_attivo = 32;
-        for (int k = 0; k < n_attivo; k++)
-            lista0[k] = rifs[k < n_rif ? k : (n_rif > 0 ? n_rif - 1 : 0)];
+        rif_t lista[2][34];
+        int n_attivo[2] = { 0, 0 };
 
-        /* Clause 8.2.4.3.1. Each step names a picture by PicNum, slides the
-         * list down from the current index, drops the named picture in, and
-         * squeezes out the copy of it that is now further along.
-         *
-         * ⚠️ The picture is looked up in the FRAME STORE, not in the list
-         * being built. Searching the list finds the entry the slide has just
-         * duplicated, which is only the right answer by accident. */
-        if (n_mod > 0 && n_attivo > 0) {
+        for (int l = 0; l < (slice_type == 1 ? 2 : 1); l++) {
+            int n = sl.num_ref_idx[l];
+            if (n > 32) n = 32;
+            n_attivo[l] = n;
+
+            if (slice_type == 0) {
+                /* 8.2.4.2.1: descending PicNum, which is the order `rifs`
+                 * already holds. */
+                for (int k = 0; k < n; k++)
+                    lista[l][k] = rifs[k < n_rif ? k : (n_rif > 0 ? n_rif - 1 : 0)];
+            } else {
+                /* 8.2.4.2.3: by display order. Before this picture, nearest
+                 * first; then after it, nearest first. List 1 takes them the
+                 * other way round. */
+                rif_t prima[16], dopo[16];
+                int np = 0, nd = 0;
+                for (int k = 0; k < n_rif; k++) {
+                    if (rifs[k].poc < poc) prima[np++] = rifs[k];
+                    else                   dopo[nd++] = rifs[k];
+                }
+                for (int a = 0; a + 1 < np; a++)      /* descending POC */
+                    for (int b = 0; b + 1 < np - a; b++)
+                        if (prima[b].poc < prima[b + 1].poc) {
+                            rif_t t = prima[b]; prima[b] = prima[b + 1]; prima[b + 1] = t;
+                        }
+                for (int a = 0; a + 1 < nd; a++)      /* ascending POC */
+                    for (int b = 0; b + 1 < nd - a; b++)
+                        if (dopo[b].poc > dopo[b + 1].poc) {
+                            rif_t t = dopo[b]; dopo[b] = dopo[b + 1]; dopo[b + 1] = t;
+                        }
+
+                rif_t ordinata[32];
+                int no = 0;
+                if (l == 0) {
+                    for (int k = 0; k < np && no < 32; k++) ordinata[no++] = prima[k];
+                    for (int k = 0; k < nd && no < 32; k++) ordinata[no++] = dopo[k];
+                } else {
+                    for (int k = 0; k < nd && no < 32; k++) ordinata[no++] = dopo[k];
+                    for (int k = 0; k < np && no < 32; k++) ordinata[no++] = prima[k];
+                }
+                for (int k = 0; k < n; k++)
+                    lista[l][k] = ordinata[k < no ? k : (no > 0 ? no - 1 : 0)];
+            }
+
+            /* Clause 8.2.4.3.1. Each step names a picture by PicNum, slides
+             * the list down from the current index, drops it in, and
+             * squeezes out the copy that is now further along.
+             *
+             * ⚠️ The picture is looked up in the frame store, not in the
+             * list being built: the list has just been slid, so searching it
+             * finds the copy the slide made. */
             int pred = frame_num;
             int ref_idx = 0;
-            for (int k = 0; k < n_mod && ref_idx < n_attivo; k++) {
-                if (mod_idc[k] != 0 && mod_idc[k] != 1) {
+            for (int k = 0; k < n_mod[l] && ref_idx < n; k++) {
+                if (mod_idc[l][k] != 0 && mod_idc[l][k] != 1) {
                     fprintf(stderr, "riferimenti a lungo termine, "
                                     "non implementati\n");
                     return 3;
                 }
-                const int delta = mod_val[k] + 1;
-                int senza_giro = (mod_idc[k] == 0) ? pred - delta : pred + delta;
+                const int delta = mod_val[l][k] + 1;
+                int senza_giro = (mod_idc[l][k] == 0) ? pred - delta : pred + delta;
                 if (senza_giro < 0) senza_giro += max_pic_num;
                 else if (senza_giro >= max_pic_num) senza_giro -= max_pic_num;
                 pred = senza_giro;
@@ -621,27 +762,55 @@ int main(int argc, char **argv)
                 for (int c = 0; c < n_rif; c++)
                     if (pic_num_di[c] == pic_num) { trovato = c; break; }
                 if (trovato < 0) {
-                    fprintf(stderr, "la lista chiede PicNum %d, che non c'e'\n",
-                            pic_num);
+                    fprintf(stderr, "la lista %d chiede PicNum %d, che non c'e'\n",
+                            l, pic_num);
                     return 3;
                 }
                 const rif_t scelto = rifs[trovato];
 
-                for (int c = n_attivo; c > ref_idx; c--)
-                    lista0[c] = lista0[c - 1];
-                lista0[ref_idx++] = scelto;
+                for (int c = n; c > ref_idx; c--)
+                    lista[l][c] = lista[l][c - 1];
+                lista[l][ref_idx++] = scelto;
                 int n2 = ref_idx;
-                for (int c = ref_idx; c <= n_attivo; c++)
-                    if (lista0[c].surface != scelto.surface)
-                        lista0[n2++] = lista0[c];
+                for (int c = ref_idx; c <= n; c++)
+                    if (lista[l][c].surface != scelto.surface)
+                        lista[l][n2++] = lista[l][c];
             }
         }
 
-        /* The list names frame store slots, which only exist once
+        /* 8.2.4.2.3: two identical lists of more than one picture would put
+         * the same one at index 0 on both sides, and bi-prediction would
+         * average a picture with itself. */
+        if (slice_type == 1 && n_attivo[1] > 1 && n_attivo[0] == n_attivo[1]) {
+            int uguali = 1;
+            for (int k = 0; k < n_attivo[0]; k++)
+                if (lista[0][k].surface != lista[1][k].surface) { uguali = 0; break; }
+            if (uguali) {
+                rif_t t = lista[1][0];
+                lista[1][0] = lista[1][1];
+                lista[1][1] = t;
+            }
+        }
+
+        /* The lists name frame store slots, which only exist once
          * begin_picture has run. */
-        for (int k = 0; k < n_attivo; k++) {
-            h264d_frame_t *f = h264_decoder_frame_for(dec, lista0[k].surface);
-            sl.ref_list[0][k] = f ? (int8_t)h264_decoder_slot_of(dec, f) : 0;
+        for (int l = 0; l < 2; l++)
+            for (int k = 0; k < n_attivo[l]; k++) {
+                h264d_frame_t *f = h264_decoder_frame_for(dec, lista[l][k].surface);
+                sl.ref_list[l][k] = f ? (int8_t)h264_decoder_slot_of(dec, f) : 0;
+            }
+
+        if (getenv("BC250_H264_W")) {
+            fprintf(stderr, "f%d fn%d tipo%d nref%d/%d denom %d/%d bipred%d |",
+                    fotogrammi, frame_num, slice_type, sl.num_ref_idx[0],
+                    sl.num_ref_idx[1], sl.luma_log2_weight_denom,
+                    sl.chroma_log2_weight_denom, pp->weighted_bipred_idc);
+            for (int l = 0; l < 2; l++)
+                for (int k = 0; k < sl.num_ref_idx[l] && k < 3; k++)
+                    fprintf(stderr, " L%d[%d]=slot%d w%d o%d", l, k,
+                            sl.ref_list[l][k], sl.luma_weight[l][k],
+                            sl.luma_offset[l][k]);
+            fprintf(stderr, "\n");
         }
 
         const int r = h264_decoder_slice(dec, &sl, rbsp, n, bit_offset);
@@ -674,6 +843,7 @@ int main(int argc, char **argv)
         }
     }
 
+    svuota(fo);
     fclose(fo);
     h264_decoder_destroy(dec);
     free(buf);

@@ -27,7 +27,11 @@ bool h264_decoder_supports(int profile_idc, int chroma_format_idc,
 static void libera_frame(h264d_frame_t *f)
 {
     free(f->y);
+    free(f->col_ref);
+    free(f->col_mv);
     f->y = f->cb = f->cr = NULL;
+    f->col_ref = NULL;
+    f->col_mv = NULL;
     f->used = false;
     f->surface = ~0u;
 }
@@ -72,6 +76,12 @@ h264_decoder_t *h264_decoder_create(bc250_gpu_context_t *gpu_ctx,
 
     for (int i = 0; i < H264D_DPB_SIZE; i++) {
         if (alloca_frame(&d->dpb[i], d->mb_w * 16, d->mb_h * 16) != 0) {
+            h264_decoder_destroy(d);
+            return NULL;
+        }
+        d->dpb[i].col_ref = calloc((size_t)d->mb_count * 2 * 4, sizeof(int8_t));
+        d->dpb[i].col_mv = calloc((size_t)d->mb_count * 2 * 16 * 2, sizeof(int16_t));
+        if (!d->dpb[i].col_ref || !d->dpb[i].col_mv) {
             h264_decoder_destroy(d);
             return NULL;
         }
@@ -156,8 +166,10 @@ int h264_decoder_begin_picture(h264_decoder_t *d, const h264d_pic_t *pic,
     f->used = true;
 
     memset(d->mbs, 0, (size_t)d->mb_count * sizeof(h264d_mb_t));
-    for (int i = 0; i < d->mb_count; i++)
+    for (int i = 0; i < d->mb_count; i++) {
         memset(d->mbs[i].ref, -1, sizeof(d->mbs[i].ref));
+        memset(d->mbs[i].ref_idx, -1, sizeof(d->mbs[i].ref_idx));
+    }
     memset(d->slice_of_mb, 0xff, (size_t)d->mb_count);
     d->n_slices = 0;
     d->dequant.valid = 0;
@@ -171,16 +183,23 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
     if (d->cur < 0) return -1;
     if (d->n_slices >= H264D_MAX_SLICES) return -1;
 
-    /* B slices need the direct derivation, which needs the co-located
-     * picture's motion field. Until that store exists they are refused here
-     * rather than decoded into something that merely looks plausible. */
-    if (slice->type == 1) return -2;
+    /* Temporal direct (8.4.1.2.3) scales the co-located vectors by the
+     * distance between pictures; only the spatial derivation is written, so
+     * a slice that asks for the other is refused rather than guessed at.
+     * x264 chooses spatial by default. */
+    if (slice->type == 1 && !slice->direct_spatial_mv_pred) return -2;
 
     d->slice = *slice;
     const int numero = d->n_slices++;
     d->deblock[numero].disable_idc = (int8_t)slice->disable_deblocking_filter_idc;
     d->deblock[numero].alpha_offset = (int8_t)slice->alpha_c0_offset;
     d->deblock[numero].beta_offset = (int8_t)slice->beta_offset;
+    if (getenv("BC250_H264_TRACE"))
+        fprintf(stderr, "slice %d: deblk idc %d alpha %d beta %d, qp %d, "
+                        "cabac_idc %d, tipo %d\n", numero,
+                slice->disable_deblocking_filter_idc, slice->alpha_c0_offset,
+                slice->beta_offset, slice->qpy, slice->cabac_init_idc,
+                slice->type);
 
     /* The slice data starts at a byte boundary once the CABAC alignment bits
      * are skipped, and the emulation prevention bytes have to come out
@@ -220,6 +239,11 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
                 fprintf(stderr, " croma %d modi", m->chroma_pred_mode);
                 for (int k = 0; k < 16; k++) fprintf(stderr, " %d", m->ipred[k]);
             } else {
+                fprintf(stderr, " sub %d %d %d %d", m->sub_tipo[0],
+                        m->sub_tipo[1], m->sub_tipo[2], m->sub_tipo[3]);
+                fprintf(stderr, " r1");
+                for (int p8 = 0; p8 < 4; p8++)
+                    fprintf(stderr, " %d", m->ref_idx[1][p8]);
                 fprintf(stderr, " rif");
                 for (int p8 = 0; p8 < 4; p8++)
                     fprintf(stderr, " %d/%d", m->ref_idx[0][p8], m->ref[0][p8]);
@@ -253,13 +277,45 @@ int h264_decoder_end_picture(h264_decoder_t *d, gpu_image_t out,
     if (d->cur < 0) return -1;
     h264d_frame_t *f = &d->dpb[d->cur];
 
+    /* Hand the motion field over to the picture before the macroblock store
+     * is reused by the next one. A direct macroblock of a later B picture
+     * reads it, and by then this picture is only a reference. */
+    bool solo_intra = true;
+    for (int i = 0; i < d->mb_count; i++) {
+        const h264d_mb_t *m = &d->mbs[i];
+        int8_t *cr8 = f->col_ref + (size_t)i * 8;
+        int16_t *cmv = f->col_mv + (size_t)i * 64;
+        for (int l = 0; l < 2; l++) {
+            /* ⚠️ The index, not the slot. colZeroFlag asks whether the
+             * co-located block used index zero of ITS OWN picture's list,
+             * which is a question about the index. */
+            for (int p = 0; p < 4; p++)
+                cr8[l * 4 + p] = m->intra ? -1 : m->ref_idx[l][p];
+            for (int b = 0; b < 16; b++) {
+                cmv[(l * 16 + b) * 2 + 0] = m->intra ? 0 : m->mv[l][b][0];
+                cmv[(l * 16 + b) * 2 + 1] = m->intra ? 0 : m->mv[l][b][1];
+            }
+        }
+        if (!m->intra) solo_intra = false;
+    }
+    f->col_intra_only = solo_intra;
+
     /* Any macroblock no slice covered is left as it was allocated. Marking
      * them as belonging to no slice keeps the deblocking filter from
      * treating them as part of their neighbour's. */
+    if (getenv("BC250_H264_TRACE"))
+        fprintf(stderr, "fine immagine slot %d poc %d: riga 0 prima "
+                        "%d %d %d %d\n", d->cur, f->poc,
+                f->y[0], f->y[1], f->y[2], f->y[3]);
+
     h264d_deblock_picture(f->y, f->stride_y, f->cb, f->cr, f->stride_c,
                           d->mb_w, d->mb_h, d->mbs, d->slice_of_mb,
                           d->deblock, d->pic.chroma_qp_index_offset,
                           d->pic.second_chroma_qp_index_offset);
+
+    if (getenv("BC250_H264_TRACE"))
+        fprintf(stderr, "                          riga 0 dopo  "
+                        "%d %d %d %d\n", f->y[0], f->y[1], f->y[2], f->y[3]);
 
     if (!d->gpu)
         return 0;            /* the standalone harness keeps the planes */

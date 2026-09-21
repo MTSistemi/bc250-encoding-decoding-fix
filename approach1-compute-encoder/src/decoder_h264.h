@@ -70,6 +70,11 @@ typedef struct {
      * 8x8. The 8x8 transform is not offered for such a macroblock, so the
      * flag has to be known before coded_block_pattern is read. */
     uint8_t  sub_8x8;
+    /* Which of the four 8x8 partitions are direct. The ref_idx
+     * context of 9.3.3.1.1.6 skips a direct neighbour. */
+    uint8_t  direct;
+    /* Debug only: the four sub_mb_types of a P_8x8 or B_8x8. */
+    int8_t   sub_tipo[4];
     uint8_t  cbp;               /* bits 0..3 luma 8x8s, bits 4..5 chroma */
     int8_t   qpy;
     int8_t   chroma_pred_mode;
@@ -114,6 +119,13 @@ typedef struct {
     uint32_t surface;            /* VASurfaceID, or ~0u when free */
     bool     used;
     bool     is_long_term;
+
+    /* The motion field this picture was decoded with, kept because a later
+     * B picture's direct macroblocks read the co-located one (8.4.1.2).
+     * Laid out per macroblock: [mb][list][8x8] and [mb][list][4x4][xy]. */
+    int8_t  *col_ref;
+    int16_t *col_mv;
+    bool     col_intra_only;     /* nothing here to derive from */
 } h264d_frame_t;
 
 /* Everything the picture parameter buffer tells us, flattened. */

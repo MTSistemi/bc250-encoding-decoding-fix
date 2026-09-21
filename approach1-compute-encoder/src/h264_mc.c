@@ -229,17 +229,27 @@ void h264d_mc_weight(uint8_t *dst, int ds, const uint8_t *src, int ss,
     }
 }
 
+/* ⚠️ The shift comes first and the offset afterwards. Folding the offset
+ * into the rounding term looks equivalent and is not: it rounds the two
+ * halves together instead of separately, and bi-predicted blocks come out
+ * one low on a good share of samples. */
 void h264d_mc_weight_bi(uint8_t *dst, int ds,
                         const uint8_t *a, int as, const uint8_t *b, int bs,
                         int w, int h, int log2_denom, int w0, int o0, int w1, int o1)
 {
-    const int shift = log2_denom + 1;
-    const int round = ((o0 + o1 + 1) << log2_denom);
+    const int off = (o0 + o1 + 1) >> 1;
     for (int y = 0; y < h; y++) {
         const uint8_t *ra = a + (size_t)y * as;
         const uint8_t *rb = b + (size_t)y * bs;
         uint8_t *o = dst + (size_t)y * ds;
-        for (int x = 0; x < w; x++)
-            o[x] = clip_uint8((ra[x] * w0 + rb[x] * w1 + round) >> shift);
+        if (log2_denom >= 1) {
+            const int tondo = 1 << log2_denom;
+            for (int x = 0; x < w; x++)
+                o[x] = clip_uint8((((ra[x] * w0 + rb[x] * w1 + tondo)
+                                    >> (log2_denom + 1))) + off);
+        } else {
+            for (int x = 0; x < w; x++)
+                o[x] = clip_uint8(ra[x] * w0 + rb[x] * w1 + off);
+        }
     }
 }

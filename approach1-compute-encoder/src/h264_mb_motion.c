@@ -19,6 +19,8 @@
  */
 #include "h264_dec_internal.h"
 
+#include "h264_parts.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -171,4 +173,119 @@ void h264d_skip_mv_p(h264_decoder_t *d, int16_t out[2])
         return;
     }
     h264d_predict_mv(d, 0, 0, 4, 4, 0, out);
+}
+
+/* ------------------------------------------------------ spatial direct */
+
+static inline int min_positivo(int a, int b)
+{
+    if (a >= 0 && b >= 0) return a < b ? a : b;
+    return a > b ? a : b;
+}
+
+/* Clause 8.4.1.2.2. Fills in both lists for the whole macroblock. Returns
+ * non-zero when the derivation cannot be done. */
+int h264d_direct_spatial(h264_decoder_t *d, h264d_mb_t *m, int maschera)
+{
+    /* The three neighbours of the macroblock as a whole. */
+    vicino_t va = vicino(d, -1, 0, 0);
+    vicino_t vb = vicino(d, 0, -1, 0);
+    vicino_t vc = vicino(d, 4, -1, 0);
+    if (!vc.c_e)
+        vc = vicino(d, -1, -1, 0);
+
+    int ref[2];
+    int16_t mvp[2][2];
+    for (int l = 0; l < 2; l++) {
+        int ra, rb, rc;
+        int16_t ma[2], mb[2], mc[2];
+        da_vicino(&va, l, &ra, ma);
+        da_vicino(&vb, l, &rb, mb);
+        da_vicino(&vc, l, &rc, mc);
+        ref[l] = min_positivo(ra, min_positivo(rb, rc));
+        (void)ma; (void)mb; (void)mc;
+    }
+
+    bool zero_forzato = false;
+    if (ref[0] < 0 && ref[1] < 0) {
+        ref[0] = ref[1] = 0;
+        zero_forzato = true;
+    }
+
+    for (int l = 0; l < 2; l++) {
+        if (ref[l] < 0 || zero_forzato) {
+            mvp[l][0] = mvp[l][1] = 0;
+        } else {
+            /* The ordinary 16x16 prediction, for the reference just chosen.
+             * It has to run before anything of this macroblock is written,
+             * which is why both lists are worked out first. */
+            h264d_predict_mv(d, l, 0, 4, 4, ref[l], mvp[l]);
+        }
+    }
+
+    /* The co-located picture is RefPicList1[0]. A direct macroblock in a
+     * slice without one is a malformed stream. */
+    const int slot_col = d->slice.ref_list[1][0];
+    if (slot_col < 0 || slot_col >= H264D_DPB_SIZE)
+        return 1;
+    const h264d_frame_t *col = &d->dpb[slot_col];
+    if (!col->col_ref || !col->col_mv)
+        return 1;
+    const int8_t *cr8 = col->col_ref + (size_t)d->mb_idx * 8;
+    const int16_t *cmv = col->col_mv + (size_t)d->mb_idx * 64;
+
+    /* With direct_8x8_inference_flag the co-located block of each 8x8 is its
+     * outer corner, and the answer covers the whole 8x8. Without it, every
+     * 4x4 asks about itself. */
+    static const uint8_t angolo[4] = { 0, 3, 12, 15 };
+
+    for (int p8 = 0; p8 < 4; p8++) {
+        /* A B_8x8 can be direct in some of its four 8x8s and explicit in the
+         * others, and the explicit ones have already been read. The
+         * derivation itself is per macroblock - it only ever looks at
+         * neighbours outside it - so it is worked out once and written only
+         * where it belongs. */
+        if (!((maschera >> p8) & 1))
+            continue;
+        const int base = (p8 >> 1) * 8 + (p8 & 1) * 2;
+        for (int k = 0; k < 4; k++) {
+            const int b = base + (k >> 1) * 4 + (k & 1);
+            const int bcol = d->pic.direct_8x8_inference ? angolo[p8] : b;
+
+            /* 8.4.1.2.1: the co-located block speaks through list 0 when it
+             * used it, otherwise through list 1; an intra one says nothing. */
+            int ref_col = cr8[0 * 4 + h264d_part8(bcol)];
+            const int16_t *mv_col = cmv + (0 * 16 + bcol) * 2;
+            if (ref_col < 0) {
+                ref_col = cr8[1 * 4 + h264d_part8(bcol)];
+                mv_col = cmv + (1 * 16 + bcol) * 2;
+            }
+
+            /* ⚠️ Short-term only. The harness refuses long-term references,
+             * so every picture here is short-term; a decoder that accepts
+             * them has to check, because a long-term co-located picture
+             * never sets this flag however still it is. */
+            const bool col_fermo = (ref_col == 0)
+                                && mv_col[0] >= -1 && mv_col[0] <= 1
+                                && mv_col[1] >= -1 && mv_col[1] <= 1;
+
+            for (int l = 0; l < 2; l++) {
+                int16_t mx = 0, my = 0;
+                if (!zero_forzato && ref[l] >= 0 && !(ref[l] == 0 && col_fermo)) {
+                    mx = mvp[l][0];
+                    my = mvp[l][1];
+                }
+                m->mv[l][b][0] = mx;
+                m->mv[l][b][1] = my;
+                m->mvd[l][b][0] = 0;
+                m->mvd[l][b][1] = 0;
+            }
+        }
+        for (int l = 0; l < 2; l++) {
+            m->ref_idx[l][p8] = (int8_t)ref[l];
+            m->ref[l][p8] = (ref[l] >= 0)
+                          ? d->slice.ref_list[l][ref[l]] : -1;
+        }
+    }
+    return 0;
 }

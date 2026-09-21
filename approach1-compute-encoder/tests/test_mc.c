@@ -226,8 +226,17 @@ static int prova_combinazione(void)
         int o1 = (int)(casuale() % 255) - 128;
         h264d_mc_weight_bi(nostro, 16, a, 16, b, 16, 16, 16, d, w0, o0, w1, o1);
         for (int i = 0; i < 256; i++) {
-            int atteso = clip255((a[i] * w0 + b[i] * w1
-                                  + ((o0 + o1 + 1) << d)) >> (d + 1));
+            /* Clause 8.4.2.3.2, written out in its two cases. The shift
+             * happens first and the offset is added to the result; the
+             * earlier version of this line folded the offset into the
+             * rounding term, which is a different number and, being the same
+             * mistake the implementation made, agreed with it perfectly. */
+            int atteso;
+            if (d >= 1)
+                atteso = clip255(((a[i] * w0 + b[i] * w1 + (1 << d)) >> (d + 1))
+                                 + ((o0 + o1 + 1) >> 1));
+            else
+                atteso = clip255(a[i] * w0 + b[i] * w1 + ((o0 + o1 + 1) >> 1));
             if (nostro[i] != atteso) { guasti++; break; }
         }
     }

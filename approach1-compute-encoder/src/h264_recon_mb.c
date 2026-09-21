@@ -185,7 +185,8 @@ static void riferimenti16(const h264_decoder_t *d, const uint8_t *piano, int s,
 
 /* ------------------------------------------------------ inter */
 
-/* One 4x4 luma block and its 2x2 chroma, predicted from one list.
+/* One 4x4 luma block and its 2x2 chroma, predicted from one list into
+ * tightly packed scratch blocks.
  *
  * Motion compensation is done per 4x4 rather than per partition. The
  * interpolation of 8.4.2.2 depends only on the samples around each output
@@ -193,69 +194,161 @@ static void riferimenti16(const h264_decoder_t *d, const uint8_t *piano, int s,
  * the same picture; it just fetches more. Merging blocks that share a vector
  * is an optimisation, not a correctness matter.
  */
-static void compensa_blocco(h264_decoder_t *d, const h264d_frame_t *rif,
-                            int b, int lista,
-                            uint8_t *dy, int sdy, uint8_t *dcb, uint8_t *dcr, int sdc)
+static void predici_lista(h264_decoder_t *d, int b, int lista,
+                          uint8_t y4[16], uint8_t cb2[4], uint8_t cr2[4])
 {
     const h264d_mb_t *m = &d->mbs[d->mb_idx];
+    const int slot = m->ref[lista][h264d_part8(b)];
+    const h264d_frame_t *rif = &d->dpb[slot];
     const int16_t *mv = m->mv[lista][b];
-    const int x4 = b & 3, y4 = b >> 2;
-
-    /* Clause 8.4.2.3. Weighted prediction scales and shifts what motion
-     * compensation produced, so when it is on the prediction lands in a
-     * scratch block first. x264 turns it on by default for P pictures, which
-     * is why nearly no real stream decodes without this. */
-    const int rif_idx = m->ref_idx[lista][h264d_part8(b)];
-    const bool pesata = d->pic.weighted_pred && d->slice.type == 0
-                     && rif_idx >= 0;
-    uint8_t tmp_y[16], tmp_cb[4], tmp_cr[4];
-    uint8_t *oy  = pesata ? tmp_y  : dy;
-    uint8_t *ocb = pesata ? tmp_cb : dcb;
-    uint8_t *ocr = pesata ? tmp_cr : dcr;
-    const int soy = pesata ? 4 : sdy;
-    const int soc = pesata ? 2 : sdc;
+    const int x4 = b & 3, y4i = b >> 2;
 
     const int px = d->mb_x * 16 + x4 * 4;
-    const int py = d->mb_y * 16 + y4 * 4;
+    const int py = d->mb_y * 16 + y4i * 4;
 
     uint8_t pad[(4 + 6) * (4 + 6)];
     const uint8_t *src = h264d_mc_fetch_luma(pad, rif->y, rif->stride_y,
                                              d->width, d->height,
                                              px + (mv[0] >> 2), py + (mv[1] >> 2),
                                              4, 4);
-    h264d_mc_luma(oy, soy, src, 4 + 6, 4, 4, mv[0] & 3, mv[1] & 3);
+    h264d_mc_luma(y4, 4, src, 4 + 6, 4, 4, mv[0] & 3, mv[1] & 3);
 
     /* 4:2:0 chroma: the vector is the luma one, read at eighth-sample
      * accuracy over a plane at half the resolution. */
     const int cx = d->mb_x * 8 + x4 * 2;
-    const int cy = d->mb_y * 8 + y4 * 2;
+    const int cy = d->mb_y * 8 + y4i * 2;
     uint8_t cpad[(2 + 1) * (2 + 1)];
     const uint8_t *cs;
     cs = h264d_mc_fetch_chroma(cpad, rif->cb, rif->stride_c,
                                d->width / 2, d->height / 2,
                                cx + (mv[0] >> 3), cy + (mv[1] >> 3), 2, 2);
-    h264d_mc_chroma(ocb, soc, cs, 3, 2, 2, mv[0] & 7, mv[1] & 7);
+    h264d_mc_chroma(cb2, 2, cs, 3, 2, 2, mv[0] & 7, mv[1] & 7);
     cs = h264d_mc_fetch_chroma(cpad, rif->cr, rif->stride_c,
                                d->width / 2, d->height / 2,
                                cx + (mv[0] >> 3), cy + (mv[1] >> 3), 2, 2);
-    h264d_mc_chroma(ocr, soc, cs, 3, 2, 2, mv[0] & 7, mv[1] & 7);
+    h264d_mc_chroma(cr2, 2, cs, 3, 2, 2, mv[0] & 7, mv[1] & 7);
+}
 
-    if (!pesata)
+/* Clause 8.4.2.3.1, the implicit weights: they come from how far the two
+ * references sit from this picture in display order, so a B picture nearer
+ * one of them leans on it more. Returns false when the standard says to fall
+ * back to the plain average. */
+static bool pesi_impliciti(const h264_decoder_t *d, int ref0, int ref1,
+                           int *w0, int *w1)
+{
+    const int s0 = d->slice.ref_list[0][ref0];
+    const int s1 = d->slice.ref_list[1][ref1];
+    if (s0 < 0 || s1 < 0 || s0 >= H264D_DPB_SIZE || s1 >= H264D_DPB_SIZE)
+        return false;
+    if (d->dpb[s0].is_long_term || d->dpb[s1].is_long_term)
+        return false;
+
+    const int poc = d->dpb[d->cur].poc;
+    int tb = poc - d->dpb[s0].poc;
+    int td = d->dpb[s1].poc - d->dpb[s0].poc;
+    if (td == 0)
+        return false;
+    tb = tb < -128 ? -128 : (tb > 127 ? 127 : tb);
+    td = td < -128 ? -128 : (td > 127 ? 127 : td);
+
+    const int tx = (16384 + abs(td / 2)) / td;
+    int dsf = (tb * tx + 32) >> 6;
+    dsf = dsf < -1024 ? -1024 : (dsf > 1023 ? 1023 : dsf);
+
+    const int q = dsf >> 2;
+    if (q < -64 || q > 128)
+        return false;               /* too far apart: average them instead */
+    *w1 = q;
+    *w0 = 64 - q;
+    return true;
+}
+
+/* One 4x4 block of an inter macroblock, however it is predicted. */
+static void compensa_blocco(h264_decoder_t *d, int b,
+                            uint8_t *dy, int sdy,
+                            uint8_t *dcb, uint8_t *dcr, int sdc)
+{
+    const h264d_mb_t *m = &d->mbs[d->mb_idx];
+    const int p8 = h264d_part8(b);
+    const int r0 = m->ref_idx[0][p8], r1 = m->ref_idx[1][p8];
+    const h264d_slice_t *s = &d->slice;
+
+    uint8_t y0[16], cb0[4], cr0[4];
+    uint8_t y1[16], cb1[4], cr1[4];
+
+    const bool usa0 = r0 >= 0 && m->ref[0][p8] >= 0;
+    const bool usa1 = r1 >= 0 && m->ref[1][p8] >= 0;
+    if (!usa0 && !usa1)
         return;
 
-    const h264d_slice_t *s = &d->slice;
-    h264d_mc_weight(dy, sdy, tmp_y, 4, 4, 4,
-                    s->luma_log2_weight_denom,
-                    s->luma_weight[lista][rif_idx],
-                    s->luma_offset[lista][rif_idx]);
-    h264d_mc_weight(dcb, sdc, tmp_cb, 2, 2, 2,
-                    s->chroma_log2_weight_denom,
-                    s->chroma_weight[lista][rif_idx][0],
-                    s->chroma_offset[lista][rif_idx][0]);
-    h264d_mc_weight(dcr, sdc, tmp_cr, 2, 2, 2,
-                    s->chroma_log2_weight_denom,
-                    s->chroma_weight[lista][rif_idx][1],
-                    s->chroma_offset[lista][rif_idx][1]);
+    if (usa0) predici_lista(d, b, 0, y0, cb0, cr0);
+    if (usa1) predici_lista(d, b, 1, y1, cb1, cr1);
+
+    if (usa0 && usa1) {
+        /* Clause 8.4.2.3: explicit weights when the picture parameter set
+         * says 1, weights derived from the picture order counts when it says
+         * 2, and otherwise the plain average. */
+        int w0 = 32, w1 = 32, o0 = 0, o1 = 0, denom = 5;
+        bool pesata = false;
+        if (d->pic.weighted_bipred_idc == 1) {
+            pesata = true;
+            denom = s->luma_log2_weight_denom;
+            w0 = s->luma_weight[0][r0];  o0 = s->luma_offset[0][r0];
+            w1 = s->luma_weight[1][r1];  o1 = s->luma_offset[1][r1];
+        } else if (d->pic.weighted_bipred_idc == 2) {
+            pesata = pesi_impliciti(d, r0, r1, &w0, &w1);
+            denom = 5;
+            o0 = o1 = 0;
+        }
+
+        if (!pesata) {
+            h264d_mc_average(dy, sdy, y0, 4, y1, 4, 4, 4);
+            h264d_mc_average(dcb, sdc, cb0, 2, cb1, 2, 2, 2);
+            h264d_mc_average(dcr, sdc, cr0, 2, cr1, 2, 2, 2);
+            return;
+        }
+
+        h264d_mc_weight_bi(dy, sdy, y0, 4, y1, 4, 4, 4, denom, w0, o0, w1, o1);
+        if (d->pic.weighted_bipred_idc == 1) {
+            denom = s->chroma_log2_weight_denom;
+            h264d_mc_weight_bi(dcb, sdc, cb0, 2, cb1, 2, 2, 2, denom,
+                               s->chroma_weight[0][r0][0], s->chroma_offset[0][r0][0],
+                               s->chroma_weight[1][r1][0], s->chroma_offset[1][r1][0]);
+            h264d_mc_weight_bi(dcr, sdc, cr0, 2, cr1, 2, 2, 2, denom,
+                               s->chroma_weight[0][r0][1], s->chroma_offset[0][r0][1],
+                               s->chroma_weight[1][r1][1], s->chroma_offset[1][r1][1]);
+        } else {
+            h264d_mc_weight_bi(dcb, sdc, cb0, 2, cb1, 2, 2, 2, 5, w0, 0, w1, 0);
+            h264d_mc_weight_bi(dcr, sdc, cr0, 2, cr1, 2, 2, 2, 5, w0, 0, w1, 0);
+        }
+        return;
+    }
+
+    /* One list only. */
+    const int lista = usa0 ? 0 : 1;
+    const int r = usa0 ? r0 : r1;
+    const uint8_t *py = usa0 ? y0 : y1;
+    const uint8_t *pcb = usa0 ? cb0 : cb1;
+    const uint8_t *pcr = usa0 ? cr0 : cr1;
+
+    const bool pesata = (d->pic.weighted_pred && s->type == 0)
+                     || (d->pic.weighted_bipred_idc == 1 && s->type == 1);
+    if (!pesata) {
+        for (int y = 0; y < 4; y++)
+            memcpy(dy + (size_t)y * sdy, py + y * 4, 4);
+        for (int y = 0; y < 2; y++) {
+            memcpy(dcb + (size_t)y * sdc, pcb + y * 2, 2);
+            memcpy(dcr + (size_t)y * sdc, pcr + y * 2, 2);
+        }
+        return;
+    }
+
+    h264d_mc_weight(dy, sdy, py, 4, 4, 4, s->luma_log2_weight_denom,
+                    s->luma_weight[lista][r], s->luma_offset[lista][r]);
+    h264d_mc_weight(dcb, sdc, pcb, 2, 2, 2, s->chroma_log2_weight_denom,
+                    s->chroma_weight[lista][r][0], s->chroma_offset[lista][r][0]);
+    h264d_mc_weight(dcr, sdc, pcr, 2, 2, 2, s->chroma_log2_weight_denom,
+                    s->chroma_weight[lista][r][1], s->chroma_offset[lista][r][1]);
 }
 
 /* --------------------------------------------------------- residual */
@@ -428,17 +521,46 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
         /* One list only for now; the bi-predicted case averages two of
          * these into a scratch block, which the B stage adds. */
         for (int b = 0; b < 16; b++) {
-            const int p = h264d_part8(b);
-            const int lista = (m->ref[0][p] >= 0) ? 0 : 1;
-            const int slot = m->ref[lista][p];
-            if (slot < 0) continue;
-            const h264d_frame_t *rif = &d->dpb[slot];
             uint8_t *dy = y + (size_t)((b >> 2) * 4) * sy + (b & 3) * 4;
             uint8_t *dcb = cb + (size_t)((b >> 2) * 2) * sc + (b & 3) * 2;
             uint8_t *dcr = cr + (size_t)((b >> 2) * 2) * sc + (b & 3) * 2;
-            compensa_blocco(d, rif, b, lista, dy, sy, dcb, dcr, sc);
+            compensa_blocco(d, b, dy, sy, dcb, dcr, sc);
         }
+
+        const char *di = getenv("BC250_H264_DUMPI");
+        const int mi = di ? atoi(di) : -1;
+        if (mi == d->mb_idx) {
+            fprintf(stderr, "mb %d inter t8 %d cbp %02x qp %d mv %d,%d rif %d%s",
+                    d->mb_idx, m->transform8x8, m->cbp, m->qpy,
+                    m->mv[0][0][0], m->mv[0][0][1], m->ref_idx[0][0], NEWLINE);
+            fprintf(stderr, "  previsione, prime due righe:%s", NEWLINE);
+            for (int yy = 0; yy < 2; yy++) {
+                fprintf(stderr, "   ");
+                for (int xx = 0; xx < 8; xx++)
+                    fprintf(stderr, " %3d", y[yy * sy + xx]);
+                fprintf(stderr, "%s", NEWLINE);
+            }
+            if (m->transform8x8) {
+                fprintf(stderr, "  coefficienti 8x8 del blocco 0, prime 16:%s",
+                        NEWLINE);
+                fprintf(stderr, "   ");
+                for (int k = 0; k < 16; k++)
+                    fprintf(stderr, " %5d", d->coeff8[0][k]);
+                fprintf(stderr, "%s", NEWLINE);
+            }
+        }
+
         aggiungi_luma(d, m, y, sy);
+
+        if (mi == d->mb_idx) {
+            fprintf(stderr, "  ricostruito, prime due righe:%s", NEWLINE);
+            for (int yy = 0; yy < 2; yy++) {
+                fprintf(stderr, "   ");
+                for (int xx = 0; xx < 8; xx++)
+                    fprintf(stderr, " %3d", y[yy * sy + xx]);
+                fprintf(stderr, "%s", NEWLINE);
+            }
+        }
     }
 
     /* Chroma residual, the same for intra and inter: the DC coefficients of
