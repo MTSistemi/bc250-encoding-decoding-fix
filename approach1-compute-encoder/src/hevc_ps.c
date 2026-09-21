@@ -553,6 +553,9 @@ int hevc_ps_leggi_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
         if (pps->cabac_init_present)
             s.cabac_init_flag = br_read1(&br) != 0;
         if (s.temporal_mvp_enabled) {
+            /* Inferred to one when it is not sent, which for a P slice is
+             * always. */
+            s.collocated_from_l0 = true;
             if (s.type == 0)
                 s.collocated_from_l0 = br_read1(&br) != 0;
             if ((s.collocated_from_l0 && s.num_ref_idx[0] > 1)
@@ -596,8 +599,12 @@ int hevc_ps_leggi_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
         if (s.num_entry_point_offsets > 0) {
             const int len = (int)br_read_ue(&br) + 1;
             if (len > 32) return PS_ASSURDO;
-            for (int i = 0; i < s.num_entry_point_offsets; i++)
-                br_skip(&br, len);
+            if (s.num_entry_point_offsets > 600) return PS_NON_SUPPORTATO;
+            uint32_t somma = 0;
+            for (int i = 0; i < s.num_entry_point_offsets; i++) {
+                somma += (uint32_t)br_read(&br, len) + 1;
+                s.entry_point[i] = somma;
+            }
         }
     }
 
@@ -606,10 +613,14 @@ int hevc_ps_leggi_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
         br_skip(&br, len * 8);
     }
 
-    /* byte_alignment(): a one bit, then zeros to the next byte. */
-    br_read1(&br);
+    /* byte_alignment(): a one bit, then zeros to the next byte.
+     *
+     * ⚠️ Read and checked, not skipped: see the note at the top of this
+     * file's history. It is the cheapest possible proof that the header
+     * above was read correctly. */
+    if (!br_read1(&br)) return PS_ASSURDO;
     while (br.bitpos & 7)
-        br_read1(&br);
+        if (br_read1(&br)) return PS_ASSURDO;
 
     if (br_overrun(&br)) return PS_TRONCO;
     s.data_bit_offset = br.bitpos;

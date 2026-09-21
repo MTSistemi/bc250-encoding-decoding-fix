@@ -20,8 +20,12 @@
 /* Prediction modes, 7.4.9.5. */
 enum { HEVCD_MODE_INTER = 0, HEVCD_MODE_INTRA = 1 };
 
-/* Partition modes, Table 7-10. Only the two an intra coding unit can use
- * are named; the inter ones come later. */
+/* Partition modes, Table 7-10.
+ *
+ * The four asymmetric ones exist because a moving object's edge rarely
+ * falls on a power of two: splitting a block one quarter of the way
+ * across costs one more bin and can save a whole partition's worth of
+ * residual. */
 enum {
     HEVCD_PART_2Nx2N = 0, HEVCD_PART_2NxN = 1, HEVCD_PART_Nx2N = 2,
     HEVCD_PART_NxN = 3,
@@ -91,7 +95,7 @@ typedef struct {
     size_t n_sao;
     uint8_t *copia[3];
     size_t n_copia;
-    size_t n_ct_depth, n_intra_mode, n_zs, n_qp, n_no_filtro;
+    size_t n_ct_depth, n_intra_mode, n_zs, n_qp, n_no_filtro, n_skip;
     int min_pu_width, min_pu_height;
 
     /* The coding unit being read. */
@@ -99,6 +103,8 @@ typedef struct {
         int x, y, log2_size;
         int pred_mode;
         int part_mode;
+        int depth;                  /* the coding quadtree depth it sits at */
+        bool skip;
         bool transquant_bypass;
         bool intra_split;
         int intra_mode_c;           /* the chroma mode, IntraPredModeC */
@@ -138,6 +144,12 @@ int hevcd_leggi_ctu(hevcd_t *d, int x0, int y0);
 void hevcd_deblocca(hevcd_t *d);
 void hevcd_sao(hevcd_t *d);
 void hevcd_libera_filtri(hevcd_t *d);
+
+/* How many prediction units a partition mode has, and where the k-th one
+ * sits inside a coding block of side `lato`. */
+int hevcd_quante_pu(int part_mode);
+void hevcd_rettangolo_pu(int part_mode, int k, int lato,
+                         int *x, int *y, int *w, int *h);
 
 /* residual_coding(), clause 7.3.8.11. The coefficients land in d->coeff,
  * in raster order inside the transform block. */

@@ -142,6 +142,7 @@ static const char *motivo_slice(int e)
     case 4: return "tipo di slice non ancora percorribile";
     case 5: return "memoria";
     case 6: return "fine sottoinsieme non a uno";
+    case 7: return "una riga non e' lunga come dice l'intestazione";
     default: return "?";
     }
 }
@@ -155,9 +156,12 @@ static const char *motivo_slice(int e)
  * NAL. One bin read against the wrong context almost never lands there. */
 static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
                           const hevc_pps_t *pps, const hevc_slice_t *sl,
-                          const uint8_t *rbsp, size_t n)
+                          const uint8_t *rbsp, size_t n, bool senza_escape)
 {
-    if (sl->type != 2) return 4;            /* only I slices, for now */
+    /* ⚠️ P and B slices are read through, not reconstructed. Their
+     * samples are meaningless until motion compensation exists; what the
+     * walk proves is that every bin of their syntax was read against the
+     * right context. */
 
     const size_t serve_cb = (size_t)sps->min_cb_width * sps->min_cb_height;
     const size_t serve_pu = (size_t)(sps->width >> 2) * (sps->height >> 2);
@@ -188,7 +192,12 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
         d->sao = calloc((size_t)sps->ctb_count, sizeof *d->sao);
         d->n_sao = (size_t)sps->ctb_count;
     }
-    if (!d->bordi || !d->no_filtro || !d->sao) return 5;
+    if (!d->skip || d->n_skip < serve_cb) {
+        free(d->skip);
+        d->skip = calloc(serve_cb, 1);
+        d->n_skip = serve_cb;
+    }
+    if (!d->bordi || !d->no_filtro || !d->sao || !d->skip) return 5;
     d->bordi_passo = (sps->width + 7) >> 3;
     if (!d->qp_y_map || d->n_qp < serve_cb) {
         free(d->qp_y_map);
@@ -199,6 +208,7 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
     memset(d->ct_depth, 0, serve_cb);
     memset(d->bordi, 0, serve_bordi);
     memset(d->no_filtro, 0, serve_cb);
+    memset(d->skip, 0, serve_cb);
     memset(d->intra_mode, HEVCD_INTRA_DC, serve_pu);
 
     d->sps = sps;
@@ -267,6 +277,16 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
 
             const size_t usati = h264d_cabac_byte_pos(&d->cabac);
             if (usati >= resto) return 3;
+
+            /* What the header said this row would be. */
+            if (senza_escape && sl->num_entry_point_offsets > 0) {
+                const int riga = addr / sps->ctb_width;
+                if (riga < sl->num_entry_point_offsets) {
+                    const uint32_t fin = sl->entry_point[riga];
+                    const uint32_t ini = riga > 0 ? sl->entry_point[riga - 1] : 0;
+                    if (usati != (size_t)(fin - ini)) return 7;
+                }
+            }
             base += usati;
             resto -= usati;
             h264d_cabac_init_engine(&d->cabac, base, resto);
@@ -477,7 +497,7 @@ int main(int argc, char **argv)
                     immagine_aperta = false;
                 }
                 const int e = percorri_slice(dec, sp, &pps[s.pps_id], &s,
-                                             rbsp, n);
+                                             rbsp, n, n == (size_t)(fine - inizio));
                 if (e == 4) {
                     slice_saltate++;
                     if (immagine_aperta) scrivi_immagine(fo, dec, sp);
@@ -513,7 +533,7 @@ int main(int argc, char **argv)
     free(buf); free(rbsp); free(sps); free(pps); free(poc_visti);
     free(dec->ct_depth); free(dec->intra_mode); free(dec->min_tb_addr_zs);
     free(dec->qp_y_map); free(dec->bordi); free(dec->no_filtro);
-    hevcd_libera_filtri(dec);
+    hevcd_libera_filtri(dec); free(dec->skip);
     for (int k = 0; k < 3; k++) free(dec->piano[k]);
     free(dec);
     return (rifiutate || gruppi_rotti || slice_perse) ? 1 : 0;

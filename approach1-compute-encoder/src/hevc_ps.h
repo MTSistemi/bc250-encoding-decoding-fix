@@ -164,6 +164,10 @@ typedef struct {
     int16_t chroma_weight[2][16][2], chroma_offset[2][16][2];
 
     int num_entry_point_offsets;
+    /* ⚠️ In bytes of the NAL unit, emulation prevention bytes included,
+     * counted from the first byte of the slice segment data. A decoder
+     * that works on the un-escaped payload has to take them out again. */
+    uint32_t entry_point[600];
     size_t data_bit_offset;              /* where slice_segment_data starts */
 } hevc_slice_t;
 

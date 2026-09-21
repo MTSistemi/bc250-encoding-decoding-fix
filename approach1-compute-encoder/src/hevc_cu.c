@@ -197,6 +197,215 @@ static void segna_bordi(hevcd_t *d, int x0, int y0, int log2_size)
             d->bordi[(y0 >> 3) * passo + ((x0 + i) >> 3)] |= 2;
 }
 
+
+/* ------------------------------------------------ inter prediction units */
+
+/* Where the prediction units of each partition mode sit, Table 7-10 and
+ * figure 7-2. Written as a table of quarters so the asymmetric modes are
+ * not four more special cases. */
+int hevcd_quante_pu(int part_mode)
+{
+    if (part_mode == HEVCD_PART_2Nx2N) return 1;
+    if (part_mode == HEVCD_PART_NxN) return 4;
+    return 2;
+}
+
+void hevcd_rettangolo_pu(int part_mode, int k, int lato,
+                         int *x, int *y, int *w, int *h)
+{
+    const int mezzo = lato / 2, quarto = lato / 4;
+
+    switch (part_mode) {
+    case HEVCD_PART_2NxN:
+        *x = 0; *y = k * mezzo; *w = lato; *h = mezzo; return;
+    case HEVCD_PART_Nx2N:
+        *x = k * mezzo; *y = 0; *w = mezzo; *h = lato; return;
+    case HEVCD_PART_NxN:
+        *x = (k & 1) * mezzo; *y = (k >> 1) * mezzo;
+        *w = mezzo; *h = mezzo; return;
+    case HEVCD_PART_2NxnU:
+        *x = 0; *y = k ? quarto : 0; *w = lato;
+        *h = k ? lato - quarto : quarto; return;
+    case HEVCD_PART_2NxnD:
+        *x = 0; *y = k ? lato - quarto : 0; *w = lato;
+        *h = k ? quarto : lato - quarto; return;
+    case HEVCD_PART_nLx2N:
+        *x = k ? quarto : 0; *y = 0;
+        *w = k ? lato - quarto : quarto; *h = lato; return;
+    case HEVCD_PART_nRx2N:
+        *x = k ? lato - quarto : 0; *y = 0;
+        *w = k ? quarto : lato - quarto; *h = lato; return;
+    default:
+        *x = 0; *y = 0; *w = lato; *h = lato; return;
+    }
+}
+
+/* 9.3.3.3: exp-Golomb of order k, entirely in bypass. */
+static unsigned golomb(hevcd_cabac_t *c, int k)
+{
+    int q = 0;
+    while (q < 24 && hevcd_bypass(c)) q++;
+    unsigned v = q ? (((1u << q) - 1) << k) : 0;
+    const int quanti = q + k;
+    if (quanti) v += hevcd_bypass_n(c, quanti);
+    return v;
+}
+
+/* 9.3.3.7. Four different binarisations wearing one name: which one
+ * applies depends on the block size and on whether the sequence allows
+ * asymmetric partitions.
+ *
+ * ⚠️ The context of the third bin is not the same in the two cases. At
+ * the smallest coding block it is index two and it is deciding between
+ * Nx2N and NxN; above it, index three, deciding between a symmetric
+ * partition and an asymmetric one. */
+static int leggi_part_mode(hevcd_t *d, int log2_size)
+{
+    hevcd_cabac_t *c = &d->cabac;
+    const hevc_sps_t *sps = d->sps;
+
+    if (hevcd_bin(c, HEVCD_CTX_PART_MODE + 0)) return HEVCD_PART_2Nx2N;
+    const bool orizzontale = hevcd_bin(c, HEVCD_CTX_PART_MODE + 1) != 0;
+
+    if (log2_size > sps->log2_min_cb) {
+        if (!sps->amp_enabled
+            || hevcd_bin(c, HEVCD_CTX_PART_MODE + 3))
+            return orizzontale ? HEVCD_PART_2NxN : HEVCD_PART_Nx2N;
+        const bool seconda = hevcd_bypass(c) != 0;
+        if (orizzontale)
+            return seconda ? HEVCD_PART_2NxnD : HEVCD_PART_2NxnU;
+        return seconda ? HEVCD_PART_nRx2N : HEVCD_PART_nLx2N;
+    }
+
+    if (orizzontale) return HEVCD_PART_2NxN;
+    /* ⚠️ An inter 4x4 does not exist, so at an eight-sample coding block
+     * the vertical branch has nowhere left to go and the bin is not
+     * sent. */
+    if (log2_size == 3) return HEVCD_PART_Nx2N;
+    return hevcd_bin(c, HEVCD_CTX_PART_MODE + 2) ? HEVCD_PART_Nx2N
+                                                 : HEVCD_PART_NxN;
+}
+
+/* Truncated Rice with the first two bins in context and the rest in
+ * bypass, for both lists. */
+static int leggi_ref_idx(hevcd_t *d, int quante)
+{
+    hevcd_cabac_t *c = &d->cabac;
+    const int massimo = quante - 1;
+    const int con_contesto = massimo < 2 ? massimo : 2;
+
+    int i = 0;
+    while (i < con_contesto && hevcd_bin(c, HEVCD_CTX_REF_IDX_L0 + i)) i++;
+    if (i == 2)
+        while (i < massimo && hevcd_bypass(c)) i++;
+    return i;
+}
+
+static int leggi_merge_idx(hevcd_t *d, int quanti)
+{
+    hevcd_cabac_t *c = &d->cabac;
+    if (quanti <= 1) return 0;
+    if (!hevcd_bin(c, HEVCD_CTX_MERGE_IDX)) return 0;
+    int i = 1;
+    while (i < quanti - 1 && hevcd_bypass(c)) i++;
+    return i;
+}
+
+/* 7.3.8.9. The two components are interleaved rather than sent one after
+ * the other, which lets the two greater-than-zero flags share a context
+ * without either of them waiting for the other's remainder. */
+static void leggi_mvd(hevcd_t *d, int16_t mvd[2])
+{
+    hevcd_cabac_t *c = &d->cabac;
+    bool sopra_zero[2], sopra_uno[2] = { false, false };
+
+    for (int i = 0; i < 2; i++)
+        sopra_zero[i] = hevcd_bin(c, HEVCD_CTX_ABS_MVD_GREATER0_FLAG) != 0;
+    for (int i = 0; i < 2; i++)
+        if (sopra_zero[i])
+            sopra_uno[i] = hevcd_bin(c, HEVCD_CTX_ABS_MVD_GREATER1_FLAG + 1) != 0;
+
+    for (int i = 0; i < 2; i++) {
+        mvd[i] = 0;
+        if (!sopra_zero[i]) continue;
+        int v = 1;
+        if (sopra_uno[i]) v = 2 + (int)golomb(c, 1);
+        mvd[i] = (int16_t)(hevcd_bypass(c) ? -v : v);
+    }
+}
+
+/* 7.3.8.6. Everything a prediction unit says about where it copies from:
+ * which lists, which pictures in them, and how far off the prediction
+ * the true motion was. */
+static bool leggi_pu(hevcd_t *d, int w, int h, bool salta)
+{
+    hevcd_cabac_t *c = &d->cabac;
+    const hevc_slice_t *sl = d->slice;
+    const int quanti_merge = 5 - sl->five_minus_max_num_merge_cand;
+
+    if (salta || hevcd_bin(c, HEVCD_CTX_MERGE_FLAG)) {
+        leggi_merge_idx(d, quanti_merge);
+        return true;
+    }
+
+    /* Which lists this unit predicts from. In a P slice there is only
+     * one and nothing is sent. */
+    int liste = 1;                          /* bit 0 list 0, bit 1 list 1 */
+    if (sl->type == 0) {
+        /* ⚠️ An 8x4 or a 4x8 may not be bi-predicted: two of those in a
+         * row would fetch more samples than the level allows, so the
+         * first bin is not even sent for them. */
+        if (w + h != 12
+            && hevcd_bin(c, HEVCD_CTX_INTER_PRED_IDC + d->cu.depth))
+            liste = 3;
+        else
+            liste = hevcd_bin(c, HEVCD_CTX_INTER_PRED_IDC + 4) ? 2 : 1;
+    }
+
+    for (int l = 0; l < 2; l++) {
+        if (!(liste & (1 << l))) continue;
+        if (sl->num_ref_idx[l] > 1) leggi_ref_idx(d, sl->num_ref_idx[l]);
+        int16_t mvd[2] = { 0, 0 };
+        if (l == 1 && sl->mvd_l1_zero && liste == 3) {
+            /* Sent as nothing at all: the slice header promised it. */
+        } else {
+            leggi_mvd(d, mvd);
+        }
+        hevcd_bin(c, HEVCD_CTX_MVP_LX_FLAG);
+    }
+    return false;
+}
+
+/* cu_skip_flag's context asks how many of the two neighbours were skipped
+ * themselves, which is the cheapest possible guess at whether this part
+ * of the picture is standing still. */
+static int contesto_salto(const hevcd_t *d, int x0, int y0)
+{
+    const hevc_sps_t *sps = d->sps;
+    const int passo = sps->min_cb_width;
+    const int l = sps->log2_min_cb;
+    int n = 0;
+
+    if (x0 > 0 && d->skip[(y0 >> l) * passo + ((x0 - 1) >> l)]) n++;
+    if (y0 > 0 && d->skip[((y0 - 1) >> l) * passo + (x0 >> l)]) n++;
+    return n;
+}
+
+static void segna_salto(hevcd_t *d, int x0, int y0, int log2_size, bool salta)
+{
+    const hevc_sps_t *sps = d->sps;
+    const int passo = sps->min_cb_width;
+    const int n = 1 << (log2_size - sps->log2_min_cb);
+
+    for (int j = 0; j < n; j++)
+        for (int i = 0; i < n; i++) {
+            const int px = (x0 >> sps->log2_min_cb) + i;
+            const int py = (y0 >> sps->log2_min_cb) + j;
+            if (px < sps->min_cb_width && py < sps->min_cb_height)
+                d->skip[py * passo + px] = salta ? 1 : 0;
+        }
+}
+
 /* ------------------------------------------------------- transform units */
 
 static void leggi_qp_delta(hevcd_t *d)
@@ -308,7 +517,11 @@ static void ricostruisci_tb(hevcd_t *d, int c_idx, int x, int y,
         ? d->intra_mode[(ly >> 2) * d->min_pu_width + (lx >> 2)]
         : d->cu.intra_mode_c;
 
-    hevcd_predici_intra(d, c_idx, x, y, log2_size, modo);
+    /* ⚠️ Only an intra block predicts from the samples beside it. An
+     * inter one predicts from another picture, which is not written yet:
+     * until it is, the residual lands on whatever is there. */
+    if (d->cu.pred_mode == HEVCD_MODE_INTRA)
+        hevcd_predici_intra(d, c_idx, x, y, log2_size, modo);
     if (!ha_residuo) return;
 
     /* 8.6.2: with the bypass the coefficients are the residual already.
@@ -378,10 +591,18 @@ static void leggi_albero_trasformate(hevcd_t *d, int x0, int y0,
         && depth < max_depth && !(d->cu.intra_split && depth == 0)) {
         dividi = hevcd_bin(c, HEVCD_CTX_SPLIT_TRANSFORM_FLAG + 5 - log2_size) != 0;
     } else {
-        /* Inferred, and rarely zero: too big for the largest transform, or
-         * an intra unit split into four prediction blocks. */
+        /* Inferred, and rarely zero: too big for the largest transform, an
+         * intra unit split into four prediction blocks, or an inter unit
+         * whose partitions the transform is not allowed to straddle.
+         *
+         * ⚠️ That last one only bites when the sequence allows no
+         * transform depth at all for inter: with a depth to spare the
+         * flag is read instead, and the condition above already says so. */
+        const bool inter_diviso = sps->max_transform_hierarchy_depth_inter == 0
+            && d->cu.pred_mode == HEVCD_MODE_INTER
+            && d->cu.part_mode != HEVCD_PART_2Nx2N && depth == 0;
         dividi = (log2_size > sps->log2_max_tb)
-              || (d->cu.intra_split && depth == 0);
+              || (d->cu.intra_split && depth == 0) || inter_diviso;
     }
 
     bool cbf_cb = false, cbf_cr = false;
@@ -440,6 +661,47 @@ static void leggi_cu(hevcd_t *d, int x0, int y0, int log2_size)
 
     /* An I slice has neither cu_skip_flag nor pred_mode_flag: everything
      * in it is intra by definition. */
+    d->cu.skip = false;
+    if (d->slice->type != 2) {
+        d->cu.skip = hevcd_bin(c, HEVCD_CTX_SKIP_FLAG
+                               + contesto_salto(d, x0, y0)) != 0;
+        segna_salto(d, x0, y0, log2_size, d->cu.skip);
+        if (d->cu.skip) {
+            /* A skipped unit is one merge index and nothing else: no
+             * partition, no residual, not even a prediction mode. */
+            d->cu.pred_mode = HEVCD_MODE_INTER;
+            leggi_pu(d, lato, lato, true);
+            return;
+        }
+        if (!hevcd_bin(c, HEVCD_CTX_PRED_MODE_FLAG))
+            d->cu.pred_mode = HEVCD_MODE_INTER;
+    } else {
+        segna_salto(d, x0, y0, log2_size, false);
+    }
+
+    if (d->cu.pred_mode == HEVCD_MODE_INTER) {
+        d->cu.part_mode = leggi_part_mode(d, log2_size);
+
+        bool unito = false;
+        const int quante = hevcd_quante_pu(d->cu.part_mode);
+        for (int k = 0; k < quante; k++) {
+            int px, py, pw, ph;
+            hevcd_rettangolo_pu(d->cu.part_mode, k, lato, &px, &py, &pw, &ph);
+            (void)px; (void)py;
+            unito = leggi_pu(d, pw, ph, false);
+        }
+
+        /* 7.3.8.5: a whole-block merge says nothing about its residual,
+         * because a skip would have been sent instead if there were
+         * none. Every other inter unit says whether it has one. */
+        bool ha_residuo = true;
+        if (!(d->cu.part_mode == HEVCD_PART_2Nx2N && unito))
+            ha_residuo = hevcd_bin(c, HEVCD_CTX_NO_RESIDUAL_DATA_FLAG) != 0;
+        if (ha_residuo)
+            leggi_albero_trasformate(d, x0, y0, x0, y0, log2_size, 0, 0,
+                                     false, false);
+        return;
+    }
 
     if (log2_size == sps->log2_min_cb) {
         if (!hevcd_bin(c, HEVCD_CTX_PART_MODE)) {
@@ -568,6 +830,7 @@ static void leggi_quadtree(hevcd_t *d, int x0, int y0, int log2_size, int depth)
         }
 
     segna_bordi(d, x0, y0, log2_size);
+    d->cu.depth = depth;
     leggi_cu(d, x0, y0, log2_size);
 
     if (d->no_filtro && d->cu.transquant_bypass)
