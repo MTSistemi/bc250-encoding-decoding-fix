@@ -82,6 +82,18 @@ static inline bool h264d_cabac_overrun(const h264d_cabac_t *c)
     return letti > (ptrdiff_t)(c->end - c->start) * 8;
 }
 
+/* Where the next substream begins: how many bytes this one has actually
+ * consumed, rounded up to the byte alignment that follows it.
+ *
+ * ⚠️ Not where the read-ahead pointer is. The engine keeps a cache and
+ * reaches ahead as a matter of course; what is wanted is how many bits
+ * have been handed out, which is a different number. */
+static inline size_t h264d_cabac_byte_pos(const h264d_cabac_t *c)
+{
+    const ptrdiff_t bit = (c->ptr - c->start) * 8 - c->cache_bits;
+    return (size_t)((bit + 7) / 8);
+}
+
 static inline uint32_t h264d_cabac_bits(h264d_cabac_t *c, int n)
 {
     if (n <= 0) return 0;

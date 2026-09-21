@@ -15,10 +15,11 @@
 # is a hard test to pass by accident, and it is available long before
 # anything can be compared sample by sample.
 #
-# ⚠️ wpp=0 throughout, for now. Wavefront parallelism changes the slice
-# data syntax - a bit and an alignment at the end of every row, and the
-# arithmetic decoder restarted from a snapshot of the row above - and none
-# of that is written yet.
+# ⚠️ Every case runs twice, with wavefront parallelism off and on, because
+# it changes the slice data itself: a bit and a byte alignment at the end of
+# every coding tree row, and the arithmetic decoder restarted there from a
+# snapshot of the row above. A decoder that only ever saw wpp=0 would read
+# most real streams wrongly, since x265 turns it on by default.
 set -u
 BIN="${1:-/tmp/hevcps}"
 T=$(mktemp -d)
@@ -32,24 +33,28 @@ prova() {
     local sorgente="$1"; shift
     local parametri="$1"; shift
 
-    ffmpeg -v error -y -f lavfi -i "$sorgente" -frames:v 1 \
-           -c:v libx265 -x265-params "log-level=none:wpp=0:$parametri" \
-           -pix_fmt yuv420p -f hevc "$T/s.265" 2>/dev/null
-    if [ ! -s "$T/s.265" ]; then
-        printf '  %-44s ffmpeg non ha prodotto il flusso\n' "$nome"
+    local guasti="" dimensione="" wpp out perse
+    for wpp in 0 1; do
+        ffmpeg -v error -y -f lavfi -i "$sorgente" -frames:v 1 \
+               -c:v libx265 -x265-params "log-level=none:wpp=$wpp:$parametri" \
+               -pix_fmt yuv420p -f hevc "$T/s.265" 2>/dev/null
+        if [ ! -s "$T/s.265" ]; then
+            guasti="$guasti wpp=$wpp:nessun-flusso"
+            continue
+        fi
+        dimensione=$(wc -c < "$T/s.265")
+        out=$("$BIN" -q "$T/s.265" 2>&1)
+        perse=$(echo "$out" | sed -n 's/.*, \([0-9]*\) perse.*/\1/p')
+        if [ "$perse" != "0" ]; then
+            guasti="$guasti wpp=$wpp:$(echo "$out" | grep -m1 '\^' \
+                    | sed 's/.*\^ //' | tr ' ' '-')"
+        fi
+    done
+    if [ -n "$guasti" ]; then
+        printf '  %-44s NON ATTERRA:%s\n' "$nome" "$guasti"
         fallite=$((fallite + 1)); return
     fi
-
-    local out
-    out=$("$BIN" -q "$T/s.265" 2>&1)
-    local perse
-    perse=$(echo "$out" | sed -n 's/.*, \([0-9]*\) perse.*/\1/p')
-    if [ "$perse" != "0" ]; then
-        printf '  %-44s NON ATTERRA: %s\n' "$nome" \
-               "$(echo "$out" | grep -m1 '\^' | sed 's/.*\^ //')"
-        fallite=$((fallite + 1)); return
-    fi
-    printf '  %-44s percorsa  (%s byte)\n' "$nome" "$(wc -c < "$T/s.265")"
+    printf '  %-44s percorsa  (%s byte)\n' "$nome" "$dimensione"
     passate=$((passate + 1))
 }
 

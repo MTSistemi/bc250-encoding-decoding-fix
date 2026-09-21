@@ -100,6 +100,7 @@ static const char *motivo_slice(int e)
     case 3: return "ha letto oltre la fine del NAL";
     case 4: return "tipo di slice non ancora percorribile";
     case 5: return "memoria";
+    case 6: return "fine sottoinsieme non a uno";
     default: return "?";
     }
 }
@@ -143,16 +144,31 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
 
     const size_t primo = sl->data_bit_offset >> 3;
     if (primo >= n) return 3;
-    hevcd_cabac_init(&d->cabac, rbsp + primo, n - primo,
+    const uint8_t *base = rbsp + primo;
+    size_t resto = n - primo;
+    hevcd_cabac_init(&d->cabac, base, resto,
                      sl->type, sl->cabac_init_flag, sl->qp);
+
+    const bool wpp = pps->entropy_coding_sync_enabled;
+    const int init_type = hevcd_init_type(sl->type, sl->cabac_init_flag);
+    uint8_t istantanea[HEVCD_CTX];
+    bool ho_istantanea = false;
 
     const int quanti = sps->ctb_count;
     int fatti = 0;
     for (int addr = sl->segment_address; addr < quanti; addr++) {
-        const int x = (addr % sps->ctb_width) << sps->log2_ctb;
+        const int cx = addr % sps->ctb_width;
+        const int x = cx << sps->log2_ctb;
         const int y = (addr / sps->ctb_width) << sps->log2_ctb;
         if (hevcd_leggi_ctu(d, x, y)) return 4;   /* refused inside */
         fatti++;
+
+        /* 9.3.2.3: after the second unit of a row, so the row below can
+         * start from here. */
+        if (wpp && cx == 1) {
+            memcpy(istantanea, d->cabac.state, HEVCD_CTX);
+            ho_istantanea = true;
+        }
         /* HEVC_TRACE: how far into the NAL each coding tree unit got.
          * When a slice does not land, this says where it stopped being
          * right - a unit that consumed implausibly little is where to
@@ -169,6 +185,27 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
         if (fine) {
             /* ⚠️ It has to end after the LAST one, not merely end. */
             return (addr == quanti - 1) ? 0 : 1;
+        }
+
+        /* 7.3.8.1: when the next unit starts a row, this substream ends. */
+        if (wpp && addr + 1 < quanti
+            && (addr + 1) % sps->ctb_width == 0) {
+            if (!hevcd_terminate(&d->cabac))
+                return 6;                  /* the bit is defined to be one */
+
+            const size_t usati = h264d_cabac_byte_pos(&d->cabac);
+            if (usati >= resto) return 3;
+            base += usati;
+            resto -= usati;
+            h264d_cabac_init_engine(&d->cabac, base, resto);
+
+            /* 9.3.1: from the snapshot of the row above when the unit
+             * above right exists, and from nothing when it does not -
+             * which is what a picture one unit wide always is. */
+            if (ho_istantanea && sps->ctb_width >= 2)
+                memcpy(d->cabac.state, istantanea, HEVCD_CTX);
+            else
+                hevcd_cabac_ctx_init(d->cabac.state, init_type, sl->qp);
         }
     }
     (void)fatti;
