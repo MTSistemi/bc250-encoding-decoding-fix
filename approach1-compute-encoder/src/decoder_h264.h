@@ -81,6 +81,12 @@ typedef struct {
      * macroblock came from. */
     int8_t   ref[2][4];
     int16_t  mv[2][16][2];      /* per 4x4 block, per list */
+    /* The motion vector differences as they were coded, per 4x4 block.
+     * ⚠️ Kept because the CABAC context for mvd is the sum of the
+     * neighbours' DIFFERENCES, not of their vectors: two blocks can end up
+     * far apart having each coded almost nothing, which is the case the
+     * context exists to catch. */
+    int16_t  mvd[2][16][2];
     uint8_t  nnz[3][16];        /* non-zero coefficients: CAVLC context and
                                  * the deblocking filter's bS both need it */
     uint8_t  cbf_dc[3];         /* coded_block_flag of the DC blocks */
