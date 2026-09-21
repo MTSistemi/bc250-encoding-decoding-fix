@@ -192,6 +192,26 @@ static void svuota_uscita(FILE *f)
 
 
 
+/* The harness runs the decoder with no GPU context, so the finished
+ * picture stays in memory instead of going to a surface. The upload is
+ * still referenced from the object file, so it needs a body to link
+ * against; reaching it would mean the null-context path had been lost,
+ * which is why it says so rather than returning quietly. */
+int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image,
+                            gpu_memory_t memory,
+                            const uint8_t *y, int ys,
+                            const uint8_t *uv, int uvs, int w, int h);
+int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image,
+                            gpu_memory_t memory,
+                            const uint8_t *y, int ys,
+                            const uint8_t *uv, int uvs, int w, int h)
+{
+    (void)ctx; (void)image; (void)memory;
+    (void)y; (void)ys; (void)uv; (void)uvs; (void)w; (void)h;
+    fprintf(stderr, "l'harness non ha una GPU a cui dare l'immagine\n");
+    abort();
+}
+
 int main(int argc, char **argv)
 {
     bool zitto = false, solo_intestazioni = false;

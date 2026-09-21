@@ -71,8 +71,8 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
 
-    /* Everything can be encoded; only H.264 can be decoded. The HEVC
-     * decoder does not exist. */
+    /* Everything here can be encoded, and H.264 and H.265 can be
+     * decoded. */
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -80,7 +80,8 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
     const int decodificabile = (profile == VAProfileH264ConstrainedBaseline ||
                                 profile == VAProfileH264Baseline ||
                                 profile == VAProfileH264Main ||
-                                profile == VAProfileH264High);
+                                profile == VAProfileH264High ||
+                                profile == VAProfileHEVCMain);
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
@@ -481,7 +482,12 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                     }
                 }
             } else if (entry == VAEntrypointVLD) {
-                c->h264_dec = h264_decoder_create(&data->gpu, picture_width, picture_height);
+                if (prof == VAProfileHEVCMain)
+                    c->h265_dec = hevc_decoder_create(&data->gpu, picture_width,
+                                                      picture_height);
+                else
+                    c->h264_dec = h264_decoder_create(&data->gpu, picture_width,
+                                                      picture_height);
             }
 
             *context = i;
@@ -520,7 +526,12 @@ VAStatus bc250_DestroyContext(VADriverContextP ctx, VAContextID context) {
         h264_decoder_destroy(c->h264_dec);
         c->h264_dec = NULL;
     }
+    if (c->h265_dec) {
+        hevc_decoder_destroy(c->h265_dec);
+        c->h265_dec = NULL;
+    }
     bc250_dec_free(c);
+    bc250_hevc_dec_free(c);
     if (c->render_targets) {
         free(c->render_targets);
         c->render_targets = NULL;
@@ -752,6 +763,7 @@ VAStatus bc250_BeginPicture(VADriverContextP ctx, VAContextID context, VASurface
     c->hevc_state.has_slice = 0;
 
     if (c->h264_dec) bc250_dec_reset(c);
+    if (c->h265_dec) bc250_hevc_dec_reset(c);
 
     DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
@@ -795,6 +807,21 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
     /* A decode context takes a different set of buffers entirely, and
      * nothing below applies to it. The slices are only collected here; the
      * decoding happens in vaEndPicture, with the lock dropped. */
+    if (c->h265_dec) {
+        for (int i = 0; i < num_buffers; i++) {
+            VABufferID buf_id = buffers[i];
+            if (!VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated)
+                continue;
+            VAStatus st = bc250_hevc_dec_render(c, &data->buffers[buf_id]);
+            if (st != VA_STATUS_SUCCESS) {
+                DRIVER_UNLOCK(data);
+                return st;
+            }
+        }
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_SUCCESS;
+    }
+
     if (c->h264_dec) {
         for (int i = 0; i < num_buffers; i++) {
             VABufferID buf_id = buffers[i];
@@ -1070,6 +1097,23 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     bc250_surface *surf = &data->surfaces[c->current_render_target];
+
+    if (c->h265_dec) {
+        VASurfaceID bersaglio = c->current_render_target;
+        gpu_image_t img = surf->image;
+        gpu_memory_t memo = surf->memory;
+        surf->ref_count++;
+        DRIVER_UNLOCK(data);
+
+        VAStatus st = bc250_hevc_dec_decode(c, img, memo);
+
+        DRIVER_LOCK(data);
+        bc250_surface_unref(data, bersaglio);
+        if (VALID_ID(bersaglio, MAX_SURFACES) && data->surfaces[bersaglio].allocated)
+            data->surfaces[bersaglio].image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+        DRIVER_UNLOCK(data);
+        return st;
+    }
 
     if (c->h264_dec) {
         /* Same shape as the synchronous encode below: pin the surface, drop

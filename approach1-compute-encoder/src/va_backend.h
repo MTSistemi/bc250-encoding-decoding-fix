@@ -20,6 +20,7 @@
 #include "encoder_h264.h"
 #include "encoder_h265.h"
 #include "decoder_h264.h"
+#include "decoder_h265.h"
 
 #ifndef VAConfigAttribEncQualityRange
 #define VAConfigAttribEncQualityRange 21
@@ -102,6 +103,7 @@ struct bc250_context {
     h264_encoder_t *h264_enc;
     hevc_encoder_t *hevc_enc;
     h264_decoder_t *h264_dec;
+    hevc_decoder_t *h265_dec;
 
     /* BC250_PIPELINE=1 only: one frame whose GPU work is in flight and whose
      * CPU entropy coding has not been done yet. At most one - the pipeline is
@@ -163,6 +165,27 @@ struct bc250_context {
         size_t n_data, cap_data;
     } dec_state;
 
+    /* The same for H.265. Separate rather than shared: the two carry
+     * different structures and nothing is gained by a union that every
+     * line then has to ask which half it is looking at. */
+    struct {
+        VAPictureParameterBufferHEVC pic;
+        int has_pic;
+        struct bc250_hevc_dec_slice {
+            VASliceParameterBufferHEVC p;
+            size_t off;               /* into `data`; (size_t)-1 = no data yet */
+            size_t len;
+        } *slices;
+        int n_slices, cap_slices;
+        uint8_t *data;
+        size_t n_data, cap_data;
+        /* ⚠️ The slice header is re-parsed here, so the payload needs its
+         * emulation prevention bytes taken out somewhere. Kept between
+         * slices rather than allocated per slice. */
+        uint8_t *rbsp;
+        size_t cap_rbsp;
+    } hevc_dec_state;
+
     struct {
         VAEncSequenceParameterBufferHEVC seq_param;
         VAEncPictureParameterBufferHEVC pic_param;
@@ -222,6 +245,12 @@ VAStatus bc250_dec_render(bc250_context *c, bc250_buffer *b);
 /* âš ï¸ Call with the driver lock DROPPED and the target surface pinned: this
  * is where the picture is actually decoded, and it is all CPU. */
 VAStatus bc250_dec_decode(bc250_context *c, gpu_image_t out, gpu_memory_t mem);
+
+void bc250_hevc_dec_reset(bc250_context *c);
+void bc250_hevc_dec_free(bc250_context *c);
+VAStatus bc250_hevc_dec_render(bc250_context *c, bc250_buffer *b);
+VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
+                               gpu_memory_t mem);
 
 /* Core VA-API Driver Functions */
 VAStatus __vaDriverInit_1_0(VADriverContextP ctx);

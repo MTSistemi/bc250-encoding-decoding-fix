@@ -10,6 +10,7 @@
  */
 #include "decoder_h265.h"
 #include "hevc_dec_internal.h"
+#include "gpu_compute.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -480,6 +481,32 @@ void hevc_decoder_sposta_entry_point(hevc_slice_t *s, const uint8_t *grezzo,
                                      size_t n_grezzo, size_t primo)
 {
     sposta_entry_point(s, grezzo, n_grezzo, primo);
+}
+
+/* ⚠️ The surface wants the two chroma planes interleaved, and it is
+ * written once, here, rather than plane by plane as the picture is
+ * decoded: surface memory is write-combining, which is fast to write
+ * straight through and very slow to read back or revisit. */
+int hevc_decoder_carica(hevc_decoder_t *h, gpu_image_t out, gpu_memory_t mem)
+{
+    if (!h->gpu) return 0;                 /* the harness keeps the planes */
+    const hevcd_img_t *g = h->d.corrente;
+    if (!g || !g->piano[0]) return -1;
+
+    const int cw = h->width / 2, ch = h->height / 2;
+    uint8_t *uv = malloc((size_t)cw * 2 * ch);
+    if (!uv) return -1;
+    for (int r = 0; r < ch; r++) {
+        const uint8_t *a = g->piano[1] + (size_t)r * g->passo[1];
+        const uint8_t *b = g->piano[2] + (size_t)r * g->passo[2];
+        uint8_t *o = uv + (size_t)r * cw * 2;
+        for (int x = 0; x < cw; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
+    }
+    const int r = gpu_compute_upload_nv12(h->gpu, &out, mem,
+                                          g->piano[0], g->passo[0],
+                                          uv, cw * 2, h->width, h->height);
+    free(uv);
+    return r;
 }
 
 const char *hevc_decoder_motivo(int e)

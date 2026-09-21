@@ -18,9 +18,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#ifdef BC250_H265_CON_GPU
 #include "gpu_compute.h"
-#endif
 
 typedef struct hevc_decoder hevc_decoder_t;
 
@@ -56,6 +54,10 @@ void hevc_decoder_end_picture(hevc_decoder_t *d);
 /* Where the picture just finished is, when there is no GPU to hand it to. */
 const uint8_t *hevc_decoder_piano(const hevc_decoder_t *d, int piano,
                                   int *passo);
+
+/* The picture just finished, onto the surface, as NV12. Does nothing
+ * when the decoder was made without a GPU: the caller keeps the planes. */
+int hevc_decoder_carica(hevc_decoder_t *d, gpu_image_t out, gpu_memory_t mem);
 
 const char *hevc_decoder_motivo(int e);
 

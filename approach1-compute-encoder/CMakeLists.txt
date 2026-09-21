@@ -198,6 +198,17 @@ set(SOURCES
     src/hevc_intra.c
     src/decoder_h264.c
     src/va_decode.c
+    src/decoder_h265.c
+    src/va_decode_hevc.c
+    src/hevc_ps.c
+    src/hevc_cu.c
+    src/hevc_residual.c
+    src/hevc_transform.c
+    src/hevc_pred.c
+    src/hevc_filter.c
+    src/hevc_mv.c
+    src/hevc_mc.c
+    src/hevc_dec_tables.c
     src/h264_mb_cabac.c
     src/h264_mb_cavlc.c
     src/h264_cavlc_dec.c
