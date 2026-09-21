@@ -258,6 +258,94 @@ static void bordo_croma(uint8_t *q, int d, int passo, int bs,
     }
 }
 
+/* One macroblock's edges: the vertical ones left to right, then the
+ * horizontal ones top to bottom, which is the order clause 8.7 fixes. */
+void h264d_deblock_mb(const h264d_deblock_pic_t *p, int mx, int my)
+{
+    uint8_t *y = p->y, *cb = p->cb, *cr = p->cr;
+    const int sy = p->stride_y, sc = p->stride_c;
+    const int mb_w = p->mb_w;
+    const h264d_mb_t *mbs = p->mbs;
+    const uint8_t *slice_of_mb = p->slice_of_mb;
+    const h264d_deblock_params_t *params = p->params;
+    const int cqp_off = p->cqp_off, cqp_off2 = p->cqp_off2;
+    const int idx = my * mb_w + mx;
+    const h264d_mb_t *m = &mbs[idx];
+    const h264d_deblock_params_t *pr = &params[slice_of_mb[idx]];
+    if (pr->disable_idc == 1)
+        return;
+
+    const int oa = pr->alpha_offset, ob = pr->beta_offset;
+    uint8_t *py = y + (size_t)my * 16 * sy + mx * 16;
+    uint8_t *pcb = cb + (size_t)my * 8 * sc + mx * 8;
+    uint8_t *pcr = cr + (size_t)my * 8 * sc + mx * 8;
+
+    const bool salta_sinistra = mx == 0
+        || (pr->disable_idc == 2 && slice_of_mb[idx - 1] != slice_of_mb[idx]);
+    const bool salta_sopra = my == 0
+        || (pr->disable_idc == 2 && slice_of_mb[idx - mb_w] != slice_of_mb[idx]);
+
+    const int qpc  = qp_croma(m->qpy, cqp_off);
+    const int qpc2 = qp_croma(m->qpy, cqp_off2);
+
+    /* --- vertical edges, left to right --------------------------- */
+    for (int e = 0; e < 4; e++) {
+        if (e == 0 && salta_sinistra) continue;
+        if (e && m->transform8x8 && (e & 1)) continue;
+
+        const h264d_mb_t *vicino = e ? m : &mbs[idx - 1];
+        const int qp_p = vicino->qpy;
+        const int qpc_p  = qp_croma(qp_p, cqp_off);
+        const int qpc2_p = qp_croma(qp_p, cqp_off2);
+
+        /* Chroma has an edge only where luma has one every eight
+         * samples, so only edges 0 and 2 - but the strength is the
+         * same answer, derived once here for both. */
+        const bool con_croma = (e == 0 || e == 2);
+        for (int r = 0; r < 4; r++) {
+            const int bq = blocco(e, r);
+            const int bp = e ? blocco(e - 1, r) : blocco(3, r);
+            const int bs = forza(vicino, bp, m, bq, e == 0);
+            if (!bs) continue;              /* nothing is filtered */
+            bordo_luma(py + (size_t)r * 4 * sy + e * 4, 1, sy, bs,
+                       qp_p, m->qpy, oa, ob);
+            if (con_croma) {
+                bordo_croma(pcb + (size_t)r * 2 * sc + e * 2, 1, sc, bs,
+                            qpc_p, qpc, oa, ob);
+                bordo_croma(pcr + (size_t)r * 2 * sc + e * 2, 1, sc, bs,
+                            qpc2_p, qpc2, oa, ob);
+            }
+        }
+    }
+
+    /* --- horizontal edges, top to bottom ------------------------- */
+    for (int e = 0; e < 4; e++) {
+        if (e == 0 && salta_sopra) continue;
+        if (e && m->transform8x8 && (e & 1)) continue;
+
+        const h264d_mb_t *vicino = e ? m : &mbs[idx - mb_w];
+        const int qp_p = vicino->qpy;
+        const int qpc_p  = qp_croma(qp_p, cqp_off);
+        const int qpc2_p = qp_croma(qp_p, cqp_off2);
+
+        const bool con_croma = (e == 0 || e == 2);
+        for (int c = 0; c < 4; c++) {
+            const int bq = blocco(c, e);
+            const int bp = e ? blocco(c, e - 1) : blocco(c, 3);
+            const int bs = forza(vicino, bp, m, bq, e == 0);
+            if (!bs) continue;
+            bordo_luma(py + (size_t)e * 4 * sy + c * 4, sy, 1, bs,
+                       qp_p, m->qpy, oa, ob);
+            if (con_croma) {
+                bordo_croma(pcb + (size_t)e * 2 * sc + c * 2, sc, 1, bs,
+                            qpc_p, qpc, oa, ob);
+                bordo_croma(pcr + (size_t)e * 2 * sc + c * 2, sc, 1, bs,
+                            qpc2_p, qpc2, oa, ob);
+            }
+        }
+    }
+}
+
 void h264d_deblock_picture(uint8_t *y, int sy,
                            uint8_t *cb, uint8_t *cr, int sc,
                            int mb_w, int mb_h,
@@ -266,83 +354,11 @@ void h264d_deblock_picture(uint8_t *y, int sy,
                            const h264d_deblock_params_t *params,
                            int cqp_off, int cqp_off2)
 {
-    for (int my = 0; my < mb_h; my++) {
-        for (int mx = 0; mx < mb_w; mx++) {
-            const int idx = my * mb_w + mx;
-            const h264d_mb_t *m = &mbs[idx];
-            const h264d_deblock_params_t *pr = &params[slice_of_mb[idx]];
-            if (pr->disable_idc == 1)
-                continue;
-
-            const int oa = pr->alpha_offset, ob = pr->beta_offset;
-            uint8_t *py = y + (size_t)my * 16 * sy + mx * 16;
-            uint8_t *pcb = cb + (size_t)my * 8 * sc + mx * 8;
-            uint8_t *pcr = cr + (size_t)my * 8 * sc + mx * 8;
-
-            const bool salta_sinistra = mx == 0
-                || (pr->disable_idc == 2 && slice_of_mb[idx - 1] != slice_of_mb[idx]);
-            const bool salta_sopra = my == 0
-                || (pr->disable_idc == 2 && slice_of_mb[idx - mb_w] != slice_of_mb[idx]);
-
-            const int qpc  = qp_croma(m->qpy, cqp_off);
-            const int qpc2 = qp_croma(m->qpy, cqp_off2);
-
-            /* --- vertical edges, left to right --------------------------- */
-            for (int e = 0; e < 4; e++) {
-                if (e == 0 && salta_sinistra) continue;
-                if (e && m->transform8x8 && (e & 1)) continue;
-
-                const h264d_mb_t *vicino = e ? m : &mbs[idx - 1];
-                const int qp_p = vicino->qpy;
-                const int qpc_p  = qp_croma(qp_p, cqp_off);
-                const int qpc2_p = qp_croma(qp_p, cqp_off2);
-
-                /* Chroma has an edge only where luma has one every eight
-                 * samples, so only edges 0 and 2 - but the strength is the
-                 * same answer, derived once here for both. */
-                const bool con_croma = (e == 0 || e == 2);
-                for (int r = 0; r < 4; r++) {
-                    const int bq = blocco(e, r);
-                    const int bp = e ? blocco(e - 1, r) : blocco(3, r);
-                    const int bs = forza(vicino, bp, m, bq, e == 0);
-                    if (!bs) continue;              /* nothing is filtered */
-                    bordo_luma(py + (size_t)r * 4 * sy + e * 4, 1, sy, bs,
-                               qp_p, m->qpy, oa, ob);
-                    if (con_croma) {
-                        bordo_croma(pcb + (size_t)r * 2 * sc + e * 2, 1, sc, bs,
-                                    qpc_p, qpc, oa, ob);
-                        bordo_croma(pcr + (size_t)r * 2 * sc + e * 2, 1, sc, bs,
-                                    qpc2_p, qpc2, oa, ob);
-                    }
-                }
-            }
-
-            /* --- horizontal edges, top to bottom ------------------------- */
-            for (int e = 0; e < 4; e++) {
-                if (e == 0 && salta_sopra) continue;
-                if (e && m->transform8x8 && (e & 1)) continue;
-
-                const h264d_mb_t *vicino = e ? m : &mbs[idx - mb_w];
-                const int qp_p = vicino->qpy;
-                const int qpc_p  = qp_croma(qp_p, cqp_off);
-                const int qpc2_p = qp_croma(qp_p, cqp_off2);
-
-                const bool con_croma = (e == 0 || e == 2);
-                for (int c = 0; c < 4; c++) {
-                    const int bq = blocco(c, e);
-                    const int bp = e ? blocco(c, e - 1) : blocco(c, 3);
-                    const int bs = forza(vicino, bp, m, bq, e == 0);
-                    if (!bs) continue;
-                    bordo_luma(py + (size_t)e * 4 * sy + c * 4, sy, 1, bs,
-                               qp_p, m->qpy, oa, ob);
-                    if (con_croma) {
-                        bordo_croma(pcb + (size_t)e * 2 * sc + c * 2, sc, 1, bs,
-                                    qpc_p, qpc, oa, ob);
-                        bordo_croma(pcr + (size_t)e * 2 * sc + c * 2, sc, 1, bs,
-                                    qpc2_p, qpc2, oa, ob);
-                    }
-                }
-            }
-        }
-    }
+    const h264d_deblock_pic_t p = {
+        y, cb, cr, sy, sc, mb_w, mb_h, mbs, slice_of_mb, params,
+        cqp_off, cqp_off2
+    };
+    for (int my = 0; my < mb_h; my++)
+        for (int mx = 0; mx < mb_w; mx++)
+            h264d_deblock_mb(&p, mx, my);
 }

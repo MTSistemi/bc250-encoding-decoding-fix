@@ -128,7 +128,7 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
         int16_t tmp[16];
         const int nz = h264d_cavlc_residuo(br, nc_di(d, 0, 0, false), 16, tmp);
         for (int k = 0; k < 16; k++)
-            d->dc_luma[h264d_zigzag4[k]] = tmp[k];
+            d->res->dc_luma[h264d_zigzag4[k]] = tmp[k];
         m->cbf_dc[0] = nz ? 1 : 0;
     }
 
@@ -146,7 +146,7 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
             int16_t tmp[16];
 
             if (!((m->cbp >> i8) & 1)) {
-                memset(d->coeff[0][b], 0, sizeof(d->coeff[0][b]));
+                memset(d->res->coeff[0][b], 0, sizeof(d->res->coeff[0][b]));
                 m->nnz[0][b] = 0;
                 continue;
             }
@@ -159,21 +159,21 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
                 for (int c = 0; c < 16; c++)
                     otto[4 * c + i4] = tmp[c];
             } else {
-                memset(d->coeff[0][b], 0, sizeof(d->coeff[0][b]));
+                memset(d->res->coeff[0][b], 0, sizeof(d->res->coeff[0][b]));
                 if (i16)
                     for (int c = 0; c < 15; c++)
-                        d->coeff[0][b][h264d_zigzag4[c + 1]] = tmp[c];
+                        d->res->coeff[0][b][h264d_zigzag4[c + 1]] = tmp[c];
                 else
                     for (int c = 0; c < 16; c++)
-                        d->coeff[0][b][h264d_zigzag4[c]] = tmp[c];
+                        d->res->coeff[0][b][h264d_zigzag4[c]] = tmp[c];
             }
         }
 
         if (m->transform8x8) {
-            memset(d->coeff8[i8], 0, sizeof(d->coeff8[i8]));
+            memset(d->res->coeff8[i8], 0, sizeof(d->res->coeff8[i8]));
             if ((m->cbp >> i8) & 1)
                 for (int c = 0; c < 64; c++)
-                    d->coeff8[i8][h264d_zigzag8[c]] = otto[c];
+                    d->res->coeff8[i8][h264d_zigzag8[c]] = otto[c];
         }
     }
 
@@ -183,16 +183,16 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
         if (cbp_c) {
             /* nC is -1 for a 4:2:0 chroma DC block: it has a table of its
              * own and no neighbourhood. */
-            const int nz = h264d_cavlc_residuo(br, -1, 4, d->dc_chroma[p]);
+            const int nz = h264d_cavlc_residuo(br, -1, 4, d->res->dc_chroma[p]);
             m->cbf_dc[p + 1] = nz ? 1 : 0;
         } else {
-            memset(d->dc_chroma[p], 0, sizeof(d->dc_chroma[p]));
+            memset(d->res->dc_chroma[p], 0, sizeof(d->res->dc_chroma[p]));
             m->cbf_dc[p + 1] = 0;
         }
     }
     for (int p = 0; p < 2; p++) {
         for (int b = 0; b < 4; b++) {
-            memset(d->coeff[p + 1][b], 0, sizeof(d->coeff[p + 1][b]));
+            memset(d->res->coeff[p + 1][b], 0, sizeof(d->res->coeff[p + 1][b]));
             if (cbp_c != 2) {
                 m->nnz[p + 1][b] = 0;
                 continue;
@@ -202,7 +202,7 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
                                                15, tmp);
             m->nnz[p + 1][b] = (uint8_t)nz;
             for (int c = 0; c < 15; c++)
-                d->coeff[p + 1][b][h264d_zigzag4[c + 1]] = tmp[c];
+                d->res->coeff[p + 1][b][h264d_zigzag4[c + 1]] = tmp[c];
         }
     }
 }
@@ -387,6 +387,7 @@ static int leggi_movimento(h264_decoder_t *d, h264d_mb_t *m, bool bslice,
 
 int h264d_decode_mb_cavlc(h264_decoder_t *d)
 {
+    h264d_punta_residuo(d);
     br_t *br = &d->br;
     h264d_mb_t *m = &d->mbs[d->mb_idx];
     azzera_mb(m);
@@ -498,7 +499,6 @@ int h264d_decode_mb_cavlc(h264_decoder_t *d)
     if (i16)
         m->ipred[0] = (int8_t)i16_modo;
 
-    h264d_reconstruct_mb(d);
     return 0;
 }
 
@@ -506,6 +506,7 @@ int h264d_decode_mb_cavlc(h264_decoder_t *d)
  * flagging each one. */
 int h264d_cavlc_skip(h264_decoder_t *d)
 {
+    h264d_punta_residuo(d);
     h264d_mb_t *m = &d->mbs[d->mb_idx];
     azzera_mb(m);
 
@@ -513,10 +514,7 @@ int h264d_cavlc_skip(h264_decoder_t *d)
     m->type = (uint8_t)(bslice ? H264D_MB_B_SKIP : H264D_MB_P_SKIP);
     m->qpy = (int8_t)d->qpy;
 
-    memset(d->dc_luma, 0, sizeof(d->dc_luma));
-    memset(d->dc_chroma, 0, sizeof(d->dc_chroma));
-    memset(d->coeff, 0, sizeof(d->coeff));
-    memset(d->coeff8, 0, sizeof(d->coeff8));
+    /* âš ï¸ Nothing to zero: see h264d_reconstruct_mb. */
 
     if (bslice) {
         m->direct = 0xf;
@@ -536,6 +534,5 @@ int h264d_cavlc_skip(h264_decoder_t *d)
         }
     }
 
-    h264d_reconstruct_mb(d);
     return 0;
 }

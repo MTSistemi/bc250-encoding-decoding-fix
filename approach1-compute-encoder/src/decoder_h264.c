@@ -69,9 +69,27 @@ h264_decoder_t *h264_decoder_create(bc250_gpu_context_t *gpu_ctx,
 
     d->mbs = calloc((size_t)d->mb_count, sizeof(h264d_mb_t));
     d->slice_of_mb = calloc((size_t)d->mb_count, 1);
+    /* A band of about a megabyte and a half: inside L3 on this part, and
+     * tall enough for the wavefront to have something to spread across. */
+    {
+        const size_t riga = (size_t)d->mb_w * sizeof(h264d_residuo_t);
+        int b = (int)((size_t)1536 * 1024 / (riga ? riga : 1));
+        const char *e = getenv("BC250_H264_BAND");
+        if (e) b = atoi(e);
+        if (b < 4) b = 4;
+        if (b > d->mb_h) b = d->mb_h;
+        d->righe_banda = b;
+    }
+    d->slices = calloc(H264D_MAX_SLICES, sizeof(h264d_slice_t));
+    d->dequant = calloc(1, sizeof(h264d_dequant_set_t));
+    d->n_residui = (d->righe_banda + 1) * d->mb_w;
+    if (d->n_residui > d->mb_count) d->n_residui = d->mb_count;
+    d->residui = calloc((size_t)d->n_residui, sizeof(h264d_residuo_t));
+    d->res = d->residui;
     d->rbsp_cap = (size_t)d->mb_count * 512 + 65536;
     d->rbsp = malloc(d->rbsp_cap);
-    if (!d->mbs || !d->slice_of_mb || !d->rbsp) {
+    if (!d->mbs || !d->slice_of_mb || !d->residui || !d->rbsp
+        || !d->slices || !d->dequant) {
         h264_decoder_destroy(d);
         return NULL;
     }
@@ -98,8 +116,12 @@ void h264_decoder_destroy(h264_decoder_t *d)
     if (!d) return;
     for (int i = 0; i < H264D_DPB_SIZE; i++)
         libera_frame(&d->dpb[i]);
+    h264d_pool_stop(d);
     free(d->mbs);
     free(d->slice_of_mb);
+    free(d->residui);
+    free(d->slices);
+    free(d->dequant);
     free(d->rbsp);
     free(d);
 }
@@ -160,6 +182,8 @@ void h264_decoder_set_references(h264_decoder_t *d, const uint32_t *refs,
 int h264_decoder_begin_picture(h264_decoder_t *d, const h264d_pic_t *pic,
                                uint32_t surface, int poc, int frame_num)
 {
+    if (!d->pool) h264d_pool_start(d);
+
     d->pic = *pic;
     d->cur = slot_per(d, surface);
     h264d_frame_t *f = &d->dpb[d->cur];
@@ -177,7 +201,7 @@ int h264_decoder_begin_picture(h264_decoder_t *d, const h264d_pic_t *pic,
     d->n_slices = 0;
     /* Rebuilt only when the scaling lists could have changed, which is
      * here: a new picture may carry a new picture parameter set. */
-    h264d_dequant_build_all(&d->dequant, d->pic.scaling4, d->pic.scaling8);
+    h264d_dequant_build_all(d->dequant, d->pic.scaling4, d->pic.scaling8);
     return 0;
 }
 
@@ -210,6 +234,21 @@ static void traccia_mb(const h264_decoder_t *d)
     fprintf(stderr, "\n");
 }
 
+/* Reconstruct the rows the entropy decoder has left behind, once a band of
+ * them has piled up. Called at the start of every macroblock row.
+ *
+ * âš ï¸ This is what keeps the residual ring small enough to stay in cache,
+ * and it is also what bounds how far apart the wavefront's threads can
+ * get. The two pull in opposite directions. */
+static inline void scarica(h264_decoder_t *d, int numero)
+{
+    const int banda = d->righe_banda * d->mb_w;
+    if (d->mb_idx - d->da_ricostruire < banda) return;
+    h264d_reconstruct_range(d, d->da_ricostruire,
+                            d->mb_idx - d->da_ricostruire, numero);
+    d->da_ricostruire = d->mb_idx;
+}
+
 int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
                        const uint8_t *data, size_t size, int bit_offset)
 {
@@ -218,6 +257,7 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
 
     d->slice = *slice;
     const int numero = d->n_slices++;
+    d->slices[numero] = *slice;
     d->deblock[numero].disable_idc = (int8_t)slice->disable_deblocking_filter_idc;
     d->deblock[numero].alpha_offset = (int8_t)slice->alpha_c0_offset;
     d->deblock[numero].beta_offset = (int8_t)slice->beta_offset;
@@ -246,6 +286,7 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
 
     d->qpy = slice->qpy;
     d->last_qp_delta_nonzero = 0;
+    d->da_ricostruire = slice->first_mb;
     d->mb_idx = slice->first_mb;
     if (d->mb_idx >= d->mb_count) return -1;
     d->mb_x = d->mb_idx % d->mb_w;
@@ -272,6 +313,7 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
         d->mb_idx++;                                   \
         d->mb_x = d->mb_idx % d->mb_w;                 \
         d->mb_y = d->mb_idx / d->mb_w;                 \
+        if (d->mb_x == 0) scarica(d, numero);          \
     } while (0)
 
     if (d->cabac_mode) {
@@ -337,6 +379,14 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
                 quanti, d->cabac_mode
                         ? (int)h264d_cabac_overrun(&d->cabac)
                         : (int)br_overrun(&d->br));
+
+    /* Whatever is left of the last band. */
+    {
+        const int fine = slice->first_mb + quanti;
+        if (fine > d->da_ricostruire)
+            h264d_reconstruct_range(d, d->da_ricostruire,
+                                    fine - d->da_ricostruire, numero);
+    }
     return 0;
 }
 
@@ -385,10 +435,15 @@ int h264_decoder_end_picture(h264_decoder_t *d, gpu_image_t out,
                         "%d %d %d %d\n", d->cur, f->poc,
                 f->y[0], f->y[1], f->y[2], f->y[3]);
 
-    h264d_deblock_picture(f->y, f->stride_y, f->cb, f->cr, f->stride_c,
-                          d->mb_w, d->mb_h, d->mbs, d->slice_of_mb,
-                          d->deblock, d->pic.chroma_qp_index_offset,
-                          d->pic.second_chroma_qp_index_offset);
+    {
+        const h264d_deblock_pic_t dp = {
+            f->y, f->cb, f->cr, f->stride_y, f->stride_c,
+            d->mb_w, d->mb_h, d->mbs, d->slice_of_mb, d->deblock,
+            d->pic.chroma_qp_index_offset,
+            d->pic.second_chroma_qp_index_offset
+        };
+        h264d_deblock_wavefront(d, &dp);
+    }
 
     if (getenv("BC250_H264_TRACE"))
         fprintf(stderr, "                          riga 0 dopo  "

@@ -53,6 +53,20 @@ enum {
     CAT_LUMA_8X8 = 5,
 };
 
+/* One macroblock's residual, as the entropy decoder leaves it: coefficients
+ * in raster order inside each block, ready for the inverse transforms.
+ *
+ * âš ï¸ coeff and coeff8 are alternatives - a macroblock uses the 4x4
+ * transform or the 8x8 one, never both - but they are kept side by side
+ * rather than in a union, because the debug dumps read whichever one the
+ * macroblock did not use and a union would make that undefined. */
+typedef struct {
+    int16_t coeff[3][16][16];     /* [plane][block][coefficient] */
+    int16_t coeff8[4][64];        /* the 8x8 transform's luma blocks */
+    int16_t dc_luma[16];
+    int16_t dc_chroma[2][4];
+} h264d_residuo_t;
+
 /* One decoded picture's worth of working state. */
 struct h264_decoder {
     bc250_gpu_context_t *gpu;
@@ -70,7 +84,16 @@ struct h264_decoder {
     h264d_mb_t *mbs;
     uint8_t *slice_of_mb;
     h264d_deblock_params_t deblock[H264D_MAX_SLICES];
+    /* âš ï¸ Kept by slice number, not just in `slice`: reconstruction reads
+     * the weights and the reference lists, and it runs after the entropy
+     * decoder has moved on. */
+    /* âš ï¸ On the heap, not in the structure: a worker copies the decoder
+     * to use as a cursor, and 256 slices of parameters would be copied
+     * with it. */
+    h264d_slice_t *slices;
     int n_slices;
+
+    struct h264d_pool *pool;      /* reconstruction threads, or NULL */
 
     /* Entropy state for the slice being decoded. */
     h264d_cabac_t cabac;
@@ -82,7 +105,7 @@ struct h264_decoder {
     /* Rebuilt whenever QP changes, which is rarely. Chroma gets its own two
      * because its QP comes from a different table and each plane has its own
      * offset. */
-    h264d_dequant_set_t dequant;
+    h264d_dequant_set_t *dequant;   /* shared, built once a picture */
 
     int qpy;                      /* running QP through the slice */
     int last_qp_delta_nonzero;    /* the mb_qp_delta context needs it */
@@ -90,11 +113,14 @@ struct h264_decoder {
     int prev_mb_skipped;
     int mb_skip_run;              /* CAVLC only */
 
-    /* Coefficients for the macroblock being decoded. */
-    int16_t coeff[3][16][16];     /* [plane][block][coefficient] */
-    int16_t dc_luma[16];
-    int16_t dc_chroma[2][4];
-    int16_t coeff8[4][64];        /* the 8x8 transform's luma blocks */
+    /* One residual per macroblock. The entropy decoder fills them in and
+     * reconstruction reads them; keeping them apart is what lets the
+     * second run behind the first. */
+    h264d_residuo_t *residui;
+    int n_residui;                /* a ring of righe_banda + 1 rows */
+    int righe_banda;
+    int da_ricostruire;           /* first macroblock not yet reconstructed */
+    h264d_residuo_t *res;         /* the one being filled in right now */
 };
 
 /* ---- neighbours ------------------------------------------------------- */
@@ -132,6 +158,12 @@ static inline const h264d_mb_t *h264d_mb_top_right(const h264_decoder_t *d)
     return &d->mbs[d->mb_idx - d->mb_w + 1];
 }
 
+/* The residual slot this macroblock fills in. */
+static inline void h264d_punta_residuo(h264_decoder_t *d)
+{
+    d->res = &d->residui[d->mb_idx % d->n_residui];
+}
+
 /* ---- the macroblock layer --------------------------------------------- */
 
 /* Decode one macroblock's syntax and reconstruct it. Returns non-zero when
@@ -143,8 +175,29 @@ int h264d_decode_mb_cavlc(h264_decoder_t *d);
  * because there the skip is a flag the macroblock layer reads itself. */
 int h264d_cavlc_skip(h264_decoder_t *d);
 
-/* Reconstruction, shared by both entropy paths once the syntax is in. */
+/* Reconstruct one macroblock. `d` here is a cursor - a copy of the
+ * decoder with its own mb_x, mb_y, mb_idx, res and slice - because this
+ * reads the decoder and never writes to it, which is what lets several
+ * threads run it at once over the same picture. */
 void h264d_reconstruct_mb(h264_decoder_t *d);
+
+/* Reconstruct a run of macroblocks of one slice: as a wavefront across
+ * the thread pool when there is one and the run is long enough to pay for
+ * it, in order on this thread otherwise. Either way the picture is the
+ * same to the byte. */
+void h264d_reconstruct_range(h264_decoder_t *d, int primo, int quanti,
+                             int numero_slice);
+
+/* The reconstruction threads. Started on the first picture and kept until
+ * the decoder is destroyed; BC250_H264_THREADS sets how many, and 1 turns
+ * them off. */
+struct h264d_pool;
+int h264d_pool_start(h264_decoder_t *d);
+void h264d_pool_stop(h264_decoder_t *d);
+
+/* The deblocking filter over a whole picture, threaded when there is a
+ * pool. Same result as h264d_deblock_picture(), to the byte. */
+void h264d_deblock_wavefront(h264_decoder_t *d, const h264d_deblock_pic_t *dp);
 
 /* Motion vector prediction, 8.4.1.3. */
 void h264d_predict_mv(h264_decoder_t *d, int list, int blk, int w4, int h4,

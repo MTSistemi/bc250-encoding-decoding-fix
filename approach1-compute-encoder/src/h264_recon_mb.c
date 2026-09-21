@@ -387,13 +387,13 @@ static void aggiungi_luma(h264_decoder_t *d, h264d_mb_t *m, uint8_t *y, int sy)
 {
     const int lista4 = m->intra ? 0 : 3;     /* scaling list, Table 7-2 */
     const int lista8 = m->intra ? 0 : 1;
-    const h264d_dequant_t *dq = &d->dequant.per_resto[m->qpy % 6];
+    const h264d_dequant_t *dq = &d->dequant->per_resto[m->qpy % 6];
 
     if (m->transform8x8) {
         for (int b8 = 0; b8 < 4; b8++) {
             if (!((m->cbp >> b8) & 1)) continue;
             uint8_t *dst = y + (size_t)((b8 >> 1) * 8) * sy + (b8 & 1) * 8;
-            h264d_idct8_add(dst, sy, d->coeff8[b8], dq->d8[lista8], m->qpy);
+            h264d_idct8_add(dst, sy, d->res->coeff8[b8], dq->d8[lista8], m->qpy);
         }
         return;
     }
@@ -407,9 +407,9 @@ static void aggiungi_luma(h264_decoder_t *d, h264d_mb_t *m, uint8_t *y, int sy)
         /* An all-zero block adds nothing. nnz counts the coefficients the
          * entropy decoder actually read; for Intra_16x16 the DC arrives
          * separately and is not in that count, so it is tested on its own. */
-        if (m->nnz[0][b] == 0 && (!i16 || d->coeff[0][b][0] == 0))
+        if (m->nnz[0][b] == 0 && (!i16 || d->res->coeff[0][b][0] == 0))
             continue;
-        h264d_idct4_add(dst, sy, d->coeff[0][b], dq->d4[lista4],
+        h264d_idct4_add(dst, sy, d->res->coeff[0][b], dq->d4[lista4],
                         m->qpy, i16);
     }
 }
@@ -457,28 +457,28 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
                 for (int yy = 0; yy < 4; yy++) {
                     fprintf(stderr, "   ");
                     for (int xx = 0; xx < 4; xx++)
-                        fprintf(stderr, " %6d", d->dc_luma[yy * 4 + xx]);
+                        fprintf(stderr, " %6d", d->res->dc_luma[yy * 4 + xx]);
                     fprintf(stderr, "%s", NEWLINE);
                 }
             }
 
-            h264d_luma_dc_transform(d->dc_luma, m->qpy,
-                                    d->dequant.per_resto[m->qpy % 6].d4[0][0]);
+            h264d_luma_dc_transform(d->res->dc_luma, m->qpy,
+                                    d->dequant->per_resto[m->qpy % 6].d4[0][0]);
             for (int k = 0; k < 16; k++)
-                d->coeff[0][k][0] = d->dc_luma[k];
+                d->res->coeff[0][k][0] = d->res->dc_luma[k];
 
             if (m16 == d->mb_idx) {
                 fprintf(stderr, "  DC dopo la trasformata:%s", NEWLINE);
                 for (int yy = 0; yy < 4; yy++) {
                     fprintf(stderr, "   ");
                     for (int xx = 0; xx < 4; xx++)
-                        fprintf(stderr, " %6d", d->dc_luma[yy * 4 + xx]);
+                        fprintf(stderr, " %6d", d->res->dc_luma[yy * 4 + xx]);
                     fprintf(stderr, "%s", NEWLINE);
                 }
                 fprintf(stderr, "  AC del blocco raster 0:%s", NEWLINE);
                 fprintf(stderr, "   ");
                 for (int xx = 1; xx < 16; xx++)
-                    fprintf(stderr, " %4d", d->coeff[0][0][xx]);
+                    fprintf(stderr, " %4d", d->res->coeff[0][0][xx]);
                 fprintf(stderr, "%s", NEWLINE);
             }
         } else if (m->transform8x8) {
@@ -490,8 +490,8 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
                 const int modo = m->ipred[(b8 >> 1) * 8 + (b8 & 1) * 2];
                 h264d_pred8x8_luma(dst, sy, modo, top, left, ang, at, al, ac, atr);
                 if ((m->cbp >> b8) & 1)
-                    h264d_idct8_add(dst, sy, d->coeff8[b8],
-                                d->dequant.per_resto[m->qpy % 6].d8[0], m->qpy);
+                    h264d_idct8_add(dst, sy, d->res->coeff8[b8],
+                                d->dequant->per_resto[m->qpy % 6].d8[0], m->qpy);
             }
         } else {
             /* Intra_4x4 predicts and reconstructs one block at a time: the
@@ -521,14 +521,14 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
                     for (int yy = 0; yy < 4; yy++) {
                         fprintf(stderr, "   ");
                         for (int xx = 0; xx < 4; xx++)
-                            fprintf(stderr, " %5d", d->coeff[0][b][yy * 4 + xx]);
+                            fprintf(stderr, " %5d", d->res->coeff[0][b][yy * 4 + xx]);
                         fprintf(stderr, "%s", NEWLINE);
                     }
                 }
 
                 if ((m->cbp >> h264d_part8(b)) & 1)
-                    h264d_idct4_add(dst, sy, d->coeff[0][b],
-                                    d->dequant.per_resto[m->qpy % 6].d4[0],
+                    h264d_idct4_add(dst, sy, d->res->coeff[0][b],
+                                    d->dequant->per_resto[m->qpy % 6].d4[0],
                                     m->qpy, false);
 
                 if (dmb == d->mb_idx && dbl == b) {
@@ -607,7 +607,7 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
                         NEWLINE);
                 fprintf(stderr, "   ");
                 for (int k = 0; k < 16; k++)
-                    fprintf(stderr, " %5d", d->coeff8[0][k]);
+                    fprintf(stderr, " %5d", d->res->coeff8[0][k]);
                 fprintf(stderr, "%s", NEWLINE);
             }
         }
@@ -627,6 +627,12 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
 
     /* Chroma residual, the same for intra and inter: the DC coefficients of
      * each plane go through their own 2x2 transform, then each 4x4 block. */
+    /* âš ï¸ Nothing below may touch the residual when there is none: the slot
+     * still holds whatever macroblock used it a band ago. coded_block_
+     * pattern's upper bits are what say a chroma residual exists. */
+    if ((m->cbp >> 4) == 0)
+        return;
+
     for (int p = 0; p < 2; p++) {
         uint8_t *piano = p ? cr : cb;
         /* Table 7-2: scaling lists 1 and 2 are intra Cb and Cr, 4 and 5 the
@@ -639,21 +645,20 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
         qpi = qpi < 0 ? 0 : (qpi > 51 ? 51 : qpi);
         const int qpc = h264d_chroma_qp[qpi];
 
-        const h264d_dequant_t *dqc = &d->dequant.per_resto[qpc % 6];
+        const h264d_dequant_t *dqc = &d->dequant->per_resto[qpc % 6];
 
-        if ((m->cbp >> 4) != 0)
-            h264d_chroma_dc_transform(d->dc_chroma[p], qpc, dqc->d4[lista_c][0]);
+        h264d_chroma_dc_transform(d->res->dc_chroma[p], qpc, dqc->d4[lista_c][0]);
 
         /* A block whose DC and AC are both zero adds nothing, and a
          * macroblock with no chroma residual at all is the common case:
          * without this every one of them ran eight inverse transforms over
          * zeros. */
         for (int b = 0; b < 4; b++) {
-            d->coeff[p + 1][b][0] = d->dc_chroma[p][b];
-            if (m->nnz[p + 1][b] == 0 && d->dc_chroma[p][b] == 0)
+            d->res->coeff[p + 1][b][0] = d->res->dc_chroma[p][b];
+            if (m->nnz[p + 1][b] == 0 && d->res->dc_chroma[p][b] == 0)
                 continue;
             uint8_t *dst = piano + (size_t)((b >> 1) * 4) * sc + (b & 1) * 4;
-            h264d_idct4_add(dst, sc, d->coeff[p + 1][b], dqc->d4[lista_c],
+            h264d_idct4_add(dst, sc, d->res->coeff[p + 1][b], dqc->d4[lista_c],
                             qpc, true);
         }
     }

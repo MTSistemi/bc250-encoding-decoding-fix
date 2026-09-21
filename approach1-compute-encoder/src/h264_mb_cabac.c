@@ -727,7 +727,7 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
         int16_t tmp[16];
         int nz = leggi_residuo(d, CAT_I16_DC, 16, tmp, inc, true);
         for (int k = 0; k < 16; k++)
-            d->dc_luma[h264d_zigzag4[k]] = tmp[k];
+            d->res->dc_luma[h264d_zigzag4[k]] = tmp[k];
         m->cbf_dc[0] = nz ? 1 : 0;
     }
 
@@ -735,16 +735,16 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
     if (m->transform8x8) {
         for (int b8 = 0; b8 < 4; b8++) {
             if (!((m->cbp >> b8) & 1)) {
-                memset(d->coeff8[b8], 0, sizeof(d->coeff8[b8]));
+                memset(d->res->coeff8[b8], 0, sizeof(d->res->coeff8[b8]));
                 continue;
             }
             /* No coded_block_flag for an 8x8 luma block at 4:2:0: the
              * coded block pattern has already said it is there. */
             int16_t tmp8[64];
             int nz = leggi_residuo(d, CAT_LUMA_8X8, 64, tmp8, 0, false);
-            memset(d->coeff8[b8], 0, sizeof(d->coeff8[b8]));
+            memset(d->res->coeff8[b8], 0, sizeof(d->res->coeff8[b8]));
             for (int k = 0; k < 64; k++)
-                d->coeff8[b8][h264d_zigzag8[k]] = tmp8[k];
+                d->res->coeff8[b8][h264d_zigzag8[k]] = tmp8[k];
             const int bx = (b8 & 1) * 2, by = (b8 >> 1) * 2;
             for (int y = 0; y < 2; y++)
                 for (int x = 0; x < 2; x++)
@@ -755,7 +755,7 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
             const int b = zscan[k];
             const int b8 = ((b >> 3) << 1) | ((b >> 1) & 1);
             if (!((m->cbp >> b8) & 1)) {
-                memset(d->coeff[0][b], 0, sizeof(d->coeff[0][b]));
+                memset(d->res->coeff[0][b], 0, sizeof(d->res->coeff[0][b]));
                 m->nnz[0][b] = 0;
                 continue;
             }
@@ -770,15 +770,15 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
             int nz = leggi_residuo(d, cat, n, tmp, inc, true);
             /* An Intra_16x16 block codes only its fifteen AC coefficients;
              * the DC comes from the separate block above. */
-            memset(d->coeff[0][b], 0, sizeof(d->coeff[0][b]));
+            memset(d->res->coeff[0][b], 0, sizeof(d->res->coeff[0][b]));
             if (i16) {
                 /* The AC coefficients start at scan position 1: position 0
                  * is the DC, which came from its own block. */
                 for (int k = 0; k < 15; k++)
-                    d->coeff[0][b][h264d_zigzag4[k + 1]] = tmp[k];
+                    d->res->coeff[0][b][h264d_zigzag4[k + 1]] = tmp[k];
             } else {
                 for (int k = 0; k < 16; k++)
-                    d->coeff[0][b][h264d_zigzag4[k]] = tmp[k];
+                    d->res->coeff[0][b][h264d_zigzag4[k]] = tmp[k];
             }
             m->nnz[0][b] = (uint8_t)nz;
         }
@@ -795,17 +795,17 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
             /* ⚠️ No un-scan here. At 4:2:0 the chroma DC block is 2x2 and
              * its scan (h264d_chroma_dc_scan) is the identity, so the four
              * coefficients come out already in raster order. */
-            int nz = leggi_residuo(d, CAT_CHROMA_DC, 4, d->dc_chroma[p], inc, true);
+            int nz = leggi_residuo(d, CAT_CHROMA_DC, 4, d->res->dc_chroma[p], inc, true);
             m->cbf_dc[p + 1] = nz ? 1 : 0;
         } else {
-            memset(d->dc_chroma[p], 0, sizeof(d->dc_chroma[p]));
+            memset(d->res->dc_chroma[p], 0, sizeof(d->res->dc_chroma[p]));
             m->cbf_dc[p + 1] = 0;
         }
     }
     for (int p = 0; p < 2; p++) {
         for (int b = 0; b < 4; b++) {
             if (cbp_c != 2) {
-                memset(d->coeff[p + 1][b], 0, sizeof(d->coeff[p + 1][b]));
+                memset(d->res->coeff[p + 1][b], 0, sizeof(d->res->coeff[p + 1][b]));
                 m->nnz[p + 1][b] = 0;
                 continue;
             }
@@ -816,9 +816,9 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
                     + 2 * cbf_vicino(d, bmb, pb, p + 1, false, intra);
             int16_t tmp[16];
             int nz = leggi_residuo(d, CAT_CHROMA_AC, 15, tmp, inc, true);
-            memset(d->coeff[p + 1][b], 0, sizeof(d->coeff[p + 1][b]));
+            memset(d->res->coeff[p + 1][b], 0, sizeof(d->res->coeff[p + 1][b]));
             for (int k = 0; k < 15; k++)
-                d->coeff[p + 1][b][h264d_zigzag4[k + 1]] = tmp[k];
+                d->res->coeff[p + 1][b][h264d_zigzag4[k + 1]] = tmp[k];
             m->nnz[p + 1][b] = (uint8_t)nz;
         }
     }
@@ -841,6 +841,7 @@ static void spacchetta_i16(int t, int *modo, int *cbp)
 
 int h264d_decode_mb_cabac(h264_decoder_t *d)
 {
+    h264d_punta_residuo(d);
     h264d_mb_t *m = &d->mbs[d->mb_idx];
     azzera_mb(m);
 
@@ -853,17 +854,12 @@ int h264d_decode_mb_cabac(h264_decoder_t *d)
             m->qpy = (int8_t)d->qpy;
             d->last_qp_delta_nonzero = 0;
 
-            /* ⚠️ A skipped macroblock never goes through the residual
-             * reader, so the coefficient scratch still holds the previous
-             * macroblock's. The luma side gets away with it because the
-             * coded block pattern is zero and the transform is skipped
-             * entirely, but the chroma DCs are written into every block
-             * unconditionally - so without this the macroblock before it
-             * tints this one. */
-            memset(d->dc_luma, 0, sizeof(d->dc_luma));
-            memset(d->dc_chroma, 0, sizeof(d->dc_chroma));
-            memset(d->coeff, 0, sizeof(d->coeff));
-            memset(d->coeff8, 0, sizeof(d->coeff8));
+            /* ⚠️ Nothing to clear, and it used to matter: a skipped
+             * macroblock never goes through the residual reader, so its
+             * slot still holds whatever used it before. The chroma DCs were
+             * once read out of it unconditionally and the macroblock before
+             * tinted this one. Reconstruction now asks coded_block_pattern
+             * first, which is the right place for the question. */
             if (bslice) {
                 /* B_Skip is B_Direct_16x16 with nothing coded at all.
                  *
@@ -876,10 +872,9 @@ int h264d_decode_mb_cabac(h264_decoder_t *d)
                 m->direct = 0xf;
                 if (h264d_direct(d, m, 0xf) != 0)
                     return 1;
-                memset(d->dc_luma, 0, sizeof(d->dc_luma));
-                memset(d->dc_chroma, 0, sizeof(d->dc_chroma));
-                memset(d->coeff, 0, sizeof(d->coeff));
-                memset(d->coeff8, 0, sizeof(d->coeff8));
+                /* âš ï¸ Nothing to zero: a macroblock with no coefficients
+                 * has its coded_block_pattern at zero, and reconstruction
+                 * reads that before it reads any residual. */
                 h264d_reconstruct_mb(d);
                 return 0;
             }
@@ -1020,6 +1015,5 @@ int h264d_decode_mb_cabac(h264_decoder_t *d)
     if (i16)
         m->ipred[0] = (int8_t)i16_modo;
 
-    h264d_reconstruct_mb(d);
     return 0;
 }

@@ -208,6 +208,7 @@ set(SOURCES
     src/h264_mc.c
     src/h264_deblock.c
     src/h264_dec_tables.c
+    src/h264_threads.c
     src/cpu_simd_me.c
     src/dynamic_governor.c
 )

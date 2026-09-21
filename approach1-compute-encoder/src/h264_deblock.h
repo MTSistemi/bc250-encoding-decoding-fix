@@ -32,6 +32,21 @@ typedef struct {
     int8_t beta_offset;
 } h264d_deblock_params_t;
 
+/* Everything the filter needs that does not change from one macroblock to
+ * the next, so that a macroblock can be filtered on its own - which is what
+ * lets a picture be filtered as a wavefront across several threads. */
+typedef struct {
+    uint8_t *y, *cb, *cr;
+    int stride_y, stride_c;
+    int mb_w, mb_h;
+    const h264d_mb_t *mbs;
+    const uint8_t *slice_of_mb;
+    const h264d_deblock_params_t *params;
+    int cqp_off, cqp_off2;
+} h264d_deblock_pic_t;
+
+void h264d_deblock_mb(const h264d_deblock_pic_t *p, int mx, int my);
+
 void h264d_deblock_picture(uint8_t *y, int stride_y,
                            uint8_t *cb, uint8_t *cr, int stride_c,
                            int mb_width, int mb_height,
