@@ -22,7 +22,8 @@ gcc -O2 -g -Wall -Wextra -std=gnu11 \
     "$D/src/h264_pred.c" \
     "$D/src/h264_mc.c" \
     "$D/src/h264_deblock.c" \
+    "$D/src/h264_threads.c" \
     "$D/src/h264_dec_tables.c" \
     "$D/src/cabac.c" \
-    -lm
+    -pthread -lm
 echo "fatto: $OUT"
