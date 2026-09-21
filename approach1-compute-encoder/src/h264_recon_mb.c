@@ -183,50 +183,78 @@ static void riferimenti16(const h264_decoder_t *d, const uint8_t *piano, int s,
             ? campione(piano, s, px - 1, py - 1) : 0;
 }
 
+
+/* âš ï¸ Looked up once. These are asked per macroblock, and getenv walks the
+ * environment every time: at 1080p that was just under 1% of the decode. */
+static const char *ambiente(const char *nome, int quale)
+{
+    static const char *valore[3];
+    static bool letto[3];
+    if (!letto[quale]) {
+        valore[quale] = getenv(nome);
+        letto[quale] = true;
+    }
+    return valore[quale];
+}
+
 /* ------------------------------------------------------ inter */
 
-/* One 4x4 luma block and its 2x2 chroma, predicted from one list into
- * tightly packed scratch blocks.
- *
- * Motion compensation is done per 4x4 rather than per partition. The
- * interpolation of 8.4.2.2 depends only on the samples around each output
- * sample, so cutting a 16x16 partition into sixteen 4x4 pieces gives exactly
- * the same picture; it just fetches more. Merging blocks that share a vector
- * is an optimisation, not a correctness matter.
- */
-static void predici_lista(h264_decoder_t *d, int b, int lista,
-                          uint8_t y4[16], uint8_t cb2[4], uint8_t cr2[4])
+/* Whether two 4x4 blocks of this macroblock move together: same reference
+ * picture, same index into the list - the weights are chosen by index - and
+ * the same vector in every list that is used. */
+static inline bool stesso_moto(const h264d_mb_t *m, int a, int b)
+{
+    const int pa = h264d_part8(a), pb = h264d_part8(b);
+    for (int l = 0; l < 2; l++) {
+        if (m->ref[l][pa] != m->ref[l][pb]) return false;
+        if (m->ref_idx[l][pa] != m->ref_idx[l][pb]) return false;
+        if (m->ref[l][pa] < 0) continue;
+        if (m->mv[l][a][0] != m->mv[l][b][0]) return false;
+        if (m->mv[l][a][1] != m->mv[l][b][1]) return false;
+    }
+    return true;
+}
+
+/* A w4 x h4 rectangle of 4x4 blocks, in 4x4 units, predicted from one list
+ * into tightly packed scratch blocks. `b` is its top-left block. */
+static void predici_lista(h264_decoder_t *d, int b, int w4, int h4, int lista,
+                          uint8_t *yb, uint8_t *cbb, uint8_t *crb)
 {
     const h264d_mb_t *m = &d->mbs[d->mb_idx];
     const int slot = m->ref[lista][h264d_part8(b)];
     const h264d_frame_t *rif = &d->dpb[slot];
     const int16_t *mv = m->mv[lista][b];
-    const int x4 = b & 3, y4i = b >> 2;
+    const int bx = b & 3, by = b >> 2;
+    const int w = w4 * 4, h = h4 * 4;
 
-    const int px = d->mb_x * 16 + x4 * 4;
-    const int py = d->mb_y * 16 + y4i * 4;
+    const int px = d->mb_x * 16 + bx * 4;
+    const int py = d->mb_y * 16 + by * 4;
 
-    uint8_t pad[(4 + 6) * (4 + 6)];
-    const uint8_t *src = h264d_mc_fetch_luma(pad, rif->y, rif->stride_y,
+    uint8_t pad[(16 + H264D_MC_PAD_BEFORE + H264D_MC_PAD_AFTER)
+                * (16 + H264D_MC_PAD_BEFORE + H264D_MC_PAD_AFTER)];
+    int ps;
+    const uint8_t *src = h264d_mc_fetch_luma(pad, &ps, rif->y, rif->stride_y,
                                              d->width, d->height,
                                              px + (mv[0] >> 2), py + (mv[1] >> 2),
-                                             4, 4);
-    h264d_mc_luma(y4, 4, src, 4 + 6, 4, 4, mv[0] & 3, mv[1] & 3);
+                                             w, h);
+    h264d_mc_luma(yb, w, src, ps, w, h, mv[0] & 3, mv[1] & 3);
 
     /* 4:2:0 chroma: the vector is the luma one, read at eighth-sample
      * accuracy over a plane at half the resolution. */
-    const int cx = d->mb_x * 8 + x4 * 2;
-    const int cy = d->mb_y * 8 + y4i * 2;
-    uint8_t cpad[(2 + 1) * (2 + 1)];
+    const int cw = w4 * 2, ch = h4 * 2;
+    const int cx = d->mb_x * 8 + bx * 2;
+    const int cy = d->mb_y * 8 + by * 2;
+    uint8_t cpad[(8 + 1) * (8 + 1)];
     const uint8_t *cs;
-    cs = h264d_mc_fetch_chroma(cpad, rif->cb, rif->stride_c,
+    int cst;
+    cs = h264d_mc_fetch_chroma(cpad, &cst, rif->cb, rif->stride_c,
                                d->width / 2, d->height / 2,
-                               cx + (mv[0] >> 3), cy + (mv[1] >> 3), 2, 2);
-    h264d_mc_chroma(cb2, 2, cs, 3, 2, 2, mv[0] & 7, mv[1] & 7);
-    cs = h264d_mc_fetch_chroma(cpad, rif->cr, rif->stride_c,
+                               cx + (mv[0] >> 3), cy + (mv[1] >> 3), cw, ch);
+    h264d_mc_chroma(cbb, cw, cs, cst, cw, ch, mv[0] & 7, mv[1] & 7);
+    cs = h264d_mc_fetch_chroma(cpad, &cst, rif->cr, rif->stride_c,
                                d->width / 2, d->height / 2,
-                               cx + (mv[0] >> 3), cy + (mv[1] >> 3), 2, 2);
-    h264d_mc_chroma(cr2, 2, cs, 3, 2, 2, mv[0] & 7, mv[1] & 7);
+                               cx + (mv[0] >> 3), cy + (mv[1] >> 3), cw, ch);
+    h264d_mc_chroma(crb, cw, cs, cst, cw, ch, mv[0] & 7, mv[1] & 7);
 }
 
 /* Clause 8.4.2.3.1, the implicit weights: they come from how far the two
@@ -263,8 +291,8 @@ static bool pesi_impliciti(const h264_decoder_t *d, int ref0, int ref1,
     return true;
 }
 
-/* One 4x4 block of an inter macroblock, however it is predicted. */
-static void compensa_blocco(h264_decoder_t *d, int b,
+/* One rectangle of an inter macroblock, however it is predicted. */
+static void compensa_blocco(h264_decoder_t *d, int b, int w4, int h4,
                             uint8_t *dy, int sdy,
                             uint8_t *dcb, uint8_t *dcr, int sdc)
 {
@@ -272,17 +300,19 @@ static void compensa_blocco(h264_decoder_t *d, int b,
     const int p8 = h264d_part8(b);
     const int r0 = m->ref_idx[0][p8], r1 = m->ref_idx[1][p8];
     const h264d_slice_t *s = &d->slice;
+    const int w = w4 * 4, h = h4 * 4;
+    const int cw = w4 * 2, ch = h4 * 2;
 
-    uint8_t y0[16], cb0[4], cr0[4];
-    uint8_t y1[16], cb1[4], cr1[4];
+    uint8_t y0[256], cb0[64], cr0[64];
+    uint8_t y1[256], cb1[64], cr1[64];
 
     const bool usa0 = r0 >= 0 && m->ref[0][p8] >= 0;
     const bool usa1 = r1 >= 0 && m->ref[1][p8] >= 0;
     if (!usa0 && !usa1)
         return;
 
-    if (usa0) predici_lista(d, b, 0, y0, cb0, cr0);
-    if (usa1) predici_lista(d, b, 1, y1, cb1, cr1);
+    if (usa0) predici_lista(d, b, w4, h4, 0, y0, cb0, cr0);
+    if (usa1) predici_lista(d, b, w4, h4, 1, y1, cb1, cr1);
 
     if (usa0 && usa1) {
         /* Clause 8.4.2.3: explicit weights when the picture parameter set
@@ -302,24 +332,24 @@ static void compensa_blocco(h264_decoder_t *d, int b,
         }
 
         if (!pesata) {
-            h264d_mc_average(dy, sdy, y0, 4, y1, 4, 4, 4);
-            h264d_mc_average(dcb, sdc, cb0, 2, cb1, 2, 2, 2);
-            h264d_mc_average(dcr, sdc, cr0, 2, cr1, 2, 2, 2);
+            h264d_mc_average(dy, sdy, y0, w, y1, w, w, h);
+            h264d_mc_average(dcb, sdc, cb0, cw, cb1, cw, cw, ch);
+            h264d_mc_average(dcr, sdc, cr0, cw, cr1, cw, cw, ch);
             return;
         }
 
-        h264d_mc_weight_bi(dy, sdy, y0, 4, y1, 4, 4, 4, denom, w0, o0, w1, o1);
+        h264d_mc_weight_bi(dy, sdy, y0, w, y1, w, w, h, denom, w0, o0, w1, o1);
         if (d->pic.weighted_bipred_idc == 1) {
             denom = s->chroma_log2_weight_denom;
-            h264d_mc_weight_bi(dcb, sdc, cb0, 2, cb1, 2, 2, 2, denom,
+            h264d_mc_weight_bi(dcb, sdc, cb0, cw, cb1, cw, cw, ch, denom,
                                s->chroma_weight[0][r0][0], s->chroma_offset[0][r0][0],
                                s->chroma_weight[1][r1][0], s->chroma_offset[1][r1][0]);
-            h264d_mc_weight_bi(dcr, sdc, cr0, 2, cr1, 2, 2, 2, denom,
+            h264d_mc_weight_bi(dcr, sdc, cr0, cw, cr1, cw, cw, ch, denom,
                                s->chroma_weight[0][r0][1], s->chroma_offset[0][r0][1],
                                s->chroma_weight[1][r1][1], s->chroma_offset[1][r1][1]);
         } else {
-            h264d_mc_weight_bi(dcb, sdc, cb0, 2, cb1, 2, 2, 2, 5, w0, 0, w1, 0);
-            h264d_mc_weight_bi(dcr, sdc, cr0, 2, cr1, 2, 2, 2, 5, w0, 0, w1, 0);
+            h264d_mc_weight_bi(dcb, sdc, cb0, cw, cb1, cw, cw, ch, 5, w0, 0, w1, 0);
+            h264d_mc_weight_bi(dcr, sdc, cr0, cw, cr1, cw, cw, ch, 5, w0, 0, w1, 0);
         }
         return;
     }
@@ -334,20 +364,20 @@ static void compensa_blocco(h264_decoder_t *d, int b,
     const bool pesata = (d->pic.weighted_pred && s->type == 0)
                      || (d->pic.weighted_bipred_idc == 1 && s->type == 1);
     if (!pesata) {
-        for (int y = 0; y < 4; y++)
-            memcpy(dy + (size_t)y * sdy, py + y * 4, 4);
-        for (int y = 0; y < 2; y++) {
-            memcpy(dcb + (size_t)y * sdc, pcb + y * 2, 2);
-            memcpy(dcr + (size_t)y * sdc, pcr + y * 2, 2);
+        for (int yy = 0; yy < h; yy++)
+            memcpy(dy + (size_t)yy * sdy, py + yy * w, (size_t)w);
+        for (int yy = 0; yy < ch; yy++) {
+            memcpy(dcb + (size_t)yy * sdc, pcb + yy * cw, (size_t)cw);
+            memcpy(dcr + (size_t)yy * sdc, pcr + yy * cw, (size_t)cw);
         }
         return;
     }
 
-    h264d_mc_weight(dy, sdy, py, 4, 4, 4, s->luma_log2_weight_denom,
+    h264d_mc_weight(dy, sdy, py, w, w, h, s->luma_log2_weight_denom,
                     s->luma_weight[lista][r], s->luma_offset[lista][r]);
-    h264d_mc_weight(dcb, sdc, pcb, 2, 2, 2, s->chroma_log2_weight_denom,
+    h264d_mc_weight(dcb, sdc, pcb, cw, cw, ch, s->chroma_log2_weight_denom,
                     s->chroma_weight[lista][r][0], s->chroma_offset[lista][r][0]);
-    h264d_mc_weight(dcr, sdc, pcr, 2, 2, 2, s->chroma_log2_weight_denom,
+    h264d_mc_weight(dcr, sdc, pcr, cw, cw, ch, s->chroma_log2_weight_denom,
                     s->chroma_weight[lista][r][1], s->chroma_offset[lista][r][1]);
 }
 
@@ -372,6 +402,11 @@ static void aggiungi_luma(h264_decoder_t *d, h264d_mb_t *m, uint8_t *y, int sy)
         uint8_t *dst = y + (size_t)((b >> 2) * 4) * sy + (b & 3) * 4;
         const bool i16 = (m->type == H264D_MB_I_16x16);
         if (!i16 && !((m->cbp >> h264d_part8(b)) & 1))
+            continue;
+        /* An all-zero block adds nothing. nnz counts the coefficients the
+         * entropy decoder actually read; for Intra_16x16 the DC arrives
+         * separately and is not in that count, so it is tested on its own. */
+        if (m->nnz[0][b] == 0 && (!i16 || d->coeff[0][b][0] == 0))
             continue;
         h264d_idct4_add(dst, sy, d->coeff[0][b], d->dequant.d4[lista4],
                         m->qpy, i16);
@@ -409,7 +444,7 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
              * which is the whole point of the second Hadamard - it
              * decorrelates DCs that are next to each other. Handing it out
              * in Z order swaps the two blocks of each 8x8 diagonal. */
-            const char *d16 = getenv("BC250_H264_DUMP16");
+            const char *d16 = ambiente("BC250_H264_DUMP16", 0);
             const int m16 = d16 ? atoi(d16) : -1;
             if (m16 == d->mb_idx) {
                 fprintf(stderr, "mb %d I16 modo %d cbp %02x qp %d%s",
@@ -467,7 +502,7 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
                 uint8_t *dst = y + (size_t)((b >> 2) * 4) * sy + (b & 3) * 4;
                 h264d_pred4x4(dst, sy, m->ipred[b], top, left, ang, at, al);
 
-                const char *dump = getenv("BC250_H264_DUMP");
+                const char *dump = ambiente("BC250_H264_DUMP", 1);
                 int dmb = -1, dbl = -1;
                 if (dump) sscanf(dump, "%d,%d", &dmb, &dbl);
                 if (dmb == d->mb_idx && dbl == b) {
@@ -520,14 +555,38 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
     } else {
         /* One list only for now; the bi-predicted case averages two of
          * these into a scratch block, which the B stage adds. */
+        /* Greedy rectangles of identical motion: as wide as the row
+         * allows, then as tall as that width allows. A 16x16 partition
+         * comes out as one call instead of sixteen, and a macroblock whose
+         * four 8x8s move differently still costs four. */
+        bool fatto[16] = { false };
         for (int b = 0; b < 16; b++) {
-            uint8_t *dy = y + (size_t)((b >> 2) * 4) * sy + (b & 3) * 4;
-            uint8_t *dcb = cb + (size_t)((b >> 2) * 2) * sc + (b & 3) * 2;
-            uint8_t *dcr = cr + (size_t)((b >> 2) * 2) * sc + (b & 3) * 2;
-            compensa_blocco(d, b, dy, sy, dcb, dcr, sc);
+            if (fatto[b]) continue;
+            const int bx = b & 3, by = b >> 2;
+            int w4 = 1;
+            while (bx + w4 < 4 && !fatto[b + w4] && stesso_moto(m, b, b + w4))
+                w4++;
+            int h4 = 1;
+            while (by + h4 < 4) {
+                bool uguale = true;
+                for (int k = 0; k < w4 && uguale; k++)
+                    uguale = !fatto[b + h4 * 4 + k]
+                          && stesso_moto(m, b, b + h4 * 4 + k);
+                if (!uguale) break;
+                h4++;
+            }
+
+            uint8_t *dy = y + (size_t)(by * 4) * sy + bx * 4;
+            uint8_t *dcb = cb + (size_t)(by * 2) * sc + bx * 2;
+            uint8_t *dcr = cr + (size_t)(by * 2) * sc + bx * 2;
+            compensa_blocco(d, b, w4, h4, dy, sy, dcb, dcr, sc);
+
+            for (int j = 0; j < h4; j++)
+                for (int k = 0; k < w4; k++)
+                    fatto[b + j * 4 + k] = true;
         }
 
-        const char *di = getenv("BC250_H264_DUMPI");
+        const char *di = ambiente("BC250_H264_DUMPI", 2);
         const int mi = di ? atoi(di) : -1;
         if (mi == d->mb_idx) {
             fprintf(stderr, "mb %d inter t8 %d cbp %02x qp %d mv %d,%d rif %d%s",
@@ -584,10 +643,14 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
         if ((m->cbp >> 4) != 0)
             h264d_chroma_dc_transform(d->dc_chroma[p], qpc, dqc->d4[lista_c][0]);
 
-        /* Every block runs even with no chroma residual: its DC may still be
-         * non-zero, and with an all-zero block the transform adds nothing. */
+        /* A block whose DC and AC are both zero adds nothing, and a
+         * macroblock with no chroma residual at all is the common case:
+         * without this every one of them ran eight inverse transforms over
+         * zeros. */
         for (int b = 0; b < 4; b++) {
             d->coeff[p + 1][b][0] = d->dc_chroma[p][b];
+            if (m->nnz[p + 1][b] == 0 && d->dc_chroma[p][b] == 0)
+                continue;
             uint8_t *dst = piano + (size_t)((b >> 1) * 4) * sc + (b & 1) * 4;
             h264d_idct4_add(dst, sc, d->coeff[p + 1][b], dqc->d4[lista_c],
                             qpc, true);

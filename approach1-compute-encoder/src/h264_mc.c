@@ -42,12 +42,24 @@ static inline int media(int a, int b) { return (a + b + 1) >> 1; }
 
 /* -------------------------------------------------------------- fetching */
 
-uint8_t *h264d_mc_fetch_luma(uint8_t *dst, const uint8_t *plane, int stride,
-                             int plane_w, int plane_h,
-                             int x, int y, int w, int h)
+const uint8_t *h264d_mc_fetch_luma(uint8_t *dst, int *out_stride,
+                                   const uint8_t *plane, int stride,
+                                   int plane_w, int plane_h,
+                                   int x, int y, int w, int h)
 {
+    /* The filter reads x-2 .. x+w-1+4 and the same vertically. When all of
+     * that is inside the plane there is nothing to copy: the caller can
+     * read the plane where it stands. */
+    if (x >= H264D_MC_PAD_BEFORE && y >= H264D_MC_PAD_BEFORE
+        && x + w + H264D_MC_PAD_AFTER <= plane_w
+        && y + h + H264D_MC_PAD_AFTER <= plane_h) {
+        *out_stride = stride;
+        return plane + (size_t)y * stride + x;
+    }
+
     const int pw = w + H264D_MC_PAD_BEFORE + H264D_MC_PAD_AFTER;
     const int ph = h + H264D_MC_PAD_BEFORE + H264D_MC_PAD_AFTER;
+    *out_stride = pw;
     for (int j = 0; j < ph; j++) {
         int sy = y - H264D_MC_PAD_BEFORE + j;
         sy = sy < 0 ? 0 : (sy >= plane_h ? plane_h - 1 : sy);
@@ -62,11 +74,18 @@ uint8_t *h264d_mc_fetch_luma(uint8_t *dst, const uint8_t *plane, int stride,
     return dst + H264D_MC_PAD_BEFORE * pw + H264D_MC_PAD_BEFORE;
 }
 
-uint8_t *h264d_mc_fetch_chroma(uint8_t *dst, const uint8_t *plane, int stride,
-                               int plane_w, int plane_h,
-                               int x, int y, int w, int h)
+const uint8_t *h264d_mc_fetch_chroma(uint8_t *dst, int *out_stride,
+                                     const uint8_t *plane, int stride,
+                                     int plane_w, int plane_h,
+                                     int x, int y, int w, int h)
 {
+    if (x >= 0 && y >= 0 && x + w < plane_w && y + h < plane_h) {
+        *out_stride = stride;
+        return plane + (size_t)y * stride + x;
+    }
+
     const int pw = w + 1;
+    *out_stride = pw;
     for (int j = 0; j <= h; j++) {
         int sy = y + j;
         sy = sy < 0 ? 0 : (sy >= plane_h ? plane_h - 1 : sy);
@@ -216,6 +235,15 @@ void h264d_mc_average(uint8_t *dst, int ds, const uint8_t *a, int as,
 void h264d_mc_weight(uint8_t *dst, int ds, const uint8_t *src, int ss,
                      int w, int h, int log2_denom, int weight, int offset)
 {
+    /* âš ï¸ Exactly a copy, not nearly one: with weight = 1 << denom and no
+     * offset, ((src << denom) + (1 << (denom - 1))) >> denom is src for
+     * every src. x264's weightp leaves most references here. */
+    if (weight == (1 << log2_denom) && offset == 0) {
+        for (int y = 0; y < h; y++)
+            memcpy(dst + (size_t)y * ds, src + (size_t)y * ss, (size_t)w);
+        return;
+    }
+
     for (int y = 0; y < h; y++) {
         const uint8_t *r = src + (size_t)y * ss;
         uint8_t *o = dst + (size_t)y * ds;
@@ -237,6 +265,15 @@ void h264d_mc_weight_bi(uint8_t *dst, int ds,
                         const uint8_t *a, int as, const uint8_t *b, int bs,
                         int w, int h, int log2_denom, int w0, int o0, int w1, int o1)
 {
+    /* Likewise exactly the average: two equal weights of 1 << denom with
+     * no offset collapse to (a + b + 1) >> 1. Implicit bi-prediction lands
+     * here whenever the two references sit symmetrically around this
+     * picture, which in a regular B structure is most of the time. */
+    if (w0 == (1 << log2_denom) && w1 == w0 && o0 == 0 && o1 == 0) {
+        h264d_mc_average(dst, ds, a, as, b, bs, w, h);
+        return;
+    }
+
     const int off = (o0 + o1 + 1) >> 1;
     for (int y = 0; y < h; y++) {
         const uint8_t *ra = a + (size_t)y * as;

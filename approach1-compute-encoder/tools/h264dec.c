@@ -31,6 +31,16 @@
 #include "decoder_h264.h"
 #include "bitreader.h"
 #include "h264_dec_tables.h"   /* the two zig-zag scans, for the scaling lists */
+#include <time.h>
+
+/* Nanoseconds on a clock that does not jump. */
+static uint64_t adesso(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
+}
+static uint64_t tempo_decodifica = 0;
 
 /* The harness runs the decoder with no GPU context, so end_picture keeps the
  * planes instead of uploading them. The upload is still referenced from the
@@ -732,7 +742,9 @@ int main(int argc, char **argv)
                 corrente_riferimento = 0;
             }
             if (in_corso) {
-                h264_decoder_end_picture(dec, (gpu_image_t){0}, (gpu_memory_t){0});
+                { const uint64_t te = adesso();
+                  h264_decoder_end_picture(dec, (gpu_image_t){0}, (gpu_memory_t){0});
+                  tempo_decodifica += adesso() - te; }
                 h264d_frame_t *f = h264_decoder_frame_for(dec, superficie_corrente);
                 if (f) {
                     scrivi(fo, f, sp);
@@ -924,8 +936,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "\n");
         }
 
+        const uint64_t t0 = adesso();
         const int r = h264_decoder_slice(dec, &sl, buf + inizio,
                                         (size_t)(fine - inizio), bit_offset);
+        tempo_decodifica += adesso() - t0;
         if (r) {
             fprintf(stderr, "slice rifiutata (%d) al macroblocco %d del "
                             "fotogramma %d\n", r, first_mb, fotogrammi);
@@ -950,7 +964,9 @@ int main(int argc, char **argv)
     }
 
     if (in_corso && dec) {
-        h264_decoder_end_picture(dec, (gpu_image_t){0}, (gpu_memory_t){0});
+        { const uint64_t te = adesso();
+          h264_decoder_end_picture(dec, (gpu_image_t){0}, (gpu_memory_t){0});
+          tempo_decodifica += adesso() - te; }
         h264d_frame_t *f = h264_decoder_frame_for(dec, superficie_corrente);
         if (f) {
             const sps_t *sp = NULL;
@@ -968,5 +984,10 @@ int main(int argc, char **argv)
     free(buf);
     free(rbsp);
     printf("%d fotogrammi decodificati, %d slice rifiutate\n", fotogrammi, saltati);
+    if (fotogrammi > 0) {
+        const double ms = (double)tempo_decodifica / 1e6;
+        fprintf(stderr, "decodifica: %.1f ms, %.2f ms/fotogramma, %.1f fps\n",
+                ms, ms / fotogrammi, 1000.0 * fotogrammi / ms);
+    }
     return saltati ? 5 : 0;
 }

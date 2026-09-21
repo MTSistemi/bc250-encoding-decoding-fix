@@ -23,19 +23,27 @@
 #define H264D_MC_PAD_BEFORE 2
 #define H264D_MC_PAD_AFTER  4
 
-/* Copy a w x h block out of a reference plane into `dst`, with
- * H264D_MC_PAD_BEFORE samples before and H264D_MC_PAD_AFTER after in each
- * direction, clamping to the edge of the plane. `dst` is (w + 6) * (h + 6)
- * and the returned pointer is its integer-sample origin. */
-uint8_t *h264d_mc_fetch_luma(uint8_t *dst, const uint8_t *plane, int stride,
-                             int plane_w, int plane_h,
-                             int x, int y, int w, int h);
+/* Make a w x h block of a reference plane readable with
+ * H264D_MC_PAD_BEFORE samples before it and H264D_MC_PAD_AFTER after, in
+ * both directions. Returns the integer-sample origin and writes the stride
+ * to read it at into *out_stride.
+ *
+ * âš ï¸ The result may point into the plane itself rather than into `dst`.
+ * A block whose padded region is entirely inside the picture needs no copy
+ * at all - the samples are already there - and at 1080p that is almost
+ * every block. `dst` must still be (w + 6) * (h + 6), for the ones that
+ * do reach an edge, where the edge sample is replicated outwards. */
+const uint8_t *h264d_mc_fetch_luma(uint8_t *dst, int *out_stride,
+                                   const uint8_t *plane, int stride,
+                                   int plane_w, int plane_h,
+                                   int x, int y, int w, int h);
 
-/* Chroma needs one sample after, for the bilinear filter. `dst` is
- * (w + 1) * (h + 1). */
-uint8_t *h264d_mc_fetch_chroma(uint8_t *dst, const uint8_t *plane, int stride,
-                               int plane_w, int plane_h,
-                               int x, int y, int w, int h);
+/* The same for chroma, which the bilinear filter reads one sample past in
+ * each direction. `dst` is (w + 1) * (h + 1). */
+const uint8_t *h264d_mc_fetch_chroma(uint8_t *dst, int *out_stride,
+                                     const uint8_t *plane, int stride,
+                                     int plane_w, int plane_h,
+                                     int x, int y, int w, int h);
 
 /* Clause 8.4.2.2.1. `src` points at the integer sample inside a padded
  * block; `xfrac` and `yfrac` are the quarter-sample parts of the motion
