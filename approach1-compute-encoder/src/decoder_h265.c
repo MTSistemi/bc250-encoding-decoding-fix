@@ -321,6 +321,16 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
     uint8_t istantanea[HEVCD_CTX];
     bool ho_istantanea = false;
 
+    /* ⚠️ Only a slice that starts at the first unit and carries one entry
+     * point per row: anything else - a slice segment starting mid picture,
+     * tiles, a header that does not say where the rows are - is walked one
+     * unit at a time rather than guessed at. */
+    if (wpp && sl->segment_address == 0 && sps->ctb_height >= 2
+        && sl->num_entry_point_offsets == sps->ctb_height - 1) {
+        const int e = hevcd_wavefront(d, sps, pps, sl, base, resto, init_type);
+        if (e >= 0) return e;
+    }
+
     const int quanti = sps->ctb_count;
     int fatti = 0;
     for (int addr = sl->segment_address; addr < quanti; addr++) {

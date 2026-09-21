@@ -175,6 +175,13 @@ static int modo_croma(int idx, int luma)
     return (base[idx] == luma) ? 34 : base[idx];
 }
 
+/* ⚠️ Rows are decoded at the same time under wavefront parallelism, and
+ * a block's bottom edge lands in a cell the row below is also writing to.
+ * One byte, two writers, and a plain read-modify-write loses whichever
+ * bit arrived first. */
+#define METTI_BORDO(i, bit) \
+    __atomic_fetch_or(&d->bordi[i], (uint8_t)(bit), __ATOMIC_RELAXED)
+
 /* 8.7.2.2: this block's left and top edges are block boundaries, and the
  * deblocking filter is allowed to cross them.
  *
@@ -198,10 +205,10 @@ static void segna_bordi(hevcd_t *d, int x0, int y0, int log2_size,
 
     if ((x0 & 7) == 0)
         for (int j = 0; j < lato; j += 8)
-            d->bordi[((y0 + j) >> 3) * passo + (x0 >> 3)] |= v;
+            METTI_BORDO(((y0 + j) >> 3) * passo + (x0 >> 3), v);
     if ((y0 & 7) == 0)
         for (int i = 0; i < lato; i += 8)
-            d->bordi[(y0 >> 3) * passo + ((x0 + i) >> 3)] |= o;
+            METTI_BORDO((y0 >> 3) * passo + ((x0 + i) >> 3), o);
 
     /* ⚠️ And the far side too. A block's right edge is its neighbour's
      * left one and the neighbour marks it - unless the neighbour has no
@@ -212,10 +219,10 @@ static void segna_bordi(hevcd_t *d, int x0, int y0, int log2_size,
     const int xf = x0 + lato, yf = y0 + lato;
     if ((xf & 7) == 0 && xf < d->sps->width)
         for (int j = 0; j < lato; j += 8)
-            d->bordi[((y0 + j) >> 3) * passo + (xf >> 3)] |= v;
+            METTI_BORDO(((y0 + j) >> 3) * passo + (xf >> 3), v);
     if ((yf & 7) == 0 && yf < d->sps->height)
         for (int i = 0; i < lato; i += 8)
-            d->bordi[(yf >> 3) * passo + ((x0 + i) >> 3)] |= o;
+            METTI_BORDO((yf >> 3) * passo + ((x0 + i) >> 3), o);
 }
 
 /* The same, for a rectangle: a prediction unit's own edges. 8.7.2.2
@@ -230,10 +237,10 @@ static void segna_bordi_rett(hevcd_t *d, int x0, int y0, int w, int h)
     const int passo = d->bordi_passo;
     if ((x0 & 7) == 0)
         for (int j = 0; j < h; j += 8)
-            d->bordi[((y0 + j) >> 3) * passo + (x0 >> 3)] |= 1;
+            METTI_BORDO(((y0 + j) >> 3) * passo + (x0 >> 3), 1);
     if ((y0 & 7) == 0)
         for (int i = 0; i < w; i += 8)
-            d->bordi[(y0 >> 3) * passo + ((x0 + i) >> 3)] |= 2;
+            METTI_BORDO((y0 >> 3) * passo + ((x0 + i) >> 3), 2);
 }
 
 /* Which smallest transform blocks carry a luma residual. */

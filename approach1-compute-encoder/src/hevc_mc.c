@@ -42,43 +42,108 @@ static inline int campione(const uint8_t *p, int passo, int w, int h,
  *
  * `prima` is how far back the filter reaches: three samples for the eight
  * taps of luma, one for the four of chroma. */
+/* One pass of the filter across a rectangle, reading whole samples along
+ * a row.
+ *
+ * ⚠️ The tap count is a compile time constant in each instance. With it
+ * in a variable the compiler keeps neither the eight coefficients in
+ * registers nor any chance of doing several samples at once, and this is
+ * three quarters of the decoder's time. */
+#define ORIZZONTALE(nome, N)                                               \
+static void nome(const uint8_t *src, int sp, int w, int h,                 \
+                 const int8_t *f, int16_t *fuori, int pf)                  \
+{                                                                          \
+    for (int r = 0; r < h; r++) {                                          \
+        const uint8_t *s = src + (size_t)r * sp;                           \
+        int16_t *o = fuori + (size_t)r * pf;                               \
+        for (int c = 0; c < w; c++) {                                      \
+            int v = 0;                                                     \
+            for (int k = 0; k < N; k++) v += f[k] * s[c + k];              \
+            o[c] = (int16_t)v;                                             \
+        }                                                                  \
+    }                                                                      \
+}
+
+/* The same down a column. `TIPO` is whole samples on the way in and the
+ * fourteen-bit output of a horizontal pass on the way back, `GIU` the
+ * shift that takes the second pass back to fourteen bits. */
+#define VERTICALE(nome, N, TIPO, GIU)                                      \
+static void nome(const TIPO *src, int sp, int w, int h,                    \
+                 const int8_t *f, int16_t *fuori, int pf)                  \
+{                                                                          \
+    for (int r = 0; r < h; r++) {                                          \
+        const TIPO *s = src + (size_t)r * sp;                              \
+        int16_t *o = fuori + (size_t)r * pf;                               \
+        for (int c = 0; c < w; c++) {                                      \
+            int v = 0;                                                     \
+            for (int k = 0; k < N; k++) v += f[k] * s[(size_t)k * sp + c]; \
+            o[c] = (int16_t)(v >> (GIU));                                  \
+        }                                                                  \
+    }                                                                      \
+}
+
+ORIZZONTALE(oriz8, 8)
+ORIZZONTALE(oriz4, 4)
+VERTICALE(vert8, 8, uint8_t, 0)
+VERTICALE(vert4, 4, uint8_t, 0)
+VERTICALE(vert8_16, 8, int16_t, 6)
+VERTICALE(vert4_16, 4, int16_t, 6)
+
 static void interpola(const uint8_t *rif, int passo, int w_pic, int h_pic,
                       int x, int y, int w, int h, int fx, int fy,
                       const int8_t *filtro, int quanti, int prima,
                       int16_t *fuori, int passo_fuori)
 {
-    if (!fx && !fy) {
-        for (int r = 0; r < h; r++)
-            for (int c = 0; c < w; c++)
-                fuori[r * passo_fuori + c] = (int16_t)
-                    (campione(rif, passo, w_pic, h_pic, x + c, y + r) << 6);
-        return;
-    }
-
     const int8_t *fh = filtro + (size_t)fx * quanti;
     const int8_t *fv = filtro + (size_t)fy * quanti;
 
-    if (!fy) {
+    /* The rectangle of whole samples the passes will read: as far back as
+     * the filter reaches, and only in the directions it actually filters. */
+    const int px = fx ? prima : 0, tx = fx ? quanti : 1;
+    const int py = fy ? prima : 0, ty = fy ? quanti : 1;
+    const int bx = x - px, by = y - py;
+    const int bw = w + tx - 1, bh = h + ty - 1;
+
+    /* ⚠️ A motion vector may point off the edge of the reference picture,
+     * and legitimately: an object entering the frame was not there before.
+     * The edge sample is repeated outwards rather than the fetch being
+     * refused - but deciding that once per tap, eight times per sample,
+     * is what made this the slowest thing in the decoder. Decide it once
+     * per block instead: either the whole window is inside the picture and
+     * the filter reads it where it lies, or the window is copied out once
+     * with its edges repeated and the filter reads the copy. */
+    const uint8_t *src;
+    int sp;
+    uint8_t orlo[(LATO_MAX + 7) * (LATO_MAX + 7)];
+    if (bx >= 0 && by >= 0 && bx + bw <= w_pic && by + bh <= h_pic) {
+        src = rif + (size_t)by * passo + bx;
+        sp = passo;
+    } else {
+        sp = LATO_MAX + 7;
+        for (int r = 0; r < bh; r++)
+            for (int c = 0; c < bw; c++)
+                orlo[(size_t)r * sp + c] = (uint8_t)
+                    campione(rif, passo, w_pic, h_pic, bx + c, by + r);
+        src = orlo;
+    }
+
+    if (!fx && !fy) {
         for (int r = 0; r < h; r++)
-            for (int c = 0; c < w; c++) {
-                int s = 0;
-                for (int k = 0; k < quanti; k++)
-                    s += fh[k] * campione(rif, passo, w_pic, h_pic,
-                                          x + c - prima + k, y + r);
-                fuori[r * passo_fuori + c] = (int16_t)s;
-            }
+            for (int c = 0; c < w; c++)
+                fuori[r * passo_fuori + c] =
+                    (int16_t)(src[(size_t)r * sp + c] << 6);
+        return;
+    }
+
+    if (!fy) {
+        if (quanti == 8) oriz8(src, sp, w, h, fh, fuori, passo_fuori);
+        else             oriz4(src, sp, w, h, fh, fuori, passo_fuori);
         return;
     }
 
     if (!fx) {
-        for (int r = 0; r < h; r++)
-            for (int c = 0; c < w; c++) {
-                int s = 0;
-                for (int k = 0; k < quanti; k++)
-                    s += fv[k] * campione(rif, passo, w_pic, h_pic,
-                                          x + c, y + r - prima + k);
-                fuori[r * passo_fuori + c] = (int16_t)s;
-            }
+        if (quanti == 8) vert8(src, sp, w, h, fv, fuori, passo_fuori);
+        else             vert4(src, sp, w, h, fv, fuori, passo_fuori);
         return;
     }
 
@@ -86,22 +151,13 @@ static void interpola(const uint8_t *rif, int passo, int w_pic, int h_pic,
      * the vertical pass to have something to stand on. */
     int16_t mezzo[(LATO_MAX + 7) * LATO_MAX];
     const int alte = h + quanti - 1;
-    for (int r = 0; r < alte; r++)
-        for (int c = 0; c < w; c++) {
-            int s = 0;
-            for (int k = 0; k < quanti; k++)
-                s += fh[k] * campione(rif, passo, w_pic, h_pic,
-                                      x + c - prima + k, y + r - prima);
-            mezzo[r * LATO_MAX + c] = (int16_t)s;
-        }
-
-    for (int r = 0; r < h; r++)
-        for (int c = 0; c < w; c++) {
-            int s = 0;
-            for (int k = 0; k < quanti; k++)
-                s += fv[k] * mezzo[(r + k) * LATO_MAX + c];
-            fuori[r * passo_fuori + c] = (int16_t)(s >> 6);
-        }
+    if (quanti == 8) {
+        oriz8(src, sp, w, alte, fh, mezzo, LATO_MAX);
+        vert8_16(mezzo, LATO_MAX, w, h, fv, fuori, passo_fuori);
+    } else {
+        oriz4(src, sp, w, alte, fh, mezzo, LATO_MAX);
+        vert4_16(mezzo, LATO_MAX, w, h, fv, fuori, passo_fuori);
+    }
 }
 
 /* ------------------------------------- fourteen bits back down to eight */
@@ -165,7 +221,10 @@ void hevcd_predici_inter(hevcd_t *d, int x0, int y0, int w, int h,
                          const hevcd_mvf_t *m)
 {
     const hevc_sps_t *sps = d->sps;
-    static int16_t p[2][LATO_MAX * LATO_MAX];
+    /* ⚠️ On the stack, not static. Sixteen kilobytes is nothing and one
+     * shared buffer would be one prediction handed to whichever row asked
+     * last. */
+    int16_t p[2][LATO_MAX * LATO_MAX];
     const bool usa[2] = { (m->pred_flag & HEVCD_PF_L0) != 0,
                           (m->pred_flag & HEVCD_PF_L1) != 0 };
     const bool pesi = pesato(d);

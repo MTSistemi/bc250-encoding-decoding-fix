@@ -196,6 +196,13 @@ typedef struct {
  * non-zero when the slice cannot go on. */
 int hevcd_leggi_ctu(hevcd_t *d, int x0, int y0);
 
+/* Several coding tree block rows at once, when the stream was written to
+ * allow it. Returns the same reasons as the serial walk, or -1 when this
+ * slice is not one it can split up. */
+int hevcd_wavefront(hevcd_t *d, const hevc_sps_t *sps, const hevc_pps_t *pps,
+                    const hevc_slice_t *sl, const uint8_t *base, size_t resto,
+                    int init_type);
+
 /* 8.7.2 and 8.7.3, over the whole finished picture, in that order. */
 void hevcd_deblocca(hevcd_t *d);
 void hevcd_sao(hevcd_t *d);
