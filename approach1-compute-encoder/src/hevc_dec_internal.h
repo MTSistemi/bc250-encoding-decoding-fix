@@ -60,7 +60,18 @@ typedef struct {
      * may or may not have come first. */
     int32_t *min_tb_addr_zs;
     int8_t *qp_y_map;               /* per min coding block */
-    size_t n_ct_depth, n_intra_mode, n_zs, n_qp;
+    /* Which 8x8 cells of the picture have a block boundary on their left
+     * edge (bit 0) and on their top edge (bit 1). The deblocking filter
+     * only ever looks at that grid, so a transform block boundary at four
+     * samples is not one of these: it is a boundary the filter is not
+     * allowed to cross. */
+    uint8_t *bordi;
+    int bordi_passo;
+    size_t n_bordi;
+    /* Per min coding block: a unit whose samples the loop filters must
+     * leave exactly as they are. Lossless coding, today. */
+    uint8_t *no_filtro;
+    size_t n_ct_depth, n_intra_mode, n_zs, n_qp, n_no_filtro;
     int min_pu_width, min_pu_height;
 
     /* The coding unit being read. */
@@ -102,6 +113,9 @@ typedef struct {
 /* Reading one coding tree unit and everything inside it. Returns 0, or
  * non-zero when the slice cannot go on. */
 int hevcd_leggi_ctu(hevcd_t *d, int x0, int y0);
+
+/* 8.7.2, over the whole finished picture. */
+void hevcd_deblocca(hevcd_t *d);
 
 /* residual_coding(), clause 7.3.8.11. The coefficients land in d->coeff,
  * in raster order inside the transform block. */

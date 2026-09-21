@@ -155,6 +155,28 @@ static int modo_croma(int idx, int luma)
     return (base[idx] == luma) ? 34 : base[idx];
 }
 
+/* 8.7.2.2: this block's left and top edges are block boundaries, and the
+ * deblocking filter is allowed to cross them.
+ *
+ * ⚠️ Only edges that fall on the eight-sample grid count. A transform
+ * block boundary four samples in is a real boundary and the filter still
+ * ignores it: filtering on a four grid would leave no unfiltered sample
+ * anywhere, since the filter reaches four samples each way.
+ */
+static void segna_bordi(hevcd_t *d, int x0, int y0, int log2_size)
+{
+    if (!d->bordi) return;
+    const int lato = 1 << log2_size;
+    const int passo = d->bordi_passo;
+
+    if ((x0 & 7) == 0)
+        for (int j = 0; j < lato; j += 8)
+            d->bordi[((y0 + j) >> 3) * passo + (x0 >> 3)] |= 1;
+    if ((y0 & 7) == 0)
+        for (int i = 0; i < lato; i += 8)
+            d->bordi[(y0 >> 3) * passo + ((x0 + i) >> 3)] |= 2;
+}
+
 /* ------------------------------------------------------- transform units */
 
 static void leggi_qp_delta(hevcd_t *d)
@@ -372,6 +394,7 @@ static void leggi_albero_trasformate(hevcd_t *d, int x0, int y0,
     if (d->cu.pred_mode == HEVCD_MODE_INTRA || depth != 0 || cbf_cb || cbf_cr)
         cbf_luma = hevcd_bin(c, HEVCD_CTX_CBF_LUMA + (depth == 0 ? 1 : 0)) != 0;
 
+    segna_bordi(d, x0, y0, log2_size);
     leggi_tu(d, x0, y0, x_base, y_base, log2_size, depth, blk,
              cbf_luma, cbf_cb, cbf_cr);
 }
@@ -524,7 +547,17 @@ static void leggi_quadtree(hevcd_t *d, int x0, int y0, int log2_size, int depth)
                 d->ct_depth[py * passo + px] = (uint8_t)depth;
         }
 
+    segna_bordi(d, x0, y0, log2_size);
     leggi_cu(d, x0, y0, log2_size);
+
+    if (d->no_filtro && d->cu.transquant_bypass)
+        for (int j = 0; j < n; j++)
+            for (int i = 0; i < n; i++) {
+                const int px = (x0 >> sps->log2_min_cb) + i;
+                const int py = (y0 >> sps->log2_min_cb) + j;
+                if (px < sps->min_cb_width && py < sps->min_cb_height)
+                    d->no_filtro[py * passo + px] = 1;
+            }
 
     /* And what parameter it ended up with, for the groups that come after
      * and, later, for the deblocking filter. */

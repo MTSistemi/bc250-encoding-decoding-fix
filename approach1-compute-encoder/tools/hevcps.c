@@ -112,8 +112,12 @@ static int apri_immagine(hevcd_t *d, const hevc_sps_t *sps)
 
 /* Cropped on the way out: the coded picture is a whole number of smallest
  * coding blocks and the visible one is not. */
-static void scrivi_immagine(FILE *f, const hevcd_t *d, const hevc_sps_t *sps)
+static void scrivi_immagine(FILE *f, hevcd_t *d, const hevc_sps_t *sps)
 {
+    /* ⚠️ The loop filters run here and not at the end of each slice: 8.7.2
+     * is defined over the whole picture, and an edge between two coding
+     * tree units cannot be filtered until both of them exist. */
+    if (d->slice) hevcd_deblocca(d);
     if (!f) return;
     const int x0 = sps->crop_left, y0 = sps->crop_top;
     const int w = sps->width - sps->crop_left - sps->crop_right;
@@ -167,6 +171,20 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
         d->intra_mode = calloc(serve_pu, 1);
         d->n_intra_mode = serve_pu;
     }
+    const size_t serve_bordi = (size_t)((sps->width + 7) >> 3)
+                            * (size_t)((sps->height + 7) >> 3);
+    if (!d->bordi || d->n_bordi < serve_bordi) {
+        free(d->bordi);
+        d->bordi = calloc(serve_bordi, 1);
+        d->n_bordi = serve_bordi;
+    }
+    if (!d->no_filtro || d->n_no_filtro < serve_cb) {
+        free(d->no_filtro);
+        d->no_filtro = calloc(serve_cb, 1);
+        d->n_no_filtro = serve_cb;
+    }
+    if (!d->bordi || !d->no_filtro) return 5;
+    d->bordi_passo = (sps->width + 7) >> 3;
     if (!d->qp_y_map || d->n_qp < serve_cb) {
         free(d->qp_y_map);
         d->qp_y_map = calloc(serve_cb, 1);
@@ -174,6 +192,8 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
     }
     if (!d->ct_depth || !d->intra_mode || !d->qp_y_map) return 5;
     memset(d->ct_depth, 0, serve_cb);
+    memset(d->bordi, 0, serve_bordi);
+    memset(d->no_filtro, 0, serve_cb);
     memset(d->intra_mode, HEVCD_INTRA_DC, serve_pu);
 
     d->sps = sps;
@@ -312,6 +332,7 @@ int main(int argc, char **argv)
     FILE *fo = uscita ? fopen(uscita, "wb") : NULL;
     if (uscita && !fo) { perror(uscita); return 2; }
     bool immagine_aperta = false;
+    hevc_slice_t ultima_slice;
 
     for (long i = 0; i + 3 < len; ) {
         /* Find the start code, then the next one. */
@@ -460,7 +481,12 @@ int main(int argc, char **argv)
                 } else if (e) {
                     slice_perse++;
                     if (!zitto) printf("     ^ %s\n", motivo_slice(e));
-                } else { slice_lette++; immagine_aperta = true; }
+                } else {
+                    slice_lette++;
+                    immagine_aperta = true;
+                    ultima_slice = s;
+                    dec->slice = &ultima_slice;
+                }
             }
         }
     }
@@ -481,7 +507,7 @@ int main(int argc, char **argv)
            slice_lette, slice_saltate, slice_perse);
     free(buf); free(rbsp); free(sps); free(pps); free(poc_visti);
     free(dec->ct_depth); free(dec->intra_mode); free(dec->min_tb_addr_zs);
-    free(dec->qp_y_map);
+    free(dec->qp_y_map); free(dec->bordi); free(dec->no_filtro);
     for (int k = 0; k < 3; k++) free(dec->piano[k]);
     free(dec);
     return (rifiutate || gruppi_rotti || slice_perse) ? 1 : 0;

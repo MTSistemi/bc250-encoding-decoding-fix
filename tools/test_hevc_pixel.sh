@@ -9,15 +9,17 @@
 # useful pass mark is "identical", and any difference at all is a bug
 # however small it looks.
 #
-# ⚠️ deblock=false, not deblock=0. The second sets the filter's offsets to
-# zero and leaves it running, which is a different thing entirely and the
-# reason a first round of these comparisons looked like a prediction bug:
-# every difference sat on an eight-sample boundary, which is the
-# deblocking grid. x264 has the same trap with -x264-params deblock=0, so
-# it is worth knowing twice.
+# ⚠️ sao=0, for now. Sample adaptive offset is the one part of the
+# decoding loop still missing, so it is turned off in the streams rather
+# than ignored in the comparison. Deblocking is on: it was off here while
+# it was being written, and leaving it off afterwards would have meant a
+# suite that says yes without looking.
 #
-# ⚠️ sao=0 as well, for now. Both filters come next; until then they are
-# turned off in the streams rather than ignored in the comparison.
+# ⚠️ To turn deblocking off in x265 the switch is deblock=false. deblock=0
+# sets the filter's beta and tC offsets to zero and leaves it running,
+# which is a different thing entirely: it cost half an hour of chasing
+# differences that all sat on eight-sample boundaries and looked like a
+# prediction bug. x264 has the same trap with -x264-params deblock=0.
 set -u
 BIN="${1:-/tmp/hevcps}"
 T=$(mktemp -d)
@@ -34,7 +36,7 @@ prova() {
     local guasti="" dimensione="" wpp
     for wpp in 0 1; do
         ffmpeg -v error -y -f lavfi -i "$sorgente" -frames:v 1 -c:v libx265 \
-               -x265-params "log-level=none:sao=0:deblock=false:wpp=$wpp:$parametri" \
+               -x265-params "log-level=none:sao=0:wpp=$wpp:$parametri" \
                -pix_fmt yuv420p -f hevc "$T/s.265" 2>/dev/null
         if [ ! -s "$T/s.265" ]; then
             guasti="$guasti wpp=$wpp:nessun-flusso"
@@ -101,6 +103,18 @@ prova "aq forte" "$S2" "aq-mode=2:aq-strength=1.5:qp=28"
 prova "rdoq spento" "$S1" "rdoq-level=0:qp=28"
 prova "psy-rd forte" "$S1" "psy-rd=4.0:qp=28"
 prova "senza perdite" "$S1" "lossless=1"
+
+echo
+echo "il filtro di deblocking"
+prova "filtro spento" "$S1" "qp=28:deblock=false"
+prova "scostamenti +3/+3" "$S1" "qp=28:deblock=3,3"
+prova "scostamenti -3/-3" "$S1" "qp=28:deblock=-3,-3"
+prova "scostamenti +6/-6" "$S1" "qp=28:deblock=6,-6"
+prova "scostamenti -6/+6" "$S1" "qp=28:deblock=-6,6"
+prova "filtro a qp alto" "$S1" "qp=48"
+prova "filtro a qp basso" "$S1" "qp=6"
+prova "filtro con CTU 16" "$S1" "qp=34:ctu=16"
+prova "filtro con TU 4" "$S1" "qp=34:max-tu-size=4"
 
 echo
 # ⚠️ Rate control is where the quantisation parameter stops standing still.

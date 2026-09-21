@@ -16,6 +16,7 @@ gcc -O2 -g -Wall -Wextra -std=gnu11 \
     "$D/src/hevc_residual.c" \
     "$D/src/hevc_transform.c" \
     "$D/src/hevc_pred.c" \
+    "$D/src/hevc_filter.c" \
     "$D/src/hevc_dec_tables.c" \
     "$D/src/cabac.c" \
     -lm
