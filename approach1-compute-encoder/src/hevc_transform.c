@@ -18,6 +18,9 @@
 #include "hevc_dec_internal.h"
 
 #include <string.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 static inline int ritaglia16(int v)
 {
@@ -54,10 +57,56 @@ void hevcd_dequantizza(int16_t *coeff, int log2_size, int qp)
 static void linea(const int16_t *src, int passo, int32_t *fuori, int n)
 {
     const int salto = 32 / n;
+
+    /* Which inputs are not zero, and which matrix row each one reaches
+     * for. Everything else contributes nothing to any output. */
+    const int8_t *riga_m[32];
+    int val[32];
+    int quanti = 0;
+    for (int k = 0; k < n; k++) {
+        const int c = src[k * passo];
+        if (!c) continue;
+        val[quanti] = c;
+        riga_m[quanti] = hevcd_dct[k * salto];
+        quanti++;
+    }
+    if (!quanti) {
+        memset(fuori, 0, (size_t)n * sizeof *fuori);
+        return;
+    }
+
+#if defined(__x86_64__) || defined(_M_X64)
+    /* Eight outputs at a time. The matrix is eight-bit and the input
+     * sixteen, so each entry widens to sixteen and _mm_madd_epi16 carries
+     * the product in thirty-two - the same pairing with a zero that the
+     * weighted prediction uses, and for the same reason. */
+    if (n >= 8) {
+        const __m128i zero = _mm_setzero_si128();
+        for (int i = 0; i < n; i += 8) {
+            __m128i lo = zero, alto = zero;
+            for (int j = 0; j < quanti; j++) {
+                const __m128i cv =
+                    _mm_set1_epi32((int32_t)(uint32_t)(uint16_t)val[j]);
+                const __m128i m8 =
+                    _mm_loadl_epi64((const __m128i *)(riga_m[j] + i));
+                const __m128i m16 =
+                    _mm_srai_epi16(_mm_unpacklo_epi8(m8, m8), 8);
+                lo = _mm_add_epi32(lo, _mm_madd_epi16(
+                        _mm_unpacklo_epi16(m16, zero), cv));
+                alto = _mm_add_epi32(alto, _mm_madd_epi16(
+                        _mm_unpackhi_epi16(m16, zero), cv));
+            }
+            _mm_storeu_si128((__m128i *)(fuori + i), lo);
+            _mm_storeu_si128((__m128i *)(fuori + i + 4), alto);
+        }
+        return;
+    }
+#endif
+
     for (int i = 0; i < n; i++) {
         int32_t s = 0;
-        for (int k = 0; k < n; k++)
-            s += (int32_t)hevcd_dct[k * salto][i] * src[k * passo];
+        for (int j = 0; j < quanti; j++)
+            s += (int32_t)riga_m[j][i] * val[j];
         fuori[i] = s;
     }
 }
