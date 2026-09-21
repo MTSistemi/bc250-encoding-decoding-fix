@@ -177,6 +177,11 @@ typedef struct {
 
     /* The picture being decoded, its motion field, and what it predicts
      * from. The harness owns the buffer and fills these in per slice. */
+    /* The decoded picture buffer, which the caller owns: the decoder
+     * writes into it and reads references out of it, and has no opinion
+     * about how long anything stays. */
+    hevcd_img_t *buf;
+    int n_buf;
     hevcd_img_t *corrente;
     hevcd_mvf_t *mvf;
     const hevcd_img_t *rif[2][16];
