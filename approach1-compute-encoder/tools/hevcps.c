@@ -278,17 +278,23 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
             const size_t usati = h264d_cabac_byte_pos(&d->cabac);
             if (usati >= resto) return 3;
 
-            /* What the header said this row would be. */
+            /* Where the header says this row ends. */
+            size_t salto = usati;
             if (senza_escape && sl->num_entry_point_offsets > 0) {
                 const int riga = addr / sps->ctb_width;
                 if (riga < sl->num_entry_point_offsets) {
                     const uint32_t fin = sl->entry_point[riga];
                     const uint32_t ini = riga > 0 ? sl->entry_point[riga - 1] : 0;
-                    if (usati != (size_t)(fin - ini)) return 7;
+                    salto = (size_t)(fin - ini);
+                    /* A row may stop short of what the header allows - the
+                     * bytes left over are the engine's own look-ahead. It
+                     * may not run past it: that is a row read wrongly. */
+                    if (usati > salto) return 7;
                 }
             }
-            base += usati;
-            resto -= usati;
+            if (salto >= resto) return 3;
+            base += salto;
+            resto -= salto;
             h264d_cabac_init_engine(&d->cabac, base, resto);
             /* 8.6.1: a row under WPP predicts its first group from the
              * slice's parameter and not from the end of the row above. */
