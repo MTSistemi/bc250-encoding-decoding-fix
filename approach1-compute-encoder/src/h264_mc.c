@@ -518,14 +518,14 @@ void h264d_mc_weight(uint8_t *dst, int ds, const uint8_t *src, int ss,
             __m128i v = _mm_unpacklo_epi8(
                 _mm_loadl_epi64((const __m128i *)(r + x)), zero);
             v = _mm_add_epi16(_mm_mullo_epi16(v, vw), vt);
-            v = _mm_add_epi16(_mm_srai_epi16(v, log2_denom), vo);
+            v = _mm_adds_epi16(_mm_srai_epi16(v, log2_denom), vo);
             _mm_storel_epi64((__m128i *)(o + x), _mm_packus_epi16(v, v));
         }
         if (x + 4 <= w) {
             __m128i v = _mm_unpacklo_epi8(
                 _mm_cvtsi32_si128(*(const int32_t *)(r + x)), zero);
             v = _mm_add_epi16(_mm_mullo_epi16(v, vw), vt);
-            v = _mm_add_epi16(_mm_srai_epi16(v, log2_denom), vo);
+            v = _mm_adds_epi16(_mm_srai_epi16(v, log2_denom), vo);
             *(int32_t *)(o + x) = _mm_cvtsi128_si32(_mm_packus_epi16(v, v));
             x += 4;
         }
@@ -552,7 +552,11 @@ void h264d_mc_weight_bi(uint8_t *dst, int ds,
      * no offset collapse to (a + b + 1) >> 1. Implicit bi-prediction lands
      * here whenever the two references sit symmetrically around this
      * picture, which in a regular B structure is most of the time. */
-    if (w0 == (1 << log2_denom) && w1 == w0 && o0 == 0 && o1 == 0) {
+    /* âš ï¸ log2_denom >= 1 is part of the condition, not a detail of it. At
+     * zero the clause does not shift, so weights of one mean a + b clipped
+     * and not the average of a and b. */
+    if (log2_denom >= 1 && w0 == (1 << log2_denom) && w1 == w0
+        && o0 == 0 && o1 == 0) {
         h264d_mc_average(dst, ds, a, as, b, bs, w, h);
         return;
     }
@@ -586,7 +590,11 @@ void h264d_mc_weight_bi(uint8_t *dst, int ds,
             __m128i hi = _mm_madd_epi16(_mm_unpackhi_epi8(mix, zero), vw);
             lo = _mm_srai_epi32(_mm_add_epi32(lo, vt), sposta);
             hi = _mm_srai_epi32(_mm_add_epi32(hi, vt), sposta);
-            __m128i v = _mm_add_epi16(_mm_packs_epi32(lo, hi), vo);
+            /* âš ï¸ Saturating, not wrapping. At log2_denom zero nothing is
+             * shifted, the sum can reach 64770, and packing it down clamps
+             * it at 32767 - where a wrapping add of the offset would turn
+             * the brightest sample into the darkest. */
+            __m128i v = _mm_adds_epi16(_mm_packs_epi32(lo, hi), vo);
             _mm_storel_epi64((__m128i *)(o + x), _mm_packus_epi16(v, v));
         }
         if (x + 4 <= w) {
@@ -595,7 +603,7 @@ void h264d_mc_weight_bi(uint8_t *dst, int ds,
             const __m128i mix = _mm_unpacklo_epi8(ia, ib);
             __m128i lo = _mm_madd_epi16(_mm_unpacklo_epi8(mix, zero), vw);
             lo = _mm_srai_epi32(_mm_add_epi32(lo, vt), sposta);
-            __m128i v = _mm_add_epi16(_mm_packs_epi32(lo, lo), vo);
+            __m128i v = _mm_adds_epi16(_mm_packs_epi32(lo, lo), vo);
             *(int32_t *)(o + x) = _mm_cvtsi128_si32(_mm_packus_epi16(v, v));
             x += 4;
         }

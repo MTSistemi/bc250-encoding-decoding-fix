@@ -55,6 +55,21 @@ endif()
 add_executable(test_dynamic_governor test_dynamic_governor.c ../src/dynamic_governor.c)
 target_include_directories(test_dynamic_governor PRIVATE ../src)
 
+# The H.264 decoder's own unit tests. GPU-free: the decoder reconstructs
+# into plain system memory and only touches the GPU to upload a finished
+# picture, so these need nothing but libc.
+add_executable(test_cabac_roundtrip test_cabac_roundtrip.c
+               ../src/cabac.c ../src/h264_dec_tables.c)
+target_include_directories(test_cabac_roundtrip PRIVATE ../src)
+
+add_executable(test_mc test_mc.c ../src/h264_mc.c)
+target_include_directories(test_mc PRIVATE ../src)
+target_link_libraries(test_mc PRIVATE m)
+
+add_executable(test_pred test_pred.c ../src/h264_pred.c)
+target_include_directories(test_pred PRIVATE ../src)
+target_link_libraries(test_pred PRIVATE m)
+
 enable_testing()
 add_test(NAME BitstreamTest COMMAND test_bitstream)
 add_test(NAME CavlcUnitTest COMMAND test_cavlc)
@@ -63,3 +78,6 @@ add_test(NAME EncodeBitstreamTest COMMAND test_encode WORKING_DIRECTORY ${CMAKE_
 add_test(NAME HevcEncodeBitstreamTest COMMAND test_hevc_encode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME CpuSimdMeTest COMMAND test_cpu_simd_me)
 add_test(NAME DynamicGovernorTest COMMAND test_dynamic_governor)
+add_test(NAME CabacRoundtripTest COMMAND test_cabac_roundtrip)
+add_test(NAME McUnitTest COMMAND test_mc)
+add_test(NAME IntraPredUnitTest COMMAND test_pred)

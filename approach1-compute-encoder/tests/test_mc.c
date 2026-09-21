@@ -130,7 +130,7 @@ static int prova_luma(void)
                     int pst;
                     const uint8_t *src = h264d_mc_fetch_luma(padded, &pst, piano, PW,
                                                              PW, PH, x, y, w, h);
-                    h264d_mc_luma(nostro, w, src, w + 6, w, h, xf, yf);
+                    h264d_mc_luma(nostro, w, src, pst, w, h, xf, yf);
 
                     for (int j = 0; j < h; j++)
                         for (int i = 0; i < w; i++)
@@ -179,7 +179,7 @@ static int prova_chroma(void)
                     int pst;
                     const uint8_t *src = h264d_mc_fetch_chroma(padded, &pst, piano, PW,
                                                                PW, PH, x, y, w, h);
-                    h264d_mc_chroma(nostro, w, src, w + 1, w, h, xf, yf);
+                    h264d_mc_chroma(nostro, w, src, pst, w, h, xf, yf);
 
                     for (int j = 0; j < h; j++)
                         for (int i = 0; i < w; i++)
