@@ -258,6 +258,54 @@ static int leggi_pps(const uint8_t *rbsp, size_t n)
     return id;
 }
 
+/* One picture in the reference list. */
+typedef struct {
+    uint32_t surface;
+    int poc;
+    int frame_num;
+} rif_t;
+
+/* Clause 8.2.5: mark the picture that has just been decoded, then add it.
+ *
+ * Either the operations its own slice header carried, or - when it carried
+ * none - the sliding window, which drops the short-term reference with the
+ * smallest PicNum once the store is full. Never both. */
+static void marca(rif_t *rifs, int *n_rif, int max_rif,
+                  uint32_t superficie, int poc, int frame_num,
+                  int log2_max_frame_num,
+                  const int *op, const int *val, int n_op)
+{
+    const int max_pn = 1 << log2_max_frame_num;
+
+    if (n_op > 0) {
+        for (int k = 0; k < n_op; k++) {
+            if (op[k] == 5) { *n_rif = 0; continue; }
+            if (op[k] != 1) continue;         /* long-term: refused earlier */
+            int pn = frame_num - (val[k] + 1);
+            if (pn < 0) pn += max_pn;
+            for (int c = 0; c < *n_rif; c++) {
+                const int suo = (rifs[c].frame_num > frame_num)
+                              ? rifs[c].frame_num - max_pn : rifs[c].frame_num;
+                if (suo == pn) {
+                    for (int j = c; j + 1 < *n_rif; j++) rifs[j] = rifs[j + 1];
+                    (*n_rif)--;
+                    break;
+                }
+            }
+        }
+    } else if (*n_rif >= max_rif && *n_rif > 0) {
+        /* Sliding window: out goes the smallest PicNum, which is the
+         * oldest - the last of a list kept newest first. */
+        (*n_rif)--;
+    }
+
+    for (int k = 15; k > 0; k--) rifs[k] = rifs[k - 1];
+    rifs[0].surface = superficie;
+    rifs[0].poc = poc;
+    rifs[0].frame_num = frame_num;
+    if (*n_rif < 16) (*n_rif)++;
+}
+
 /* Pictures held back so they can be written in display order. */
 typedef struct {
     int poc;
@@ -321,11 +369,6 @@ static void svuota(FILE *fo)
 
 /* ---------------------------------------------------------- the driver */
 
-typedef struct {
-    uint32_t surface;
-    int poc;
-    int frame_num;
-} rif_t;
 
 int main(int argc, char **argv)
 {
@@ -358,6 +401,8 @@ int main(int argc, char **argv)
     int in_corso = 0;
     uint32_t superficie_corrente = 0;
     int corrente_riferimento = 0, corrente_poc = 0, corrente_frame_num = 0;
+    int n_mmco_attesa = 0, mmco_op_attesa[32], mmco_val_attesa[32];
+    int n_mmco_precedente = 0, mmco_op_precedente[32], mmco_val_precedente[32];
 
     long i = 0;
     while (i + 3 < len) {
@@ -569,28 +614,18 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Applied now, because the list these operations name is the one
-         * this picture was decoded against. */
-        for (int k = 0; k < n_mmco; k++) {
-            if (mmco_op[k] == 1) {
-                const int max_pn = 1 << sp->log2_max_frame_num;
-                int pn = frame_num - (mmco_val[k] + 1);
-                if (pn < 0) pn += max_pn;
-                int dove = -1;
-                for (int c = 0; c < n_rif; c++)
-                    if (rifs[c].frame_num == pn) { dove = c; break; }
-                if (dove >= 0) {
-                    for (int c = dove; c + 1 < n_rif; c++) rifs[c] = rifs[c + 1];
-                    n_rif--;
-                }
-            } else if (mmco_op[k] == 5) {
-                n_rif = 0;
-            } else {
-                fprintf(stderr, "marcatura con operazione %d, "
-                                "non implementata\n", mmco_op[k]);
-                return 3;
+        /* ⚠️ Nothing is marked here. These operations belong to the picture
+         * this header introduces and run once it has been decoded, in
+         * `marca()` below - which is also where the sliding window lives,
+         * because a picture uses one or the other and never both. */
+        if (first_mb == 0) {
+            n_mmco_attesa = n_mmco;
+            for (int k = 0; k < n_mmco; k++) {
+                mmco_op_attesa[k] = mmco_op[k];
+                mmco_val_attesa[k] = mmco_val[k];
             }
         }
+
         if (pp->entropy_coding_mode && slice_type != 2)
             sl.cabac_init_idc = (int)br_read_ue(&br);
         sl.qpy = pp->pic_init_qp + br_read_se(&br);
@@ -614,12 +649,9 @@ int main(int argc, char **argv)
 
         if (first_mb == 0) {
             if (in_corso && corrente_riferimento) {
-                /* the picture that just finished joins the list */
-                for (int k = 15; k > 0; k--) rifs[k] = rifs[k - 1];
-                rifs[0].surface = superficie_corrente;
-                rifs[0].poc = corrente_poc;
-                rifs[0].frame_num = corrente_frame_num;
-                if (n_rif < sp->max_num_ref_frames && n_rif < 16) n_rif++;
+                marca(rifs, &n_rif, sp->max_num_ref_frames, superficie_corrente,
+                      corrente_poc, corrente_frame_num, sp->log2_max_frame_num,
+                      mmco_op_precedente, mmco_val_precedente, n_mmco_precedente);
                 corrente_riferimento = 0;
             }
             if (in_corso) {
@@ -801,15 +833,17 @@ int main(int argc, char **argv)
             }
 
         if (getenv("BC250_H264_W")) {
-            fprintf(stderr, "f%d fn%d tipo%d nref%d/%d denom %d/%d bipred%d |",
-                    fotogrammi, frame_num, slice_type, sl.num_ref_idx[0],
-                    sl.num_ref_idx[1], sl.luma_log2_weight_denom,
-                    sl.chroma_log2_weight_denom, pp->weighted_bipred_idc);
+            fprintf(stderr, "f%d fn%d poc%d tipo%d nri%d mmco%d nrif%d |",
+                    fotogrammi, frame_num, poc, slice_type, nal_ref_idc,
+                    n_mmco, n_rif);
+            fprintf(stderr, " nmod%d/%d nattivo%d/%d |", n_mod[0], n_mod[1],
+                    n_attivo[0], n_attivo[1]);
+            for (int k = 0; k < n_rif; k++)
+                fprintf(stderr, " rif(fn%d,poc%d)", rifs[k].frame_num, rifs[k].poc);
             for (int l = 0; l < 2; l++)
-                for (int k = 0; k < sl.num_ref_idx[l] && k < 3; k++)
-                    fprintf(stderr, " L%d[%d]=slot%d w%d o%d", l, k,
-                            sl.ref_list[l][k], sl.luma_weight[l][k],
-                            sl.luma_offset[l][k]);
+                for (int k = 0; k < n_attivo[l] && k < 4; k++)
+                    fprintf(stderr, " L%d[%d]=slot%d(poc%d)", l, k,
+                            sl.ref_list[l][k], lista[l][k].poc);
             fprintf(stderr, "\n");
         }
 
@@ -828,6 +862,13 @@ int main(int argc, char **argv)
         corrente_riferimento = nal_ref_idc != 0;
         corrente_poc = poc;
         corrente_frame_num = frame_num;
+        if (first_mb == 0) {
+            n_mmco_precedente = n_mmco_attesa;
+            for (int k = 0; k < n_mmco_attesa; k++) {
+                mmco_op_precedente[k] = mmco_op_attesa[k];
+                mmco_val_precedente[k] = mmco_val_attesa[k];
+            }
+        }
     }
 
     if (in_corso && dec) {

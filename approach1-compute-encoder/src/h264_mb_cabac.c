@@ -556,10 +556,22 @@ static int leggi_movimento(h264_decoder_t *d, h264d_mb_t *m, bool bslice, int t)
             m->sub_tipo[i] = (int8_t)s;
             sub[i] = bslice ? h264d_sub_b[s >= 0 && s < 13 ? s : 12]
                             : h264d_sub_p[s >= 0 && s < 4 ? s : 3];
-            if (sub[i].w4 < 2 || sub[i].h4 < 2)
+            /* noSubMbPartSizeLessThan8x8Flag, clause 7.3.5. A
+             * sub-macroblock cut smaller than 8x8 clears it - but a
+             * B_Direct_8x8 does not, unless direct_8x8_inference_flag is
+             * off.
+             *
+             * ⚠️ B_Direct_8x8 is modelled here as four 4x4 pieces, because
+             * that is how its vectors are derived, so the size test catches
+             * it and has to be told not to. Otherwise a B_8x8 with one
+             * direct sub-macroblock never reads transform_size_8x8_flag and
+             * the slice comes apart from there. */
+            if (bslice && s == 0) {
+                if (!d->pic.direct_8x8_inference)
+                    sotto_8x8 = true;
+            } else if (sub[i].w4 < 2 || sub[i].h4 < 2) {
                 sotto_8x8 = true;
-            if (bslice && s == 0 && !d->pic.direct_8x8_inference)
-                sotto_8x8 = true;
+            }
         }
         for (int i = 0; i < 4; i++) {
             parte[i].pred = sub[i].pred;
