@@ -20,9 +20,11 @@
  */
 #include "h264_dec_internal.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "h264_dec_tables.h"
+#include "h264_parts.h"
 #include "h264_pred.h"
 
 /* Decoding order of the sixteen 4x4 luma blocks, as raster positions inside
@@ -414,16 +416,22 @@ static int leggi_residuo(h264_decoder_t *d, int cat, int n, int16_t *out,
             /* The tail uses a second context group, capped one lower for
              * chroma DC because that block has fewer coefficients. */
             const int cappa = (cat == CAT_CHROMA_DC) ? 3 : 4;
-            int m = 1;
-            while (m < 13) {
+
+            /* ⚠️ Fourteen, not thirteen. coeff_abs_level_minus1 is UEG0 with
+             * uCoff = 14 (9.3.2.3): the prefix is a run of up to fourteen
+             * ones, and only a full run of fourteen is followed by the
+             * Exp-Golomb suffix. A run shorter than that ends with a zero
+             * bin, which the loop below consumes on the way out. */
+            int v = 1;
+            while (v < 14) {
                 inc = 5 + (quanti_maggiori < cappa ? quanti_maggiori : cappa);
                 if (!decidi(d, base_abs + inc))
                     break;
-                m++;
+                v++;
             }
-            livello = 1 + m;
-            if (m == 13)
-                livello += (int)h264d_cabac_eg_bypass(&d->cabac, 0);
+            if (v == 14)
+                v += (int)h264d_cabac_eg_bypass(&d->cabac, 0);
+            livello = v + 1;
             quanti_maggiori++;
         } else {
             quanti_uno++;
@@ -433,6 +441,173 @@ static int leggi_residuo(h264_decoder_t *d, int cat, int n, int16_t *out,
         nonzero++;
     }
     return nonzero;
+}
+
+
+/* ------------------------------------------------------------- motion */
+
+/* Write one partition's vector and reference into every 4x4 block it
+ * covers. */
+static void posa(h264d_mb_t *m, int lista, int blk, int w4, int h4,
+                 int ref, int slot, int16_t mvx, int16_t mvy,
+                 int16_t dx, int16_t dy)
+{
+    const int x4 = blk & 3, y4 = blk >> 2;
+    for (int y = 0; y < h4; y++) {
+        for (int x = 0; x < w4; x++) {
+            const int b = (y4 + y) * 4 + x4 + x;
+            m->mv[lista][b][0] = mvx;
+            m->mv[lista][b][1] = mvy;
+            m->mvd[lista][b][0] = dx;
+            m->mvd[lista][b][1] = dy;
+        }
+    }
+    /* The reference is kept per 8x8, so each covered 4x4 stamps the 8x8 it
+     * belongs to. A partition either sits inside one 8x8 or covers whole
+     * ones, so this never writes two different references into the same
+     * slot. */
+    for (int y = 0; y < h4; y++)
+        for (int x = 0; x < w4; x++) {
+            const int p = h264d_part8(((y4 + y) * 4) + x4 + x);
+            m->ref[lista][p] = (int8_t)slot;
+            m->ref_idx[lista][p] = (int8_t)ref;
+        }
+}
+
+/* The sum of the neighbours' coded differences, which picks the mvd context
+ * (9.3.3.1.1.7). Both neighbours are looked up in the macroblock store, so a
+ * partition of this same macroblock that has already been read counts too. */
+static int somma_mvd(const h264_decoder_t *d, int lista, int blk, int comp)
+{
+    int s = 0;
+    int pa, pb;
+    const h264d_mb_t *a = sinistra4(d, blk, &pa);
+    const h264d_mb_t *b = sopra4(d, blk, &pb);
+    if (a && !a->intra) s += abs(a->mvd[lista][pa][comp]);
+    if (b && !b->intra) s += abs(b->mvd[lista][pb][comp]);
+    return s;
+}
+
+static inline bool usa(int pred, int lista)
+{
+    if (pred == H264D_PRED_BI) return true;
+    return pred == (lista ? H264D_PRED_L1 : H264D_PRED_L0);
+}
+
+/* Clause 7.3.5.1 and 7.3.5.2.
+ *
+ * ⚠️ The order is four passes over the partitions, not one: every
+ * ref_idx_l0, then every ref_idx_l1, then every mvd_l0, then every mvd_l1.
+ * Reading a partition's reference and difference together would consume the
+ * bins in the wrong order and desynchronise the slice at the second
+ * partition of the first macroblock that has two.
+ *
+ * It is also why the vectors can be computed inside the mvd passes: by then
+ * every partition's reference is known, which is what the prediction of
+ * 8.4.1.3 needs to compare against.
+ */
+static int leggi_movimento(h264_decoder_t *d, h264d_mb_t *m, bool bslice, int t)
+{
+    h264d_part_t parti[16];
+    int n = 0;
+    bool sotto_8x8 = false;
+
+    if (m->type == H264D_MB_P_8x8 || m->type == H264D_MB_B_8x8) {
+        /* Every sub_mb_type first, then the partitions they describe. */
+        h264d_sub_t sub[4];
+        for (int i = 0; i < 4; i++) {
+            const int s = bslice ? leggi_sub_mb_type_b(d) : leggi_sub_mb_type_p(d);
+            sub[i] = bslice ? h264d_sub_b[s < 13 ? s : 12]
+                            : h264d_sub_p[s < 4 ? s : 3];
+            if (sub[i].w4 < 2 || sub[i].h4 < 2)
+                sotto_8x8 = true;
+            if (bslice && s == 0 && !d->pic.direct_8x8_inference)
+                sotto_8x8 = true;
+        }
+        for (int i = 0; i < 4; i++) {
+            for (int k = 0; k < sub[i].n; k++) {
+                parti[n].blk = (uint8_t)(h264d_blk8[i] + h264d_sub_offset(&sub[i], k));
+                parti[n].w4 = sub[i].w4;
+                parti[n].h4 = sub[i].h4;
+                parti[n].pred = sub[i].pred;
+                n++;
+            }
+        }
+    } else if (m->type == H264D_MB_P_16x16 || m->type == H264D_MB_B_16x16) {
+        parti[0] = (h264d_part_t){ 0, 4, 4,
+            (uint8_t)(bslice ? (t == 1 ? H264D_PRED_L0
+                              : t == 2 ? H264D_PRED_L1 : H264D_PRED_BI)
+                             : H264D_PRED_L0) };
+        n = 1;
+    } else if (m->type == H264D_MB_B_DIRECT) {
+        parti[0] = (h264d_part_t){ 0, 4, 4, H264D_PRED_DIRECT };
+        n = 1;
+    } else {
+        const bool verticale = (m->type == H264D_MB_P_8x16
+                             || m->type == H264D_MB_B_8x16);
+        const int w4 = verticale ? 2 : 4, h4 = verticale ? 4 : 2;
+        const int secondo = verticale ? 2 : 8;
+        uint8_t p0 = H264D_PRED_L0, p1 = H264D_PRED_L0;
+        if (bslice) {
+            const int coppia = (t - 4) / 2;
+            p0 = h264d_b_pair[coppia < 9 ? coppia : 8][0];
+            p1 = h264d_b_pair[coppia < 9 ? coppia : 8][1];
+        }
+        parti[0] = (h264d_part_t){ 0, (uint8_t)w4, (uint8_t)h4, p0 };
+        parti[1] = (h264d_part_t){ (uint8_t)secondo, (uint8_t)w4, (uint8_t)h4, p1 };
+        n = 2;
+    }
+
+    m->sub_8x8 = sotto_8x8 ? 1 : 0;
+
+    /* Nothing is signalled for a direct partition: its vectors come from
+     * 8.4.1.2 once the whole macroblock is known. */
+    int ref[2][16];
+    for (int i = 0; i < n; i++)
+        ref[0][i] = ref[1][i] = -1;
+
+    for (int lista = 0; lista < (bslice ? 2 : 1); lista++) {
+        const int cap = d->slice.num_ref_idx[lista];
+        for (int i = 0; i < n; i++) {
+            if (parti[i].pred == H264D_PRED_DIRECT || !usa(parti[i].pred, lista))
+                continue;
+            ref[lista][i] = leggi_ref_idx(d, lista,
+                                          h264d_part8(parti[i].blk), cap);
+            /* The reference has to be in the store before any vector is
+             * predicted, because the prediction compares references. */
+            posa(m, lista, parti[i].blk, parti[i].w4, parti[i].h4,
+                 ref[lista][i], d->slice.ref_list[lista][ref[lista][i]],
+                 0, 0, 0, 0);
+        }
+    }
+
+    for (int lista = 0; lista < (bslice ? 2 : 1); lista++) {
+        for (int i = 0; i < n; i++) {
+            if (parti[i].pred == H264D_PRED_DIRECT || !usa(parti[i].pred, lista))
+                continue;
+            int16_t pmv[2];
+            h264d_predict_mv(d, lista, parti[i].blk, parti[i].w4, parti[i].h4,
+                             ref[lista][i], pmv);
+            const int dx = leggi_mvd(d, 0, somma_mvd(d, lista, parti[i].blk, 0));
+            const int dy = leggi_mvd(d, 1, somma_mvd(d, lista, parti[i].blk, 1));
+            posa(m, lista, parti[i].blk, parti[i].w4, parti[i].h4, ref[lista][i],
+                 d->slice.ref_list[lista][ref[lista][i]],
+                 (int16_t)(pmv[0] + dx), (int16_t)(pmv[1] + dy),
+                 (int16_t)dx, (int16_t)dy);
+        }
+    }
+
+    /* B direct is not derived yet: 8.4.1.2 needs the motion field of the
+     * co-located picture, which means keeping one per reference frame. Until
+     * that store exists a direct partition is refused rather than guessed at,
+     * and the slice layer keeps B slices out entirely - a direct macroblock
+     * decoded as zero motion would not look broken, it would look slightly
+     * wrong, which is worse. */
+    for (int i = 0; i < n; i++)
+        if (parti[i].pred == H264D_PRED_DIRECT)
+            return 1;
+
+    return 0;
 }
 
 /* --------------------------------------------------------- the macroblock */
@@ -455,7 +630,10 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
         b = h264d_mb_top(d);  bb = 0;
         int inc = cbf_vicino(d, a, ba, 0, true, intra)
                 + 2 * cbf_vicino(d, b, bb, 0, true, intra);
-        int nz = leggi_residuo(d, CAT_I16_DC, 16, d->dc_luma, inc, true);
+        int16_t tmp[16];
+        int nz = leggi_residuo(d, CAT_I16_DC, 16, tmp, inc, true);
+        for (int k = 0; k < 16; k++)
+            d->dc_luma[h264d_zigzag4[k]] = tmp[k];
         m->cbf_dc[0] = nz ? 1 : 0;
     }
 
@@ -468,7 +646,11 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
             }
             /* No coded_block_flag for an 8x8 luma block at 4:2:0: the
              * coded block pattern has already said it is there. */
-            int nz = leggi_residuo(d, CAT_LUMA_8X8, 64, d->coeff8[b8], 0, false);
+            int16_t tmp8[64];
+            int nz = leggi_residuo(d, CAT_LUMA_8X8, 64, tmp8, 0, false);
+            memset(d->coeff8[b8], 0, sizeof(d->coeff8[b8]));
+            for (int k = 0; k < 64; k++)
+                d->coeff8[b8][h264d_zigzag8[k]] = tmp8[k];
             const int bx = (b8 & 1) * 2, by = (b8 >> 1) * 2;
             for (int y = 0; y < 2; y++)
                 for (int x = 0; x < 2; x++)
@@ -494,11 +676,15 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
             int nz = leggi_residuo(d, cat, n, tmp, inc, true);
             /* An Intra_16x16 block codes only its fifteen AC coefficients;
              * the DC comes from the separate block above. */
+            memset(d->coeff[0][b], 0, sizeof(d->coeff[0][b]));
             if (i16) {
-                d->coeff[0][b][0] = 0;
-                memcpy(d->coeff[0][b] + 1, tmp, 15 * sizeof(int16_t));
+                /* The AC coefficients start at scan position 1: position 0
+                 * is the DC, which came from its own block. */
+                for (int k = 0; k < 15; k++)
+                    d->coeff[0][b][h264d_zigzag4[k + 1]] = tmp[k];
             } else {
-                memcpy(d->coeff[0][b], tmp, 16 * sizeof(int16_t));
+                for (int k = 0; k < 16; k++)
+                    d->coeff[0][b][h264d_zigzag4[k]] = tmp[k];
             }
             m->nnz[0][b] = (uint8_t)nz;
         }
@@ -512,6 +698,9 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
             const h264d_mb_t *b = h264d_mb_top(d);
             int inc = cbf_vicino(d, a, 0, p + 1, true, intra)
                     + 2 * cbf_vicino(d, b, 0, p + 1, true, intra);
+            /* ⚠️ No un-scan here. At 4:2:0 the chroma DC block is 2x2 and
+             * its scan (h264d_chroma_dc_scan) is the identity, so the four
+             * coefficients come out already in raster order. */
             int nz = leggi_residuo(d, CAT_CHROMA_DC, 4, d->dc_chroma[p], inc, true);
             m->cbf_dc[p + 1] = nz ? 1 : 0;
         } else {
@@ -533,8 +722,9 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
                     + 2 * cbf_vicino(d, bmb, pb, p + 1, false, intra);
             int16_t tmp[16];
             int nz = leggi_residuo(d, CAT_CHROMA_AC, 15, tmp, inc, true);
-            d->coeff[p + 1][b][0] = 0;
-            memcpy(d->coeff[p + 1][b] + 1, tmp, 15 * sizeof(int16_t));
+            memset(d->coeff[p + 1][b], 0, sizeof(d->coeff[p + 1][b]));
+            for (int k = 0; k < 15; k++)
+                d->coeff[p + 1][b][h264d_zigzag4[k + 1]] = tmp[k];
             m->nnz[p + 1][b] = (uint8_t)nz;
         }
     }
@@ -545,9 +735,14 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
 static void spacchetta_i16(int t, int *modo, int *cbp)
 {
     const int k = t - 1;                 /* 0..23 */
-    *modo = k & 3;
-    *cbp = ((k >> 2) & 3) << 4;          /* chroma */
-    if (k >= 12) *cbp |= 15;             /* luma all or nothing */
+    *modo = k & 3;                       /* four prediction modes */
+    /* ⚠️ The chroma pattern cycles through THREE values, not four, so it is
+     * (k / 4) modulo 3 and not the low two bits of k / 4. The two agree
+     * while k is under 12 - that is, while the luma pattern is zero - and
+     * part company exactly where the luma residual appears, which is what
+     * made this look like a bug in the residual rather than in the type. */
+    *cbp = ((k / 4) % 3) << 4;
+    if (k >= 12) *cbp |= 15;             /* luma is all or nothing */
 }
 
 int h264d_decode_mb_cabac(h264_decoder_t *d)
@@ -563,6 +758,14 @@ int h264d_decode_mb_cabac(h264_decoder_t *d)
             m->type = (uint8_t)(bslice ? H264D_MB_B_SKIP : H264D_MB_P_SKIP);
             m->qpy = (int8_t)d->qpy;
             d->last_qp_delta_nonzero = 0;
+            if (bslice)
+                return 1;       /* B_Skip needs the direct derivation */
+            /* Clause 8.4.1.1: one 16x16 partition on reference 0, with the
+             * vector predicted as usual except that it collapses to zero at
+             * the picture edge or beside a neighbour that is itself still. */
+            int16_t mv[2];
+            h264d_skip_mv_p(d, mv);
+            posa(m, 0, 0, 4, 4, 0, d->slice.ref_list[0][0], mv[0], mv[1], 0, 0);
             h264d_reconstruct_mb(d);
             return 0;
         }
@@ -662,7 +865,7 @@ int h264d_decode_mb_cabac(h264_decoder_t *d)
         m->chroma_pred_mode = (int8_t)leggi_chroma_pred_mode(d);
     } else {
         /* --- motion ---------------------------------------------------- */
-        if (h264d_read_motion_cabac(d, m, bslice) != 0)
+        if (leggi_movimento(d, m, bslice, t) != 0)
             return 1;
     }
 
@@ -670,8 +873,15 @@ int h264d_decode_mb_cabac(h264_decoder_t *d)
     const bool i16 = (m->type == H264D_MB_I_16x16);
     if (!i16) {
         m->cbp = (uint8_t)leggi_cbp(d);
-        if ((m->cbp & 15) && d->pic.transform_8x8_mode && !m->intra
-            && m->type != H264D_MB_P_8x8 + 100 /* placeholder, see below */)
+        /* Clause 7.3.5. The 8x8 transform is only offered when there is luma
+         * residual to transform, when no sub-partition is smaller than 8x8,
+         * and - for a direct macroblock - when direct_8x8_inference_flag
+         * says its vectors are uniform over each 8x8. A macroblock carved
+         * into 4x4 pieces cannot use an 8x8 transform, which is what
+         * sub_8x8 records while the partitions are read. */
+        if ((m->cbp & 15) && d->pic.transform_8x8_mode
+            && m->type != H264D_MB_I_NxN && !m->sub_8x8
+            && (m->type != H264D_MB_B_DIRECT || d->pic.direct_8x8_inference))
             m->transform8x8 = (uint8_t)leggi_transform8x8(d);
     }
 

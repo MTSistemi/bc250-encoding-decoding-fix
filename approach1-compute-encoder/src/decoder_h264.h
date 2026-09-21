@@ -66,6 +66,10 @@ typedef struct {
     uint8_t  type;              /* h264d_mb_type_t */
     uint8_t  intra;             /* 1 for every I_ type */
     uint8_t  transform8x8;
+    /* Set while the partitions are read when any of them is smaller than
+     * 8x8. The 8x8 transform is not offered for such a macroblock, so the
+     * flag has to be known before coded_block_pattern is read. */
+    uint8_t  sub_8x8;
     uint8_t  cbp;               /* bits 0..3 luma 8x8s, bits 4..5 chroma */
     int8_t   qpy;
     int8_t   chroma_pred_mode;
@@ -80,6 +84,13 @@ typedef struct {
      * once here also means the filter never has to know which slice a
      * macroblock came from. */
     int8_t   ref[2][4];
+    /* The reference INDEX the slice signalled, per 8x8 partition.
+     * ⚠️ Kept alongside the DPB slot above because the two clauses ask
+     * different questions. Motion vector prediction (8.4.1.3) compares
+     * indices; the deblocking filter (8.7.2.1) compares pictures. They agree
+     * within a slice unless reference list modification has put the same
+     * picture at two indices, which is exactly when one of them is wrong. */
+    int8_t   ref_idx[2][4];
     int16_t  mv[2][16][2];      /* per 4x4 block, per list */
     /* The motion vector differences as they were coded, per 4x4 block.
      * ⚠️ Kept because the CABAC context for mvd is the sum of the
@@ -181,5 +192,10 @@ void h264_decoder_set_references(h264_decoder_t *dec, const uint32_t *refs,
  * referring to a picture this decoder never produced (a stream that starts
  * mid-GOP, typically). */
 h264d_frame_t *h264_decoder_frame_for(h264_decoder_t *dec, uint32_t surface);
+
+/* The frame store slot a frame sits in. The reference lists a slice carries
+ * name slots, not surfaces, so that the macroblock layer never has to search
+ * for a picture while it is decoding. */
+int h264_decoder_slot_of(const h264_decoder_t *dec, const h264d_frame_t *f);
 
 #endif /* BC250_DECODER_H264_H */

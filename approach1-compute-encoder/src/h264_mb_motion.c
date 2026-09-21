@@ -87,7 +87,7 @@ static void da_vicino(const vicino_t *v, int lista, int *ref, int16_t mv[2])
         return;
     }
     const int p = ((v->blocco >> 2) & 2) | ((v->blocco >> 1) & 1);
-    *ref = v->mb->ref[lista][p];
+    *ref = v->mb->ref_idx[lista][p];   /* the index, per 8.4.1.3 */
     mv[0] = v->mb->mv[lista][v->blocco][0];
     mv[1] = v->mb->mv[lista][v->blocco][1];
 }
@@ -172,52 +172,3 @@ void h264d_skip_mv_p(h264_decoder_t *d, int16_t out[2])
     }
     h264d_predict_mv(d, 0, 0, 4, 4, 0, out);
 }
-
-/* ------------------------------------------------- writing a partition in */
-
-/* Fill in `w4` x `h4` 4x4 blocks from (blk) with one vector and reference. */
-static void scrivi_partizione(h264d_mb_t *m, int lista, int blk, int w4, int h4,
-                              int ref, const int16_t mv[2])
-{
-    const int x4 = blk & 3, y4 = blk >> 2;
-    for (int y = 0; y < h4; y++) {
-        for (int x = 0; x < w4; x++) {
-            const int b = (y4 + y) * 4 + x4 + x;
-            m->mv[lista][b][0] = mv[0];
-            m->mv[lista][b][1] = mv[1];
-        }
-    }
-    /* The reference is kept per 8x8 partition, so a partition narrower than
-     * 8x8 writes the 8x8 it sits in. */
-    for (int y = 0; y < h4; y += 2) {
-        for (int x = 0; x < w4; x += 2) {
-            const int p = (((y4 + y) >> 1) << 1) | ((x4 + x) >> 1);
-            m->ref[lista][p] = (int8_t)ref;
-        }
-    }
-    if (w4 < 2 || h4 < 2) {
-        const int p = ((y4 >> 1) << 1) | (x4 >> 1);
-        m->ref[lista][p] = (int8_t)ref;
-    }
-}
-
-/* The sum of the absolute motion vector differences of the two neighbours,
- * which is what picks the context for mvd, clause 9.3.3.1.1.7.
- *
- * ⚠️ This is the sum of the differences each neighbour CODED, not of their
- * vectors. Two blocks can have very different vectors and have coded almost
- * nothing, which is exactly the case the context is there to catch. */
-static int somma_mvd(const h264_decoder_t *d, int lista, int blk, int comp)
-{
-    const int x4 = blk & 3, y4 = blk >> 2;
-    vicino_t va = vicino(d, x4 - 1, y4, blk);
-    vicino_t vb = vicino(d, x4, y4 - 1, blk);
-
-    int s = 0;
-    if (va.c_e && va.mb && !va.mb->intra)
-        s += abs(va.mb->mvd[lista][va.blocco][comp]);
-    if (vb.c_e && vb.mb && !vb.mb->intra)
-        s += abs(vb.mb->mvd[lista][vb.blocco][comp]);
-    return s;
-}
-

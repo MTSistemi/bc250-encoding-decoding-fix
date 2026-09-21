@@ -8,6 +8,7 @@
 #ifndef BC250_H264_RECON_H
 #define BC250_H264_RECON_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* The dequantisation factors for one quantisation parameter, laid out in
@@ -28,8 +29,13 @@ void h264d_dequant_build(h264d_dequant_t *dq, int qp,
 
 /* 8.5.12.1 scaling, then 8.5.12.2 transformation, then the add and the clip.
  * `block` holds the coefficients in raster order and is destroyed. */
+/* `dc_pronto` says the DC has already been through its own transform and
+ * scaling - an Intra_16x16 or a chroma block - so it is used as it stands.
+ * ⚠️ This used to be signalled by passing a null dequant array, which meant
+ * the one case that had to be handled specially was also the one that
+ * dereferenced a null pointer if anything slipped through. */
 void h264d_idct4_add(uint8_t *dst, int stride, int16_t block[16],
-                     const int32_t dequant[16], int qp);
+                     const int32_t dequant[16], int qp, bool dc_pronto);
 void h264d_idct8_add(uint8_t *dst, int stride, int16_t block[64],
                      const int32_t dequant[64], int qp);
 

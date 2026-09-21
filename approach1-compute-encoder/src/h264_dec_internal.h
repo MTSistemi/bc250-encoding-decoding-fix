@@ -79,8 +79,11 @@ struct h264_decoder {
     uint8_t *rbsp;                /* slice data with emulation bytes removed */
     size_t rbsp_cap;
 
-    /* Rebuilt whenever QP changes, which is rarely. */
+    /* Rebuilt whenever QP changes, which is rarely. Chroma gets its own two
+     * because its QP comes from a different table and each plane has its own
+     * offset. */
     h264d_dequant_t dequant;
+    h264d_dequant_t dequant_c[2];
 
     int qpy;                      /* running QP through the slice */
     int last_qp_delta_nonzero;    /* the mb_qp_delta context needs it */
@@ -140,9 +143,11 @@ int h264d_decode_mb_cavlc(h264_decoder_t *d);
 /* Reconstruction, shared by both entropy paths once the syntax is in. */
 void h264d_reconstruct_mb(h264_decoder_t *d);
 
-/* Motion vector prediction, 8.4.1.3, and the B direct modes, 8.4.1.2. */
+/* Motion vector prediction, 8.4.1.3. */
 void h264d_predict_mv(h264_decoder_t *d, int list, int blk, int w4, int h4,
                       int ref_idx, int16_t out[2]);
-void h264d_direct_mv(h264_decoder_t *d, int blk8);
+
+/* The vector of a skipped P macroblock, 8.4.1.1. */
+void h264d_skip_mv_p(h264_decoder_t *d, int16_t out[2]);
 
 #endif /* BC250_H264_DEC_INTERNAL_H */

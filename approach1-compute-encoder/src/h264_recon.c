@@ -102,15 +102,12 @@ static inline void idct4_righe(int32_t t[16])
 }
 
 void h264d_idct4_add(uint8_t *dst, int stride, int16_t block[16],
-                     const int32_t dequant[16], int qp)
+                     const int32_t dequant[16], int qp, bool dc_pronto)
 {
     int32_t t[16];
 
-    /* The DC of an Intra_16x16 or a chroma block has already been through its
-     * own transform and been written back into block[0] already scaled, which
-     * is why the caller passes dequant[0] of zero for those: a zero factor
-     * here would wipe it out. It is passed through untouched instead. */
-    t[0] = dequant[0] ? scala4(block[0], dequant[0], qp) : block[0];
+    t[0] = dc_pronto ? block[0]
+                     : (block[0] ? scala4(block[0], dequant[0], qp) : 0);
     for (int n = 1; n < 16; n++)
         t[n] = block[n] ? scala4(block[n], dequant[n], qp) : 0;
 
