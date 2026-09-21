@@ -334,6 +334,81 @@ static void due_v(uint8_t *dst, int passo, int w, int h,
         for (; c < w; c++) o[c] = ritaglia8((sa[c] + sb[c] + 64) >> 7);
     }
 }
+
+/* 8.5.3.3.4.3 in vectors. The product of a fourteen-bit sample and a
+ * weight does not fit in sixteen bits, so _mm_madd_epi16 carries it in
+ * thirty-two: pairing each sample with a zero and each weight with a zero
+ * turns one multiply-add into exactly the multiply we want, sign and all,
+ * with no widening step of its own. */
+static void uno_pesato_v(uint8_t *dst, int passo, int w, int h,
+                         const int16_t *a, int passo_a,
+                         int peso, int off, int den)
+{
+    const int log2wd = den + 6;
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i pv = _mm_set1_epi32((int32_t)(uint32_t)(uint16_t)peso);
+    const __m128i tondo = _mm_set1_epi32(1 << (log2wd - 1));
+    const __m128i ov = _mm_set1_epi32(off);
+    const __m128i giu = _mm_cvtsi32_si128(log2wd);
+
+    for (int r = 0; r < h; r++) {
+        const int16_t *s = a + (size_t)r * passo_a;
+        uint8_t *o = dst + (size_t)r * passo;
+        int c = 0;
+        for (; c + 8 <= w; c += 8) {
+            const __m128i v = _mm_loadu_si128((const __m128i *)(s + c));
+            __m128i lo = _mm_madd_epi16(_mm_unpacklo_epi16(v, zero), pv);
+            __m128i hi = _mm_madd_epi16(_mm_unpackhi_epi16(v, zero), pv);
+            lo = _mm_add_epi32(_mm_sra_epi32(_mm_add_epi32(lo, tondo), giu), ov);
+            hi = _mm_add_epi32(_mm_sra_epi32(_mm_add_epi32(hi, tondo), giu), ov);
+            const __m128i sedici = _mm_packs_epi32(lo, hi);
+            _mm_storel_epi64((__m128i *)(o + c),
+                             _mm_packus_epi16(sedici, sedici));
+        }
+        for (; c < w; c++) {
+            const int v = s[c];
+            o[c] = ritaglia8(((v * peso + (1 << (log2wd - 1))) >> log2wd) + off);
+        }
+    }
+}
+
+static void due_pesate_v(uint8_t *dst, int passo, int w, int h,
+                         const int16_t *a, const int16_t *b, int passo_p,
+                         int pa, int pb, int oa, int ob, int den)
+{
+    const int log2wd = den + 6;
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i pav = _mm_set1_epi32((int32_t)(uint32_t)(uint16_t)pa);
+    const __m128i pbv = _mm_set1_epi32((int32_t)(uint32_t)(uint16_t)pb);
+    const __m128i tondo = _mm_set1_epi32((oa + ob + 1) << log2wd);
+    const __m128i giu = _mm_cvtsi32_si128(log2wd + 1);
+
+    for (int r = 0; r < h; r++) {
+        const int16_t *sa = a + (size_t)r * passo_p;
+        const int16_t *sb = b + (size_t)r * passo_p;
+        uint8_t *o = dst + (size_t)r * passo;
+        int c = 0;
+        for (; c + 8 <= w; c += 8) {
+            const __m128i va = _mm_loadu_si128((const __m128i *)(sa + c));
+            const __m128i vb = _mm_loadu_si128((const __m128i *)(sb + c));
+            __m128i lo = _mm_add_epi32(
+                _mm_madd_epi16(_mm_unpacklo_epi16(va, zero), pav),
+                _mm_madd_epi16(_mm_unpacklo_epi16(vb, zero), pbv));
+            __m128i hi = _mm_add_epi32(
+                _mm_madd_epi16(_mm_unpackhi_epi16(va, zero), pav),
+                _mm_madd_epi16(_mm_unpackhi_epi16(vb, zero), pbv));
+            lo = _mm_sra_epi32(_mm_add_epi32(lo, tondo), giu);
+            hi = _mm_sra_epi32(_mm_add_epi32(hi, tondo), giu);
+            const __m128i sedici = _mm_packs_epi32(lo, hi);
+            _mm_storel_epi64((__m128i *)(o + c),
+                             _mm_packus_epi16(sedici, sedici));
+        }
+        for (; c < w; c++)
+            o[c] = ritaglia8((sa[c] * pa + sb[c] * pb
+                              + ((oa + ob + 1) << log2wd)) >> (log2wd + 1));
+    }
+}
+
 #endif /* x86-64 */
 
 /* ----------------------------------------------- and the scalar twins */
@@ -432,11 +507,27 @@ static void interpola(const uint8_t *rif, int passo, int w_pic, int h_pic,
         src = rif + (size_t)by * passo + bx;
         sp = passo;
     } else {
+        /* The window hangs over an edge. Clamping every sample by itself
+         * is how it was written first and it costs more than the filter
+         * that reads the result: the row is the same for a whole span of
+         * columns, so each output row is a repeat of one sample, a copy
+         * of the middle, and a repeat of the last. */
         sp = LATO_MAX + 7;
-        for (int r = 0; r < bh; r++)
-            for (int c = 0; c < bw; c++)
-                orlo[(size_t)r * sp + c] = (uint8_t)
-                    campione(rif, passo, w_pic, h_pic, bx + c, by + r);
+        const int sinistra = bx < 0 ? (-bx > bw ? bw : -bx) : 0;
+        const int dentro_fine = bx + bw > w_pic ? w_pic - bx : bw;
+        const int destra = dentro_fine < sinistra ? sinistra : dentro_fine;
+        for (int r = 0; r < bh; r++) {
+            int sy = by + r;
+            sy = sy < 0 ? 0 : (sy >= h_pic ? h_pic - 1 : sy);
+            const uint8_t *riga_rif = rif + (size_t)sy * passo;
+            uint8_t *o = orlo + (size_t)r * sp;
+            if (sinistra > 0) memset(o, riga_rif[0], (size_t)sinistra);
+            if (destra > sinistra)
+                memcpy(o + sinistra, riga_rif + bx + sinistra,
+                       (size_t)(destra - sinistra));
+            if (bw > destra)
+                memset(o + destra, riga_rif[w_pic - 1], (size_t)(bw - destra));
+        }
         src = orlo;
     }
 
@@ -514,6 +605,14 @@ static void uno_pesato(uint8_t *dst, int passo, int w, int h,
                        int peso, int off, int den)
 {
     const int log2wd = den + 6;
+#if defined(__x86_64__) || defined(_M_X64)
+    /* log2wd is den + 6 and den is never negative, so the other branch is
+     * unreachable on any stream the parser accepts. It stays anyway. */
+    if (log2wd >= 1) {
+        uno_pesato_v(dst, passo, w, h, a, passo_a, peso, off, den);
+        return;
+    }
+#endif
     for (int r = 0; r < h; r++)
         for (int c = 0; c < w; c++) {
             const int v = a[r * passo_a + c];
@@ -528,11 +627,17 @@ static void due_pesate(uint8_t *dst, int passo, int w, int h,
                        int pa, int pb, int oa, int ob, int den)
 {
     const int log2wd = den + 6;
+#if defined(__x86_64__) || defined(_M_X64)
+    due_pesate_v(dst, passo, w, h, a, b, passo_p, pa, pb, oa, ob, den);
+    (void)log2wd;
+    return;
+#else
     for (int r = 0; r < h; r++)
         for (int c = 0; c < w; c++)
             dst[r * passo + c] = ritaglia8(
                 (a[r * passo_p + c] * pa + b[r * passo_p + c] * pb
                  + ((oa + ob + 1) << log2wd)) >> (log2wd + 1));
+#endif
 }
 
 /* Does this slice carry a weight table at all. */
