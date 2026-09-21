@@ -201,6 +201,20 @@ static void compensa_blocco(h264_decoder_t *d, const h264d_frame_t *rif,
     const int16_t *mv = m->mv[lista][b];
     const int x4 = b & 3, y4 = b >> 2;
 
+    /* Clause 8.4.2.3. Weighted prediction scales and shifts what motion
+     * compensation produced, so when it is on the prediction lands in a
+     * scratch block first. x264 turns it on by default for P pictures, which
+     * is why nearly no real stream decodes without this. */
+    const int rif_idx = m->ref_idx[lista][h264d_part8(b)];
+    const bool pesata = d->pic.weighted_pred && d->slice.type == 0
+                     && rif_idx >= 0;
+    uint8_t tmp_y[16], tmp_cb[4], tmp_cr[4];
+    uint8_t *oy  = pesata ? tmp_y  : dy;
+    uint8_t *ocb = pesata ? tmp_cb : dcb;
+    uint8_t *ocr = pesata ? tmp_cr : dcr;
+    const int soy = pesata ? 4 : sdy;
+    const int soc = pesata ? 2 : sdc;
+
     const int px = d->mb_x * 16 + x4 * 4;
     const int py = d->mb_y * 16 + y4 * 4;
 
@@ -209,7 +223,7 @@ static void compensa_blocco(h264_decoder_t *d, const h264d_frame_t *rif,
                                              d->width, d->height,
                                              px + (mv[0] >> 2), py + (mv[1] >> 2),
                                              4, 4);
-    h264d_mc_luma(dy, sdy, src, 4 + 6, 4, 4, mv[0] & 3, mv[1] & 3);
+    h264d_mc_luma(oy, soy, src, 4 + 6, 4, 4, mv[0] & 3, mv[1] & 3);
 
     /* 4:2:0 chroma: the vector is the luma one, read at eighth-sample
      * accuracy over a plane at half the resolution. */
@@ -220,11 +234,28 @@ static void compensa_blocco(h264_decoder_t *d, const h264d_frame_t *rif,
     cs = h264d_mc_fetch_chroma(cpad, rif->cb, rif->stride_c,
                                d->width / 2, d->height / 2,
                                cx + (mv[0] >> 3), cy + (mv[1] >> 3), 2, 2);
-    h264d_mc_chroma(dcb, sdc, cs, 3, 2, 2, mv[0] & 7, mv[1] & 7);
+    h264d_mc_chroma(ocb, soc, cs, 3, 2, 2, mv[0] & 7, mv[1] & 7);
     cs = h264d_mc_fetch_chroma(cpad, rif->cr, rif->stride_c,
                                d->width / 2, d->height / 2,
                                cx + (mv[0] >> 3), cy + (mv[1] >> 3), 2, 2);
-    h264d_mc_chroma(dcr, sdc, cs, 3, 2, 2, mv[0] & 7, mv[1] & 7);
+    h264d_mc_chroma(ocr, soc, cs, 3, 2, 2, mv[0] & 7, mv[1] & 7);
+
+    if (!pesata)
+        return;
+
+    const h264d_slice_t *s = &d->slice;
+    h264d_mc_weight(dy, sdy, tmp_y, 4, 4, 4,
+                    s->luma_log2_weight_denom,
+                    s->luma_weight[lista][rif_idx],
+                    s->luma_offset[lista][rif_idx]);
+    h264d_mc_weight(dcb, sdc, tmp_cb, 2, 2, 2,
+                    s->chroma_log2_weight_denom,
+                    s->chroma_weight[lista][rif_idx][0],
+                    s->chroma_offset[lista][rif_idx][0]);
+    h264d_mc_weight(dcr, sdc, tmp_cr, 2, 2, 2,
+                    s->chroma_log2_weight_denom,
+                    s->chroma_weight[lista][rif_idx][1],
+                    s->chroma_offset[lista][rif_idx][1]);
 }
 
 /* --------------------------------------------------------- residual */

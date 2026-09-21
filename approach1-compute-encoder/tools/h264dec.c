@@ -312,6 +312,7 @@ int main(int argc, char **argv)
     int prev_poc_lsb = 0, prev_poc_msb = 0;
     int in_corso = 0;
     uint32_t superficie_corrente = 0;
+    int corrente_riferimento = 0, corrente_poc = 0, corrente_frame_num = 0;
 
     long i = 0;
     while (i + 3 < len) {
@@ -420,18 +421,64 @@ int main(int argc, char **argv)
          * list has to name are settled. */
         for (int k = 0; k < 32; k++) sl.ref_list[0][k] = sl.ref_list[1][k] = 0;
 
-        /* reference list modification: refused rather than ignored */
-        if (slice_type != 2) {
-            if (br_read1(&br)) {
-                fprintf(stderr, "ref_pic_list_modification presente, "
-                                "non implementata\n");
-                return 3;
+        /* Clause 7.3.3.1, read here and applied once the frame store slots
+         * are known. A stream that reorders its list is not exotic: x264
+         * does it whenever weighted prediction is on, which is by default. */
+        int n_mod = 0;
+        int mod_idc[32], mod_val[32];
+        if (slice_type != 2 && br_read1(&br)) {
+            for (;;) {
+                const int idc = (int)br_read_ue(&br);
+                if (idc == 3 || n_mod >= 32) break;
+                const int v = (int)br_read_ue(&br);
+                mod_idc[n_mod] = idc;
+                mod_val[n_mod] = v;
+                n_mod++;
             }
         }
+        /* Clause 7.3.3.2. A reference whose flag is clear takes the neutral
+         * weight, which is 1 << denom and not 1: the shift is applied either
+         * way, so a weight of 1 would divide the prediction instead of
+         * leaving it alone. */
+        sl.luma_log2_weight_denom = 0;
+        sl.chroma_log2_weight_denom = 0;
+        for (int l = 0; l < 2; l++)
+            for (int k = 0; k < 32; k++) {
+                sl.luma_weight[l][k] = 1;
+                sl.luma_offset[l][k] = 0;
+                sl.chroma_weight[l][k][0] = 1;
+                sl.chroma_weight[l][k][1] = 1;
+                sl.chroma_offset[l][k][0] = 0;
+                sl.chroma_offset[l][k][1] = 0;
+            }
+
         if ((pp->weighted_pred && slice_type == 0)
             || (pp->weighted_bipred_idc == 1 && slice_type == 1)) {
-            fprintf(stderr, "pesi espliciti nell'header, non implementati\n");
-            return 3;
+            sl.luma_log2_weight_denom = (int)br_read_ue(&br);
+            sl.chroma_log2_weight_denom = (int)br_read_ue(&br);
+            const int ld = sl.luma_log2_weight_denom;
+            const int cd = sl.chroma_log2_weight_denom;
+            for (int l = 0; l < 2; l++)
+                for (int k = 0; k < 32; k++) {
+                    sl.luma_weight[l][k] = (int16_t)(1 << ld);
+                    sl.chroma_weight[l][k][0] = (int16_t)(1 << cd);
+                    sl.chroma_weight[l][k][1] = (int16_t)(1 << cd);
+                }
+            const int liste = (slice_type == 1) ? 2 : 1;
+            for (int l = 0; l < liste; l++) {
+                for (int k = 0; k < sl.num_ref_idx[l] && k < 32; k++) {
+                    if (br_read1(&br)) {
+                        sl.luma_weight[l][k] = (int16_t)br_read_se(&br);
+                        sl.luma_offset[l][k] = (int16_t)br_read_se(&br);
+                    }
+                    if (br_read1(&br)) {
+                        for (int j = 0; j < 2; j++) {
+                            sl.chroma_weight[l][k][j] = (int16_t)br_read_se(&br);
+                            sl.chroma_offset[l][k][j] = (int16_t)br_read_se(&br);
+                        }
+                    }
+                }
+            }
         }
         if (nal_ref_idc) {
             if (idr) { br_read1(&br); br_read1(&br); }
@@ -463,6 +510,15 @@ int main(int argc, char **argv)
         }
 
         if (first_mb == 0) {
+            if (in_corso && corrente_riferimento) {
+                /* the picture that just finished joins the list */
+                for (int k = 15; k > 0; k--) rifs[k] = rifs[k - 1];
+                rifs[0].surface = superficie_corrente;
+                rifs[0].poc = corrente_poc;
+                rifs[0].frame_num = corrente_frame_num;
+                if (n_rif < sp->max_num_ref_frames && n_rif < 16) n_rif++;
+                corrente_riferimento = 0;
+            }
             if (in_corso) {
                 h264_decoder_end_picture(dec, (gpu_image_t){0}, (gpu_memory_t){0});
                 h264d_frame_t *f = h264_decoder_frame_for(dec, superficie_corrente);
@@ -510,25 +566,82 @@ int main(int argc, char **argv)
             in_corso = 1;
         }
 
-        /* The reference list has to name DPB slots, which only exist once
-         * begin_picture has run. */
-        for (int k = 0; k < n_rif && k < 32; k++) {
-            h264d_frame_t *f = h264_decoder_frame_for(dec, rifs[k].surface);
-            sl.ref_list[0][k] = f ? (int8_t)h264_decoder_slot_of(dec, f) : 0;
+        /* PicNum for a short-term reference, clause 8.2.4.1: a frame_num
+         * ahead of the current picture's belongs to the previous cycle, so
+         * it counts as negative rather than as a large positive. */
+        const int max_pic_num = 1 << sp->log2_max_frame_num;
+        int pic_num_di[16];
+        for (int k = 0; k < n_rif; k++)
+            pic_num_di[k] = (rifs[k].frame_num > frame_num)
+                          ? rifs[k].frame_num - max_pic_num
+                          : rifs[k].frame_num;
+
+        /* The initial list, clause 8.2.4.2.1: short-term references by
+         * descending PicNum, which without frame_num gaps is reverse decode
+         * order - the order `rifs` already holds. It is then cut to the
+         * number of active indices the slice declared. */
+        /* ⚠️ The list is as long as num_ref_idx says, even when the frame
+         * store holds fewer pictures than that. Reordering may put the same
+         * picture at several indices, and x264 does exactly that for
+         * weighted prediction: the same reference twice, once with an offset
+         * of its own. Capping the list at the number of distinct pictures
+         * left the tail pointing at whatever slot 0 happened to be, which
+         * was right only while slot 0 was still a reference. */
+        rif_t lista0[34];
+        int n_attivo = sl.num_ref_idx[0];
+        if (n_attivo > 32) n_attivo = 32;
+        for (int k = 0; k < n_attivo; k++)
+            lista0[k] = rifs[k < n_rif ? k : (n_rif > 0 ? n_rif - 1 : 0)];
+
+        /* Clause 8.2.4.3.1. Each step names a picture by PicNum, slides the
+         * list down from the current index, drops the named picture in, and
+         * squeezes out the copy of it that is now further along.
+         *
+         * ⚠️ The picture is looked up in the FRAME STORE, not in the list
+         * being built. Searching the list finds the entry the slide has just
+         * duplicated, which is only the right answer by accident. */
+        if (n_mod > 0 && n_attivo > 0) {
+            int pred = frame_num;
+            int ref_idx = 0;
+            for (int k = 0; k < n_mod && ref_idx < n_attivo; k++) {
+                if (mod_idc[k] != 0 && mod_idc[k] != 1) {
+                    fprintf(stderr, "riferimenti a lungo termine, "
+                                    "non implementati\n");
+                    return 3;
+                }
+                const int delta = mod_val[k] + 1;
+                int senza_giro = (mod_idc[k] == 0) ? pred - delta : pred + delta;
+                if (senza_giro < 0) senza_giro += max_pic_num;
+                else if (senza_giro >= max_pic_num) senza_giro -= max_pic_num;
+                pred = senza_giro;
+                const int pic_num = (senza_giro > frame_num)
+                                  ? senza_giro - max_pic_num : senza_giro;
+
+                int trovato = -1;
+                for (int c = 0; c < n_rif; c++)
+                    if (pic_num_di[c] == pic_num) { trovato = c; break; }
+                if (trovato < 0) {
+                    fprintf(stderr, "la lista chiede PicNum %d, che non c'e'\n",
+                            pic_num);
+                    return 3;
+                }
+                const rif_t scelto = rifs[trovato];
+
+                for (int c = n_attivo; c > ref_idx; c--)
+                    lista0[c] = lista0[c - 1];
+                lista0[ref_idx++] = scelto;
+                int n2 = ref_idx;
+                for (int c = ref_idx; c <= n_attivo; c++)
+                    if (lista0[c].surface != scelto.surface)
+                        lista0[n2++] = lista0[c];
+            }
         }
 
-        if (getenv("BC250_H264_REFS"))
-            fprintf(stderr, "fotogramma %d: tipo %d frame_num %d poc %d "
-                            "superficie %u slot %d | num_ref %d | lista:%s",
-                    fotogrammi, slice_type, frame_num, poc, superficie_corrente,
-                    h264_decoder_slot_of(dec,
-                        h264_decoder_frame_for(dec, superficie_corrente)),
-                    sl.num_ref_idx[0], "");
-        if (getenv("BC250_H264_REFS")) {
-            for (int k = 0; k < n_rif; k++)
-                fprintf(stderr, " sup%u=slot%d(fn%d)", rifs[k].surface,
-                        sl.ref_list[0][k], rifs[k].frame_num);
-            fprintf(stderr, "\n");
+        /* The list names frame store slots, which only exist once
+         * begin_picture has run. */
+        for (int k = 0; k < n_attivo; k++) {
+            h264d_frame_t *f = h264_decoder_frame_for(dec, lista0[k].surface);
+            sl.ref_list[0][k] = f ? (int8_t)h264_decoder_slot_of(dec, f) : 0;
         }
 
         const int r = h264_decoder_slice(dec, &sl, rbsp, n, bit_offset);
@@ -540,13 +653,12 @@ int main(int argc, char **argv)
             return 4;
         }
 
-        if (nal_ref_idc) {
-            for (int k = 15; k > 0; k--) rifs[k] = rifs[k - 1];
-            rifs[0].surface = superficie_corrente;
-            rifs[0].poc = poc;
-            rifs[0].frame_num = frame_num;
-            if (n_rif < sp->max_num_ref_frames && n_rif < 16) n_rif++;
-        }
+        /* ⚠️ Remembered, not applied: a picture joins the reference list
+         * once, when it is finished. Doing it per slice pushed the older
+         * references out four times as fast on a picture cut into four. */
+        corrente_riferimento = nal_ref_idc != 0;
+        corrente_poc = poc;
+        corrente_frame_num = frame_num;
     }
 
     if (in_corso && dec) {
