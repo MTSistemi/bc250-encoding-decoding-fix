@@ -35,6 +35,8 @@
 #include <stdint.h>
 
 #include "cabac.h"            /* cabac_range_lps, cabac_transition */
+#include <string.h>
+
 #include "h264_dec_tables.h"  /* h264d_cabac_init_I, h264d_cabac_init_PB */
 
 #define H264D_CABAC_CTX 1024
@@ -115,9 +117,11 @@ static inline void h264d_cabac_ctx_init(uint8_t *state, bool intra_slice,
 
 /* Clause 9.3.1.2. The caller has already skipped the alignment bits, so
  * `data` starts on a byte boundary. */
-static inline void h264d_cabac_init(h264d_cabac_t *c,
-                                    const uint8_t *data, size_t size,
-                                    bool intra_slice, int cabac_init_idc, int qp)
+/* Clause 9.3.1.2: range starts at 510 and offset is the next nine bits.
+ * Shared with H.265, which specifies the same machine - see
+ * hevc_cabac_dec.h. */
+static inline void h264d_cabac_init_engine(h264d_cabac_t *c,
+                                           const uint8_t *data, size_t size)
 {
     c->start = data;
     c->ptr = data;
@@ -126,6 +130,13 @@ static inline void h264d_cabac_init(h264d_cabac_t *c,
     c->cache_bits = 0;
     c->range = 510;
     c->low = h264d_cabac_bits(c, 9);
+}
+
+static inline void h264d_cabac_init(h264d_cabac_t *c,
+                                    const uint8_t *data, size_t size,
+                                    bool intra_slice, int cabac_init_idc, int qp)
+{
+    h264d_cabac_init_engine(c, data, size);
     h264d_cabac_ctx_init(c->state, intra_slice, cabac_init_idc, qp);
 }
 
