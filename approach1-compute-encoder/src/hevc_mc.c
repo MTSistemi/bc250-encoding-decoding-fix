@@ -37,11 +37,307 @@ static inline int campione(const uint8_t *p, int passo, int w, int h,
     return p[(size_t)y * passo + x];
 }
 
-/* One rectangle of one plane, at a fractional position, into fourteen-bit
- * intermediate values.
+/* ------------------------------------------------- the vector paths */
+
+/* SSE2 is part of the x86-64 ABI, so the two stages that take fourteen
+ * bits back down to eight need no runtime check. The filter itself wants
+ * _mm_maddubs_epi16, which is SSSE3, and asks first.
  *
- * `prima` is how far back the filter reaches: three samples for the eight
- * taps of luma, one for the four of chroma. */
+ * ⚠️ Nothing here is allowed to disagree with the scalar twin beside it by
+ * so much as a level. Both are exercised by the same suites, which compare
+ * whole sequences with ffmpeg byte for byte, so a vector path that gets an
+ * order or a shift wrong fails loudly instead of quietly softening the
+ * picture. That is what makes these safe to write. */
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+
+static int ha_ssse3(void)
+{
+    static int risposta = -1;
+    if (risposta < 0) risposta = __builtin_cpu_supports("ssse3") ? 1 : 0;
+    return risposta;
+}
+
+/* Two consecutive taps, broadcast: the shape _mm_maddubs_epi16 wants,
+ * which multiplies unsigned samples by signed taps and adds each adjacent
+ * pair into sixteen bits. */
+__attribute__((target("ssse3")))
+static inline __m128i coppia(const int8_t *f, int k)
+{
+    const uint16_t due_byte = (uint16_t)((uint8_t)f[k])
+                            | (uint16_t)((uint8_t)f[k + 1] << 8);
+    return _mm_set1_epi16((int16_t)due_byte);
+}
+
+/* The same pair as two sixteen-bit lanes, for _mm_madd_epi16 when the
+ * samples coming in are already fourteen-bit. */
+__attribute__((target("ssse3")))
+static inline __m128i coppia32(const int8_t *f, int k)
+{
+    const uint32_t due_corti = (uint32_t)(uint16_t)(int16_t)f[k]
+                             | ((uint32_t)(uint16_t)(int16_t)f[k + 1] << 16);
+    return _mm_set1_epi32((int32_t)due_corti);
+}
+
+/* ⚠️ Eight outputs of an eight tap filter need fifteen bytes and the load
+ * takes sixteen. At the end of a row that sixteenth byte can be one past
+ * the end of the reference picture, and a picture whose last row ends on a
+ * page boundary would fault on a read the filter never uses. */
+__attribute__((target("ssse3")))
+static inline __m128i carica(const uint8_t *p, int disponibili)
+{
+    if (disponibili >= 16) return _mm_loadu_si128((const __m128i *)p);
+    uint8_t t[16];
+    memset(t, 0, sizeof t);
+    memcpy(t, p, (size_t)disponibili);
+    return _mm_loadu_si128((const __m128i *)t);
+}
+
+/* Along a row, eight or four taps, eight outputs at a time.
+ *
+ * The taps of one output overlap the taps of the next, so one load covers
+ * all eight: _mm_shuffle_epi8 lays out the pair each output needs for tap
+ * k and k+1, and four (or two) maddubs and three (or one) adds finish it.
+ *
+ * ⚠️ maddubs saturates. It cannot bite here - the largest H.265 luma
+ * filter sums to 112, so a pair reaches at most 75 * 255 and the whole
+ * sum 112 * 255, both inside sixteen bits - and that is why the adds may
+ * be plain wrapping adds that match the scalar truncation exactly. */
+#define ORIZZONTALE_V(nome, N, SCALARE)                                       \
+__attribute__((target("ssse3")))                                              \
+static void nome(const uint8_t *src, int sp, int w, int h,                    \
+                 const int8_t *f, int16_t *fuori, int pf)                     \
+{                                                                             \
+    const __m128i c0 = coppia(f, 0), c2 = coppia(f, 2);                       \
+    const __m128i c4 = (N) == 8 ? coppia(f, 4) : _mm_setzero_si128();         \
+    const __m128i c6 = (N) == 8 ? coppia(f, 6) : _mm_setzero_si128();         \
+    const __m128i m0 = _mm_setr_epi8(0, 1, 1, 2, 2, 3, 3, 4,                  \
+                                     4, 5, 5, 6, 6, 7, 7, 8);                 \
+    const __m128i m2 = _mm_setr_epi8(2, 3, 3, 4, 4, 5, 5, 6,                  \
+                                     6, 7, 7, 8, 8, 9, 9, 10);                \
+    const __m128i m4 = _mm_setr_epi8(4, 5, 5, 6, 6, 7, 7, 8,                  \
+                                     8, 9, 9, 10, 10, 11, 11, 12);            \
+    const __m128i m6 = _mm_setr_epi8(6, 7, 7, 8, 8, 9, 9, 10,                 \
+                                     10, 11, 11, 12, 12, 13, 13, 14);         \
+    for (int r = 0; r < h; r++) {                                             \
+        const uint8_t *s = src + (size_t)r * sp;                              \
+        int16_t *o = fuori + (size_t)r * pf;                                  \
+        int c = 0;                                                            \
+        for (; c + 8 <= w; c += 8) {                                          \
+            const __m128i v = carica(s + c, w + (N) - 1 - c);                 \
+            __m128i a = _mm_maddubs_epi16(_mm_shuffle_epi8(v, m0), c0);       \
+            a = _mm_add_epi16(a, _mm_maddubs_epi16(                           \
+                    _mm_shuffle_epi8(v, m2), c2));                            \
+            if ((N) == 8) {                                                   \
+                a = _mm_add_epi16(a, _mm_maddubs_epi16(                       \
+                        _mm_shuffle_epi8(v, m4), c4));                        \
+                a = _mm_add_epi16(a, _mm_maddubs_epi16(                       \
+                        _mm_shuffle_epi8(v, m6), c6));                        \
+            }                                                                 \
+            _mm_storeu_si128((__m128i *)(o + c), a);                          \
+        }                                                                     \
+        if (c < w) SCALARE(s, o, c, w, f);                                    \
+    }                                                                         \
+}
+
+/* Down a column, from whole samples. One load per tap row, and
+ * _mm_unpacklo_epi8 puts tap k and tap k+1 of the same column side by side
+ * where maddubs expects them. */
+#define VERTICALE_V(nome, N, SCALARE)                                         \
+__attribute__((target("ssse3")))                                              \
+static void nome(const uint8_t *src, int sp, int w, int h,                    \
+                 const int8_t *f, int16_t *fuori, int pf)                     \
+{                                                                             \
+    const __m128i c0 = coppia(f, 0), c2 = coppia(f, 2);                       \
+    const __m128i c4 = (N) == 8 ? coppia(f, 4) : _mm_setzero_si128();         \
+    const __m128i c6 = (N) == 8 ? coppia(f, 6) : _mm_setzero_si128();         \
+    for (int r = 0; r < h; r++) {                                             \
+        const uint8_t *s = src + (size_t)r * sp;                              \
+        int16_t *o = fuori + (size_t)r * pf;                                  \
+        int c = 0;                                                            \
+        for (; c + 8 <= w; c += 8) {                                          \
+            __m128i l[8];                                                     \
+            for (int k = 0; k < (N); k++)                                     \
+                l[k] = _mm_loadl_epi64(                                       \
+                    (const __m128i *)(s + (size_t)k * sp + c));               \
+            __m128i a = _mm_maddubs_epi16(_mm_unpacklo_epi8(l[0], l[1]), c0); \
+            a = _mm_add_epi16(a, _mm_maddubs_epi16(                           \
+                    _mm_unpacklo_epi8(l[2], l[3]), c2));                      \
+            if ((N) == 8) {                                                   \
+                a = _mm_add_epi16(a, _mm_maddubs_epi16(                       \
+                        _mm_unpacklo_epi8(l[4], l[5]), c4));                  \
+                a = _mm_add_epi16(a, _mm_maddubs_epi16(                       \
+                        _mm_unpacklo_epi8(l[6], l[7]), c6));                  \
+            }                                                                 \
+            _mm_storeu_si128((__m128i *)(o + c), a);                          \
+        }                                                                     \
+        if (c < w) SCALARE(s, sp, o, c, w, f);                                \
+    }                                                                         \
+}
+
+/* Down a column, from the fourteen-bit output of a horizontal pass. These
+ * no longer fit in sixteen bits once multiplied, so _mm_madd_epi16 carries
+ * them in thirty-two.
+ *
+ * ⚠️ And the way back down is a shuffle, not a pack. _mm_packs_epi32
+ * saturates; the scalar path truncates. They agree on every stream that
+ * conforms and part company on one that does not, which is the kind of
+ * difference that surfaces years later in a crash report. */
+#define VERTICALE16_V(nome, N, SCALARE)                                       \
+__attribute__((target("ssse3")))                                              \
+static void nome(const int16_t *src, int sp, int w, int h,                    \
+                 const int8_t *f, int16_t *fuori, int pf)                     \
+{                                                                             \
+    const __m128i c0 = coppia32(f, 0), c2 = coppia32(f, 2);                   \
+    const __m128i c4 = (N) == 8 ? coppia32(f, 4) : _mm_setzero_si128();       \
+    const __m128i c6 = (N) == 8 ? coppia32(f, 6) : _mm_setzero_si128();       \
+    const __m128i giu = _mm_setr_epi8(0, 1, 4, 5, 8, 9, 12, 13,               \
+                                      -1, -1, -1, -1, -1, -1, -1, -1);        \
+    for (int r = 0; r < h; r++) {                                             \
+        const int16_t *s = src + (size_t)r * sp;                              \
+        int16_t *o = fuori + (size_t)r * pf;                                  \
+        int c = 0;                                                            \
+        for (; c + 8 <= w; c += 8) {                                          \
+            __m128i v[8];                                                     \
+            for (int k = 0; k < (N); k++)                                     \
+                v[k] = _mm_loadu_si128(                                       \
+                    (const __m128i *)(s + (size_t)k * sp + c));               \
+            __m128i lo = _mm_madd_epi16(_mm_unpacklo_epi16(v[0], v[1]), c0);  \
+            __m128i hi = _mm_madd_epi16(_mm_unpackhi_epi16(v[0], v[1]), c0);  \
+            lo = _mm_add_epi32(lo, _mm_madd_epi16(                            \
+                    _mm_unpacklo_epi16(v[2], v[3]), c2));                     \
+            hi = _mm_add_epi32(hi, _mm_madd_epi16(                            \
+                    _mm_unpackhi_epi16(v[2], v[3]), c2));                     \
+            if ((N) == 8) {                                                   \
+                lo = _mm_add_epi32(lo, _mm_madd_epi16(                        \
+                        _mm_unpacklo_epi16(v[4], v[5]), c4));                 \
+                hi = _mm_add_epi32(hi, _mm_madd_epi16(                        \
+                        _mm_unpackhi_epi16(v[4], v[5]), c4));                 \
+                lo = _mm_add_epi32(lo, _mm_madd_epi16(                        \
+                        _mm_unpacklo_epi16(v[6], v[7]), c6));                 \
+                hi = _mm_add_epi32(hi, _mm_madd_epi16(                        \
+                        _mm_unpackhi_epi16(v[6], v[7]), c6));                 \
+            }                                                                 \
+            lo = _mm_srai_epi32(lo, 6);                                       \
+            hi = _mm_srai_epi32(hi, 6);                                       \
+            _mm_storeu_si128((__m128i *)(o + c),                              \
+                _mm_unpacklo_epi64(_mm_shuffle_epi8(lo, giu),                 \
+                                   _mm_shuffle_epi8(hi, giu)));               \
+        }                                                                     \
+        if (c < w) SCALARE(s, sp, o, c, w, f);                                \
+    }                                                                         \
+}
+
+/* The tails, for the columns at the right edge that do not fill a
+ * register. The same arithmetic, one sample at a time. */
+#define CODA_ORIZ(N)                                                          \
+static inline void coda_oriz##N(const uint8_t *s, int16_t *o, int c, int w,   \
+                                const int8_t *f)                              \
+{                                                                             \
+    for (; c < w; c++) {                                                      \
+        int v = 0;                                                            \
+        for (int k = 0; k < (N); k++) v += f[k] * s[c + k];                   \
+        o[c] = (int16_t)v;                                                    \
+    }                                                                         \
+}
+
+#define CODA_VERT(N, TIPO, GIU, suffisso)                                     \
+static inline void coda_vert##suffisso(const TIPO *s, int sp, int16_t *o,     \
+                                       int c, int w, const int8_t *f)         \
+{                                                                             \
+    for (; c < w; c++) {                                                      \
+        int v = 0;                                                            \
+        for (int k = 0; k < (N); k++) v += f[k] * s[(size_t)k * sp + c];      \
+        o[c] = (int16_t)(v >> (GIU));                                         \
+    }                                                                         \
+}
+
+CODA_ORIZ(8)
+CODA_ORIZ(4)
+CODA_VERT(8, uint8_t, 0, 8)
+CODA_VERT(4, uint8_t, 0, 4)
+CODA_VERT(8, int16_t, 6, 8_16)
+CODA_VERT(4, int16_t, 6, 4_16)
+
+ORIZZONTALE_V(oriz8_v, 8, coda_oriz8)
+ORIZZONTALE_V(oriz4_v, 4, coda_oriz4)
+VERTICALE_V(vert8_v, 8, coda_vert8)
+VERTICALE_V(vert4_v, 4, coda_vert4)
+VERTICALE16_V(vert8_16_v, 8, coda_vert8_16)
+VERTICALE16_V(vert4_16_v, 4, coda_vert4_16)
+
+/* A motion vector that lands on a whole sample: nothing to filter, just
+ * the samples moved up into fourteen bits. */
+static void copia14_v(const uint8_t *src, int sp, int w, int h,
+                      int16_t *fuori, int pf)
+{
+    const __m128i zero = _mm_setzero_si128();
+    for (int r = 0; r < h; r++) {
+        const uint8_t *s = src + (size_t)r * sp;
+        int16_t *o = fuori + (size_t)r * pf;
+        int c = 0;
+        for (; c + 8 <= w; c += 8) {
+            const __m128i v = _mm_loadl_epi64((const __m128i *)(s + c));
+            _mm_storeu_si128((__m128i *)(o + c),
+                _mm_slli_epi16(_mm_unpacklo_epi8(v, zero), 6));
+        }
+        for (; c < w; c++) o[c] = (int16_t)(s[c] << 6);
+    }
+}
+
+/* One prediction down to eight bits. ⚠️ Adding 32 in sixteen bits is safe
+ * only because the largest fourteen-bit intermediate is 112 * 255. */
+static void uno_v(uint8_t *dst, int passo, int w, int h,
+                  const int16_t *a, int passo_a)
+{
+    const __m128i trentadue = _mm_set1_epi16(32);
+    for (int r = 0; r < h; r++) {
+        const int16_t *s = a + (size_t)r * passo_a;
+        uint8_t *o = dst + (size_t)r * passo;
+        int c = 0;
+        for (; c + 8 <= w; c += 8) {
+            __m128i v = _mm_loadu_si128((const __m128i *)(s + c));
+            v = _mm_srai_epi16(_mm_add_epi16(v, trentadue), 6);
+            _mm_storel_epi64((__m128i *)(o + c), _mm_packus_epi16(v, v));
+        }
+        for (; c < w; c++) o[c] = ritaglia8((s[c] + 32) >> 6);
+    }
+}
+
+/* Two averaged. ⚠️ Two fourteen-bit values added do not fit in sixteen,
+ * so this one widens first - which is also why it is the slower of the
+ * two and worth having in vectors at all. */
+static void due_v(uint8_t *dst, int passo, int w, int h,
+                  const int16_t *a, const int16_t *b, int passo_p)
+{
+    const __m128i sessantaquattro = _mm_set1_epi32(64);
+    for (int r = 0; r < h; r++) {
+        const int16_t *sa = a + (size_t)r * passo_p;
+        const int16_t *sb = b + (size_t)r * passo_p;
+        uint8_t *o = dst + (size_t)r * passo;
+        int c = 0;
+        for (; c + 8 <= w; c += 8) {
+            const __m128i va = _mm_loadu_si128((const __m128i *)(sa + c));
+            const __m128i vb = _mm_loadu_si128((const __m128i *)(sb + c));
+            __m128i lo = _mm_add_epi32(
+                _mm_srai_epi32(_mm_unpacklo_epi16(va, va), 16),
+                _mm_srai_epi32(_mm_unpacklo_epi16(vb, vb), 16));
+            __m128i hi = _mm_add_epi32(
+                _mm_srai_epi32(_mm_unpackhi_epi16(va, va), 16),
+                _mm_srai_epi32(_mm_unpackhi_epi16(vb, vb), 16));
+            lo = _mm_srai_epi32(_mm_add_epi32(lo, sessantaquattro), 7);
+            hi = _mm_srai_epi32(_mm_add_epi32(hi, sessantaquattro), 7);
+            const __m128i sedici = _mm_packs_epi32(lo, hi);
+            _mm_storel_epi64((__m128i *)(o + c),
+                             _mm_packus_epi16(sedici, sedici));
+        }
+        for (; c < w; c++) o[c] = ritaglia8((sa[c] + sb[c] + 64) >> 7);
+    }
+}
+#endif /* x86-64 */
+
+/* ----------------------------------------------- and the scalar twins */
+
 /* One pass of the filter across a rectangle, reading whole samples along
  * a row.
  *
@@ -89,6 +385,23 @@ VERTICALE(vert4, 4, uint8_t, 0)
 VERTICALE(vert8_16, 8, int16_t, 6)
 VERTICALE(vert4_16, 4, int16_t, 6)
 
+/* ------------------------------------------------ and which one to use */
+
+#if defined(__x86_64__) || defined(_M_X64)
+#define ORIZ(n) (ha_ssse3() ? oriz##n##_v : oriz##n)
+#define VERT(n) (ha_ssse3() ? vert##n##_v : vert##n)
+#define VERT16(n) (ha_ssse3() ? vert##n##_16_v : vert##n##_16)
+#else
+#define ORIZ(n) oriz##n
+#define VERT(n) vert##n
+#define VERT16(n) vert##n##_16
+#endif
+
+/* One rectangle of one plane, at a fractional position, into fourteen-bit
+ * intermediate values.
+ *
+ * `prima` is how far back the filter reaches: three samples for the eight
+ * taps of luma, one for the four of chroma. */
 static void interpola(const uint8_t *rif, int passo, int w_pic, int h_pic,
                       int x, int y, int w, int h, int fx, int fy,
                       const int8_t *filtro, int quanti, int prima,
@@ -128,22 +441,26 @@ static void interpola(const uint8_t *rif, int passo, int w_pic, int h_pic,
     }
 
     if (!fx && !fy) {
+#if defined(__x86_64__) || defined(_M_X64)
+        copia14_v(src, sp, w, h, fuori, passo_fuori);
+#else
         for (int r = 0; r < h; r++)
             for (int c = 0; c < w; c++)
                 fuori[r * passo_fuori + c] =
                     (int16_t)(src[(size_t)r * sp + c] << 6);
+#endif
         return;
     }
 
     if (!fy) {
-        if (quanti == 8) oriz8(src, sp, w, h, fh, fuori, passo_fuori);
-        else             oriz4(src, sp, w, h, fh, fuori, passo_fuori);
+        if (quanti == 8) ORIZ(8)(src, sp, w, h, fh, fuori, passo_fuori);
+        else             ORIZ(4)(src, sp, w, h, fh, fuori, passo_fuori);
         return;
     }
 
     if (!fx) {
-        if (quanti == 8) vert8(src, sp, w, h, fv, fuori, passo_fuori);
-        else             vert4(src, sp, w, h, fv, fuori, passo_fuori);
+        if (quanti == 8) VERT(8)(src, sp, w, h, fv, fuori, passo_fuori);
+        else             VERT(4)(src, sp, w, h, fv, fuori, passo_fuori);
         return;
     }
 
@@ -152,11 +469,11 @@ static void interpola(const uint8_t *rif, int passo, int w_pic, int h_pic,
     int16_t mezzo[(LATO_MAX + 7) * LATO_MAX];
     const int alte = h + quanti - 1;
     if (quanti == 8) {
-        oriz8(src, sp, w, alte, fh, mezzo, LATO_MAX);
-        vert8_16(mezzo, LATO_MAX, w, h, fv, fuori, passo_fuori);
+        ORIZ(8)(src, sp, w, alte, fh, mezzo, LATO_MAX);
+        VERT16(8)(mezzo, LATO_MAX, w, h, fv, fuori, passo_fuori);
     } else {
-        oriz4(src, sp, w, alte, fh, mezzo, LATO_MAX);
-        vert4_16(mezzo, LATO_MAX, w, h, fv, fuori, passo_fuori);
+        ORIZ(4)(src, sp, w, alte, fh, mezzo, LATO_MAX);
+        VERT16(4)(mezzo, LATO_MAX, w, h, fv, fuori, passo_fuori);
     }
 }
 
@@ -165,18 +482,26 @@ static void interpola(const uint8_t *rif, int passo, int w_pic, int h_pic,
 static void uno(uint8_t *dst, int passo, int w, int h,
                 const int16_t *a, int passo_a)
 {
+#if defined(__x86_64__) || defined(_M_X64)
+    uno_v(dst, passo, w, h, a, passo_a);
+#else
     for (int r = 0; r < h; r++)
         for (int c = 0; c < w; c++)
             dst[r * passo + c] = ritaglia8((a[r * passo_a + c] + 32) >> 6);
+#endif
 }
 
 static void due(uint8_t *dst, int passo, int w, int h,
                 const int16_t *a, const int16_t *b, int passo_p)
 {
+#if defined(__x86_64__) || defined(_M_X64)
+    due_v(dst, passo, w, h, a, b, passo_p);
+#else
     for (int r = 0; r < h; r++)
         for (int c = 0; c < w; c++)
             dst[r * passo + c] =
                 ritaglia8((a[r * passo_p + c] + b[r * passo_p + c] + 64) >> 7);
+#endif
 }
 
 /* 8.5.3.3.4.3. ⚠️ Used whenever the slice carries a weight table, even
