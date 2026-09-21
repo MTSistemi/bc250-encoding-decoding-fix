@@ -193,7 +193,10 @@ static void test_dynamic_qp_and_rate_control(void) {
     assert(hevc_encoder_get_qp(enc) == 27);
     assert(hevc_encoder_get_bitrate(enc) == 2000000);
     assert(hevc_encoder_get_fps(enc) == 30);
-    assert(hevc_encoder_get_rc_mode(enc) == RC_CQP);
+    /* A new encoder runs its rate control, the same way the H.264 path
+     * does. It only starts in RC_CQP when the caller has pinned a QP
+     * through BC250_HEVC_QP, which is checked below. */
+    assert(hevc_encoder_get_rc_mode(enc) == RC_LOW_LATENCY);
 
     uint8_t *y_plane = malloc((size_t)width * height);
     uint8_t *uv_plane = malloc((size_t)(width / 2) * (height / 2) * 2);
@@ -210,6 +213,14 @@ static void test_dynamic_qp_and_rate_control(void) {
             uv_plane[r * width + c * 2 + 0] = (uint8_t)((r * 13 + c * 7) & 0xFF);
             uv_plane[r * width + c * 2 + 1] = (uint8_t)((r * 23 + c * 11) & 0xFF);
         }
+
+    /* The next two encodes are about the QP reaching the picture, so they
+     * run in constant-QP mode. Under a bitrate-driven mode the rate control
+     * picks the QP for each frame and what the caller set does not reach the
+     * slice header, so comparing the two sizes would be measuring the loop,
+     * not the quantiser. */
+    hevc_encoder_set_rc_mode(enc, RC_CQP);
+    assert(hevc_encoder_get_rc_mode(enc) == RC_CQP);
 
     /* Encode at low QP (18) */
     hevc_encoder_set_qp(enc, 18);
@@ -249,6 +260,19 @@ static void test_dynamic_qp_and_rate_control(void) {
 
     free(y_plane); free(uv_plane); free(out_buf);
     hevc_encoder_destroy(enc);
+
+    /* Naming a QP is asking for that QP: BC250_HEVC_QP has to start the
+     * encoder in RC_CQP, or the loop would quietly override the number the
+     * caller went out of their way to set. Read at create time, so it needs
+     * an encoder of its own. */
+    setenv("BC250_HEVC_QP", "23", 1);
+    hevc_encoder_t *pinned = hevc_encoder_create(NULL, width, height, fps, bitrate);
+    assert(pinned != NULL);
+    assert(hevc_encoder_get_rc_mode(pinned) == RC_CQP);
+    assert(hevc_encoder_get_qp(pinned) == 23);
+    hevc_encoder_destroy(pinned);
+    unsetenv("BC250_HEVC_QP");
+
     printf("[test_hevc_encode] Dynamic QP and rate control OK.\n");
 }
 
