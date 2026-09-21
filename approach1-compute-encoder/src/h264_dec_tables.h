@@ -41,5 +41,8 @@ extern const uint8_t h264d_chroma_dc_total_zeros_len[3][4];
 extern const uint8_t h264d_chroma_dc_total_zeros_bits[3][4];
 extern const uint8_t h264d_run_len[7][16];
 extern const uint8_t h264d_run_bits[7][16];
+extern const uint8_t h264d_alpha[52];
+extern const uint8_t h264d_beta[52];
+extern const uint8_t h264d_tc0[52][3];
 
 #endif /* BC250_H264_DEC_TABLES_H */

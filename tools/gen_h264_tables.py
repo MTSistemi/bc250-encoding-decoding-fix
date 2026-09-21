@@ -227,7 +227,8 @@ def main():
     out = pathlib.Path(sys.argv[2])
 
     sorgenti = {}
-    for nome in ("h264_cabac.c", "h264data.c", "h264_cavlc.c", "cabac.c"):
+    for nome in ("h264_cabac.c", "h264data.c", "h264_cavlc.c", "cabac.c",
+                 "h264_loopfilter.c"):
         p = rif / nome
         if not p.exists():
             raise SystemExit("manca il riferimento %s" % p)
@@ -332,6 +333,27 @@ def main():
           matrice(sorgenti, "run_len", 7, 16), 16, 2)
     bidim("uint8_t", "h264d_run_bits", 7, 16,
           matrice(sorgenti, "run_bits", 7, 16), 16, 2)
+
+
+    # ---- deblocking, Tables 8-16 and 8-17 ---------------------------------
+    # ⚠️ FFmpeg pads these with 52 entries of 0 in front and 52 of 255 behind,
+    # so that indexA and indexB can run out of range without a bounds check.
+    # Only the middle 52 are the standard's table.
+    alpha = piatta(sorgenti, "alpha_table")
+    beta = piatta(sorgenti, "beta_table")
+    if len(alpha) != 52 * 3 or len(beta) != 52 * 3:
+        raise SystemExit("alpha/beta: %d e %d valori, ne aspettavo 156" % (len(alpha), len(beta)))
+    alpha = alpha[52:104]
+    beta = beta[52:104]
+    if alpha[15] or alpha[16] != 4 or alpha[51] != 255 or beta[51] != 18:
+        raise SystemExit("alpha/beta: i valori noti non tornano, il taglio e' sbagliato")
+    scalare("uint8_t", "h264d_alpha", 52, alpha, 13, 3)
+    scalare("uint8_t", "h264d_beta", 52, beta, 13, 3)
+
+    tc0 = matrice(sorgenti, "tc0_table", 52 * 3, 4)
+    # column 0 is bS = 0, which never filters; keep bS 1..3
+    tc0 = [r[1:4] for r in tc0[52:104]]
+    bidim("uint8_t", "h264d_tc0", 52, 3, tc0, 3, 3)
 
     h += ["", "#endif /* BC250_H264_DEC_TABLES_H */", ""]
 

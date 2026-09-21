@@ -70,7 +70,16 @@ typedef struct {
     int8_t   qpy;
     int8_t   chroma_pred_mode;
     int8_t   ipred[16];         /* Intra_4x4 / Intra_8x8 modes, raster in mb */
-    int8_t   ref[2][4];         /* per 8x8 partition, per list; -1 = unused */
+    /* Per 8x8 partition, per list: the DPB slot of the reference picture, or
+     * -1 when that list is unused here.
+     *
+     * ⚠️ The DPB slot, not the reference index the slice header gave. The
+     * deblocking filter compares reference PICTURES, and the same picture
+     * can sit at different indices in two slices' lists, so a decoder that
+     * stores indices puts an edge where the encoder put none. Resolving it
+     * once here also means the filter never has to know which slice a
+     * macroblock came from. */
+    int8_t   ref[2][4];
     int16_t  mv[2][16][2];      /* per 4x4 block, per list */
     uint8_t  nnz[3][16];        /* non-zero coefficients: CAVLC context and
                                  * the deblocking filter's bS both need it */
