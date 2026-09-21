@@ -517,6 +517,20 @@ int main(int argc, char **argv)
             sl.ref_list[0][k] = f ? (int8_t)h264_decoder_slot_of(dec, f) : 0;
         }
 
+        if (getenv("BC250_H264_REFS"))
+            fprintf(stderr, "fotogramma %d: tipo %d frame_num %d poc %d "
+                            "superficie %u slot %d | num_ref %d | lista:%s",
+                    fotogrammi, slice_type, frame_num, poc, superficie_corrente,
+                    h264_decoder_slot_of(dec,
+                        h264_decoder_frame_for(dec, superficie_corrente)),
+                    sl.num_ref_idx[0], "");
+        if (getenv("BC250_H264_REFS")) {
+            for (int k = 0; k < n_rif; k++)
+                fprintf(stderr, " sup%u=slot%d(fn%d)", rifs[k].surface,
+                        sl.ref_list[0][k], rifs[k].frame_num);
+            fprintf(stderr, "\n");
+        }
+
         const int r = h264_decoder_slice(dec, &sl, rbsp, n, bit_offset);
         if (r) {
             fprintf(stderr, "slice rifiutata (%d) al macroblocco %d del "

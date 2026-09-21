@@ -219,6 +219,13 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
             if (m->intra) {
                 fprintf(stderr, " croma %d modi", m->chroma_pred_mode);
                 for (int k = 0; k < 16; k++) fprintf(stderr, " %d", m->ipred[k]);
+            } else {
+                fprintf(stderr, " rif");
+                for (int p8 = 0; p8 < 4; p8++)
+                    fprintf(stderr, " %d/%d", m->ref_idx[0][p8], m->ref[0][p8]);
+                fprintf(stderr, " mv");
+                for (int bb = 0; bb < 16; bb++)
+                    fprintf(stderr, " %d,%d", m->mv[0][bb][0], m->mv[0][bb][1]);
             }
             fprintf(stderr, "\n");
         }
