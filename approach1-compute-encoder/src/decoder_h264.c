@@ -177,6 +177,35 @@ int h264_decoder_begin_picture(h264_decoder_t *d, const h264d_pic_t *pic,
     return 0;
 }
 
+/* One line per macroblock when BC250_H264_TRACE is set. The single most
+ * useful debugging tool this decoder has: a diff against the same line out
+ * of a reference decoder says which syntax element went wrong, and usually
+ * which macroblock it went wrong at. */
+static void traccia_mb(const h264_decoder_t *d)
+{
+    const h264d_mb_t *m = &d->mbs[d->mb_idx];
+    fprintf(stderr, "mb %4d (%2d,%2d) tipo %d intra %d t8 %d cbp %02x qp %2d",
+            d->mb_idx, d->mb_x, d->mb_y, m->type, m->intra,
+            m->transform8x8, m->cbp, m->qpy);
+    if (m->intra) {
+        fprintf(stderr, " croma %d modi", m->chroma_pred_mode);
+        for (int k = 0; k < 16; k++) fprintf(stderr, " %d", m->ipred[k]);
+    } else {
+        fprintf(stderr, " sub %d %d %d %d", m->sub_tipo[0],
+                m->sub_tipo[1], m->sub_tipo[2], m->sub_tipo[3]);
+        fprintf(stderr, " r1");
+        for (int p8 = 0; p8 < 4; p8++)
+            fprintf(stderr, " %d", m->ref_idx[1][p8]);
+        fprintf(stderr, " rif");
+        for (int p8 = 0; p8 < 4; p8++)
+            fprintf(stderr, " %d/%d", m->ref_idx[0][p8], m->ref[0][p8]);
+        fprintf(stderr, " mv");
+        for (int bb = 0; bb < 16; bb++)
+            fprintf(stderr, " %d,%d", m->mv[0][bb][0], m->mv[0][bb][1]);
+    }
+    fprintf(stderr, "\n");
+}
+
 int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
                        const uint8_t *data, size_t size, int bit_offset)
 {
@@ -204,13 +233,17 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
     /* The slice data starts at a byte boundary once the CABAC alignment bits
      * are skipped, and the emulation prevention bytes have to come out
      * before the engine ever sees them. */
-    const int primo_byte = (bit_offset + 7) / 8;
-    if ((size_t)primo_byte >= size) return -1;
-    const size_t n = br_extract_rbsp(d->rbsp, d->rbsp_cap,
-                                     data + primo_byte, size - primo_byte);
-
     d->cabac_mode = d->pic.entropy_coding_mode;
-    if (!d->cabac_mode) return -3;          /* CAVLC not written yet */
+
+    size_t n = 0;
+    if (d->cabac_mode) {
+        const int primo_byte = (bit_offset + 7) / 8;
+        if ((size_t)primo_byte >= size) return -1;
+        n = br_extract_rbsp(d->rbsp, d->rbsp_cap,
+                            data + primo_byte, size - primo_byte);
+    } else if ((size_t)bit_offset >= size * 8) {
+        return -1;
+    }
 
     d->qpy = slice->qpy;
     d->last_qp_delta_nonzero = 0;
@@ -219,55 +252,88 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
     d->mb_x = d->mb_idx % d->mb_w;
     d->mb_y = d->mb_idx / d->mb_w;
 
-    h264d_cabac_init(&d->cabac, d->rbsp, n, slice->type == 2,
-                     slice->cabac_init_idc, slice->qpy);
+    if (d->cabac_mode) {
+        h264d_cabac_init(&d->cabac, d->rbsp, n, slice->type == 2,
+                         slice->cabac_init_idc, slice->qpy);
+    } else {
+        /* âš ï¸ No alignment and no re-extraction: the bit after the slice
+         * header, in the buffer the caller already un-escaped. */
+        br_init(&d->br, data, size);
+        br_skip(&d->br, bit_offset);
+    }
 
     const char *traccia = getenv("BC250_H264_TRACE");
     int quanti = 0;
 
-    for (;;) {
-        d->slice_of_mb[d->mb_idx] = (uint8_t)numero;
-        const int r = h264d_decode_mb_cabac(d);
-        if (r) return r;
-        quanti++;
-        if (traccia) {
-            const h264d_mb_t *m = &d->mbs[d->mb_idx];
-            fprintf(stderr, "mb %4d (%2d,%2d) tipo %d intra %d t8 %d cbp %02x qp %2d",
-                    d->mb_idx, d->mb_x, d->mb_y, m->type, m->intra,
-                    m->transform8x8, m->cbp, m->qpy);
-            if (m->intra) {
-                fprintf(stderr, " croma %d modi", m->chroma_pred_mode);
-                for (int k = 0; k < 16; k++) fprintf(stderr, " %d", m->ipred[k]);
-            } else {
-                fprintf(stderr, " sub %d %d %d %d", m->sub_tipo[0],
-                        m->sub_tipo[1], m->sub_tipo[2], m->sub_tipo[3]);
-                fprintf(stderr, " r1");
-                for (int p8 = 0; p8 < 4; p8++)
-                    fprintf(stderr, " %d", m->ref_idx[1][p8]);
-                fprintf(stderr, " rif");
-                for (int p8 = 0; p8 < 4; p8++)
-                    fprintf(stderr, " %d/%d", m->ref_idx[0][p8], m->ref[0][p8]);
-                fprintf(stderr, " mv");
-                for (int bb = 0; bb < 16; bb++)
-                    fprintf(stderr, " %d,%d", m->mv[0][bb][0], m->mv[0][bb][1]);
-            }
-            fprintf(stderr, "\n");
+#define AVANZA() do {                              \
+        d->mb_idx++;                                   \
+        d->mb_x = d->mb_idx % d->mb_w;                 \
+        d->mb_y = d->mb_idx / d->mb_w;                 \
+    } while (0)
+
+    if (d->cabac_mode) {
+        for (;;) {
+            d->slice_of_mb[d->mb_idx] = (uint8_t)numero;
+            const int r = h264d_decode_mb_cabac(d);
+            if (r) return r;
+            quanti++;
+            if (traccia) traccia_mb(d);
+
+            if (h264d_cabac_terminate(&d->cabac))
+                break;
+            if (h264d_cabac_overrun(&d->cabac))
+                return -4;
+
+            AVANZA();
+            if (d->mb_idx >= d->mb_count)
+                break;
         }
+    } else {
+        /* Clause 7.3.4. A run of skipped macroblocks is counted, not
+         * flagged, and more_rbsp_data() ends the slice.
+         *
+         * âš ï¸ The run is read before every coded macroblock of a P or B
+         * slice, including when it is zero, and the standard only consults
+         * more_rbsp_data() after a run that was not zero. Consulting it
+         * unconditionally would be right in practice and wrong in
+         * principle, so it is not done. */
+        for (;;) {
+            if (slice->type != 2) {
+                int salti = (int)br_read_ue(&d->br);
+                const int quanti_salti = salti;
+                while (salti-- > 0) {
+                    if (d->mb_idx >= d->mb_count) return -1;
+                    d->slice_of_mb[d->mb_idx] = (uint8_t)numero;
+                    if (h264d_cavlc_skip(d)) return -5;
+                    quanti++;
+                    if (traccia) traccia_mb(d);
+                    AVANZA();
+                }
+                if (quanti_salti > 0 && !br_more_rbsp_data(&d->br))
+                    break;
+            }
+            if (d->mb_idx >= d->mb_count) break;
+            if (br_overrun(&d->br)) return -4;
 
-        if (h264d_cabac_terminate(&d->cabac))
-            break;
-        if (h264d_cabac_overrun(&d->cabac))
-            return -4;
+            d->slice_of_mb[d->mb_idx] = (uint8_t)numero;
+            const int r = h264d_decode_mb_cavlc(d);
+            if (r) return r;
+            quanti++;
+            if (traccia) traccia_mb(d);
 
-        d->mb_idx++;
-        if (d->mb_idx >= d->mb_count)
-            break;
-        d->mb_x = d->mb_idx % d->mb_w;
-        d->mb_y = d->mb_idx / d->mb_w;
+            AVANZA();
+            if (d->mb_idx >= d->mb_count) break;
+            if (!br_more_rbsp_data(&d->br)) break;
+        }
+        if (br_overrun(&d->br)) return -4;
     }
+#undef AVANZA
+
     if (traccia)
         fprintf(stderr, "slice finita: %d macroblocchi, sforamento %d\n",
-                quanti, (int)h264d_cabac_overrun(&d->cabac));
+                quanti, d->cabac_mode
+                        ? (int)h264d_cabac_overrun(&d->cabac)
+                        : (int)br_overrun(&d->br));
     return 0;
 }
 

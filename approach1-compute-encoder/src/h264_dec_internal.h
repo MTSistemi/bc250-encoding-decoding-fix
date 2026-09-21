@@ -140,6 +140,10 @@ static inline const h264d_mb_t *h264d_mb_top_right(const h264_decoder_t *d)
 int h264d_decode_mb_cabac(h264_decoder_t *d);
 int h264d_decode_mb_cavlc(h264_decoder_t *d);
 
+/* One skipped macroblock of a CAVLC slice. CABAC has no equivalent call
+ * because there the skip is a flag the macroblock layer reads itself. */
+int h264d_cavlc_skip(h264_decoder_t *d);
+
 /* Reconstruction, shared by both entropy paths once the syntax is in. */
 void h264d_reconstruct_mb(h264_decoder_t *d);
 

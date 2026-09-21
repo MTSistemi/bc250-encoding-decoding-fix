@@ -115,13 +115,25 @@ static inline void chroma_forte(uint8_t *q, int d, int alpha, int beta)
 /* The 4x4 block index inside a macroblock, from its position in samples. */
 static inline int blocco(int x4, int y4) { return y4 * 4 + x4; }
 
-/* Whether the 4x4 block `b` of macroblock `m` carries any coefficient. With
- * the 8x8 transform the coefficients belong to the 8x8 block, so all four of
- * its 4x4 positions answer together - which is why nnz is filled in for all
- * four when an 8x8 block is coded. */
+/* Whether the block containing 4x4 position `b` of macroblock `m` carries
+ * any coefficient, clause 8.7.2.1.
+ *
+ * âš ï¸ "The block" is the 8x8 one when the macroblock uses the 8x8
+ * transform, so all four of its 4x4 positions have to answer together. The
+ * OR is done here rather than left to the entropy decoders, because the two
+ * of them store different things: CABAC has no per-4x4 count for an 8x8
+ * block and writes a flag into all four, while CAVLC reads four real counts
+ * and needs to keep them - they are the context of the next block's
+ * coeff_token. */
 static inline bool ha_coefficienti(const h264d_mb_t *m, int b)
 {
-    return m->nnz[0][b] != 0;
+    if (!m->transform8x8)
+        return m->nnz[0][b] != 0;
+    /* The 8x8 block's corner: clear the low bit of the row and of the
+     * column, which are bits 2 and 0 of the raster index. */
+    const int angolo = b & 10;
+    return m->nnz[0][angolo] || m->nnz[0][angolo + 1]
+        || m->nnz[0][angolo + 4] || m->nnz[0][angolo + 5];
 }
 
 static int forza(const h264d_mb_t *p, int bp, const h264d_mb_t *q, int bq,

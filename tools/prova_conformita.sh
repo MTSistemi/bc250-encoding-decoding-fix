@@ -123,9 +123,53 @@ prova "10 fotogrammi, piramide B" "$SRC1" 176x144     -frames:v 10 -c:v libx264 
 prova "20 fotogrammi, tutti i default di x264" "$SRC1" 176x144     -frames:v 20 -c:v libx264 -profile:v high -preset slow -crf 25 -g 10
 
 echo
-echo "CAVLC (baseline)"
-prova "intra CAVLC" "$SRC1" 176x144     -frames:v 1 -c:v libx264 -profile:v baseline -qp 26
-prova "10 fotogrammi CAVLC" "$SRC1" 176x144     -frames:v 10 -c:v libx264 -profile:v baseline -qp 26 -g 30
+echo "CAVLC"
+NC="-x264opts cabac=0"
+prova "intra CAVLC" "$SRC1" 176x144 \
+    -frames:v 1 -c:v libx264 -profile:v baseline -qp 26
+prova "10 fotogrammi CAVLC" "$SRC1" 176x144 \
+    -frames:v 10 -c:v libx264 -profile:v baseline -qp 26 -g 30
+
+# Low QP means big coefficients, and big coefficients are the only way to
+# reach the level escape codes: level_prefix 15 and up, where the suffix
+# length stops following suffixLength and starts following the prefix.
+for qp in 1 8 16 34 51; do
+    prova "intra CAVLC qp $qp" "$SRC1" 176x144 \
+        -frames:v 1 -c:v libx264 -profile:v main -qp $qp $NC
+done
+
+prova "intra 8x8 CAVLC" "$SRC1" 176x144 \
+    -frames:v 1 -c:v libx264 -profile:v high -qp 18 $NC
+prova "58x50 CAVLC" "testsrc2=size=58x50:rate=25" 58x50 \
+    -frames:v 1 -c:v libx264 -profile:v main -qp 24 $NC
+prova "4 slice CAVLC" "$SRC1" 176x144 \
+    -frames:v 1 -c:v libx264 -profile:v main -qp 26 -x264opts cabac=0:slices=4
+prova "intra CAVLC no-deblock" "$SRC1" 176x144 \
+    -frames:v 1 -c:v libx264 -profile:v main -qp 26 -x264opts cabac=0:no-deblock
+
+prova "10 fotogrammi CAVLC, 3 riferimenti" "$SRC1" 176x144 \
+    -frames:v 10 -c:v libx264 -profile:v main -qp 26 -bf 0 -refs 3 -g 30 $NC
+prova "12 fotogrammi CAVLC, high 8x8" "$SRC1" 176x144 \
+    -frames:v 12 -c:v libx264 -profile:v high -qp 24 -bf 0 -g 6 $NC
+prova "20 fotogrammi CAVLC, preset lento" "$SRC1" 176x144 \
+    -frames:v 20 -c:v libx264 -profile:v high -preset slow -crf 26 -bf 0 -g 8 $NC
+prova "12 fotogrammi CAVLC 320x240" "$SRC2" 320x240 \
+    -frames:v 12 -c:v libx264 -profile:v high -crf 24 -bf 0 -g 6 $NC
+
+prova "9 fotogrammi CAVLC, 2 B" "$SRC1" 176x144 \
+    -frames:v 9 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 30 \
+    -x264opts cabac=0:b-pyramid=none
+prova "12 fotogrammi CAVLC B, high 8x8" "$SRC1" 176x144 \
+    -frames:v 12 -c:v libx264 -profile:v high -qp 26 -bf 2 -g 6 \
+    -x264opts cabac=0:b-pyramid=none
+prova "10 fotogrammi CAVLC, piramide B" "$SRC1" 176x144 \
+    -frames:v 10 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 30 $NC
+prova "12 fotogrammi CAVLC B, 320x240" "$SRC2" 320x240 \
+    -frames:v 12 -c:v libx264 -profile:v high -qp 24 -bf 2 -g 6 \
+    -x264opts cabac=0:b-pyramid=none
+prova "8 fotogrammi CAVLC, pesi espliciti" "$SRC1" 176x144 \
+    -frames:v 8 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 4 \
+    -x264opts cabac=0:weightp=2:weightb=1:b-pyramid=none
 
 echo
 printf 'passate %d, fallite %d, saltate %d
