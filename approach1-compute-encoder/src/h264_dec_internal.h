@@ -159,4 +159,12 @@ void h264d_skip_mv_p(h264_decoder_t *d, int16_t out[2]);
  * direct in some of them and explicit in the rest. */
 int h264d_direct_spatial(h264_decoder_t *d, h264d_mb_t *m, int maschera);
 
+/* Temporal direct prediction, 8.4.1.2.2's other half: 8.4.1.2.3. Same
+ * arguments, and the co-located block's vector rescaled by picture
+ * distance instead of the neighbours' consensus. */
+int h264d_direct_temporal(h264_decoder_t *d, h264d_mb_t *m, int maschera);
+
+/* Whichever one direct_spatial_mv_pred_flag asked for. */
+int h264d_direct(h264_decoder_t *d, h264d_mb_t *m, int maschera);
+
 #endif /* BC250_H264_DEC_INTERNAL_H */

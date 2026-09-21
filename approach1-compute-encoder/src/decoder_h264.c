@@ -29,9 +29,11 @@ static void libera_frame(h264d_frame_t *f)
     free(f->y);
     free(f->col_ref);
     free(f->col_mv);
+    free(f->col_poc);
     f->y = f->cb = f->cr = NULL;
     f->col_ref = NULL;
     f->col_mv = NULL;
+    f->col_poc = NULL;
     f->used = false;
     f->surface = ~0u;
 }
@@ -81,7 +83,8 @@ h264_decoder_t *h264_decoder_create(bc250_gpu_context_t *gpu_ctx,
         }
         d->dpb[i].col_ref = calloc((size_t)d->mb_count * 2 * 4, sizeof(int8_t));
         d->dpb[i].col_mv = calloc((size_t)d->mb_count * 2 * 16 * 2, sizeof(int16_t));
-        if (!d->dpb[i].col_ref || !d->dpb[i].col_mv) {
+        d->dpb[i].col_poc = calloc((size_t)d->mb_count * 2 * 4, sizeof(int32_t));
+        if (!d->dpb[i].col_ref || !d->dpb[i].col_mv || !d->dpb[i].col_poc) {
             h264_decoder_destroy(d);
             return NULL;
         }
@@ -211,12 +214,6 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
 {
     if (d->cur < 0) return -1;
     if (d->n_slices >= H264D_MAX_SLICES) return -1;
-
-    /* Temporal direct (8.4.1.2.3) scales the co-located vectors by the
-     * distance between pictures; only the spatial derivation is written, so
-     * a slice that asks for the other is refused rather than guessed at.
-     * x264 chooses spatial by default. */
-    if (slice->type == 1 && !slice->direct_spatial_mv_pred) return -2;
 
     d->slice = *slice;
     const int numero = d->n_slices++;
@@ -351,12 +348,20 @@ int h264_decoder_end_picture(h264_decoder_t *d, gpu_image_t out,
         const h264d_mb_t *m = &d->mbs[i];
         int8_t *cr8 = f->col_ref + (size_t)i * 8;
         int16_t *cmv = f->col_mv + (size_t)i * 64;
+        int32_t *cpc = f->col_poc + (size_t)i * 8;
         for (int l = 0; l < 2; l++) {
             /* ⚠️ The index, not the slot. colZeroFlag asks whether the
              * co-located block used index zero of ITS OWN picture's list,
              * which is a question about the index. */
-            for (int p = 0; p < 4; p++)
+            for (int p = 0; p < 4; p++) {
                 cr8[l * 4 + p] = m->intra ? -1 : m->ref_idx[l][p];
+                /* The slot is still valid here: this runs the moment the
+                 * picture is decoded, before any of its references can be
+                 * pushed out of the store. */
+                const int slot = m->intra ? -1 : m->ref[l][p];
+                cpc[l * 4 + p] = (slot >= 0 && slot < H264D_DPB_SIZE)
+                               ? d->dpb[slot].poc : 0;
+            }
             for (int b = 0; b < 16; b++) {
                 cmv[(l * 16 + b) * 2 + 0] = m->intra ? 0 : m->mv[l][b][0];
                 cmv[(l * 16 + b) * 2 + 1] = m->intra ? 0 : m->mv[l][b][1];

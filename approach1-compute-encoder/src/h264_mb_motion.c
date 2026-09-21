@@ -289,3 +289,133 @@ int h264d_direct_spatial(h264_decoder_t *d, h264d_mb_t *m, int maschera)
     }
     return 0;
 }
+
+/* MapColToList0, clause 8.4.1.2.3: the lowest index of the current list 0
+ * that names the picture with this POC. */
+static int mappa_su_lista0(const h264_decoder_t *d, int32_t poc)
+{
+    for (int i = 0; i < d->slice.num_ref_idx[0]; i++) {
+        const int slot = d->slice.ref_list[0][i];
+        if (slot >= 0 && slot < H264D_DPB_SIZE && d->dpb[slot].poc == poc)
+            return i;
+    }
+    return -1;
+}
+
+static int ritaglia(int v, int lo, int hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* Temporal direct prediction, clause 8.4.1.2.3.
+ *
+ * The co-located block's vector is rescaled by the distance between the
+ * pictures, and list 1 gets what is left over: mvL1 = mvL0 - mvCol. Both
+ * partitions of the result point at the same physical motion, measured from
+ * two different ends.
+ */
+int h264d_direct_temporal(h264_decoder_t *d, h264d_mb_t *m, int maschera)
+{
+    const int slot_col = d->slice.ref_list[1][0];
+    if (slot_col < 0 || slot_col >= H264D_DPB_SIZE)
+        return 1;
+    const h264d_frame_t *col = &d->dpb[slot_col];
+    if (!col->col_ref || !col->col_mv || !col->col_poc)
+        return 1;
+
+    const int8_t  *cr8 = col->col_ref + (size_t)d->mb_idx * 8;
+    const int16_t *cmv = col->col_mv  + (size_t)d->mb_idx * 64;
+    const int32_t *cpc = col->col_poc + (size_t)d->mb_idx * 8;
+
+    const int poc_ora = d->dpb[d->cur].poc;
+    const int poc_col = col->poc;
+
+    static const uint8_t angolo[4] = { 0, 3, 12, 15 };
+
+    for (int p8 = 0; p8 < 4; p8++) {
+        if (!((maschera >> p8) & 1))
+            continue;
+        const int base = (p8 >> 1) * 8 + (p8 & 1) * 2;
+        int rif_otto = -1;
+
+        for (int k = 0; k < 4; k++) {
+            const int b = base + (k >> 1) * 4 + (k & 1);
+            const int bcol = d->pic.direct_8x8_inference ? angolo[p8] : b;
+            const int pcol = h264d_part8(bcol);
+
+            /* 8.4.1.2.1 again: list 0 of the co-located block when it used
+             * it, list 1 otherwise, nothing at all when it was intra. */
+            int rif_col = cr8[0 * 4 + pcol];
+            const int16_t *mv_col = cmv + (0 * 16 + bcol) * 2;
+            int32_t poc_rif = cpc[0 * 4 + pcol];
+            if (rif_col < 0) {
+                rif_col = cr8[1 * 4 + pcol];
+                mv_col  = cmv + (1 * 16 + bcol) * 2;
+                poc_rif = cpc[1 * 4 + pcol];
+            }
+
+            int mvx = 0, mvy = 0, rif0 = 0;
+            if (rif_col >= 0) {
+                mvx = mv_col[0];
+                mvy = mv_col[1];
+                rif0 = mappa_su_lista0(d, poc_rif);
+                if (rif0 < 0)
+                    return 1;     /* the stream names a picture we don't have */
+            }
+
+            const int slot0 = d->slice.ref_list[0][rif0];
+            if (slot0 < 0 || slot0 >= H264D_DPB_SIZE)
+                return 1;
+            const int poc0 = d->dpb[slot0].poc;
+
+            int l0x, l0y, l1x, l1y;
+            if (d->dpb[slot0].is_long_term || poc_col == poc0) {
+                /* Nothing to scale by: a long-term reference has no
+                 * meaningful distance, and two pictures at the same POC
+                 * would divide by zero. */
+                l0x = mvx; l0y = mvy;
+                l1x = 0;   l1y = 0;
+            } else {
+                const int tb = ritaglia(poc_ora - poc0, -128, 127);
+                const int td = ritaglia(poc_col - poc0, -128, 127);
+                const int tx = (16384 + abs(td / 2)) / td;
+                const int f = ritaglia((tb * tx + 32) >> 6, -1024, 1023);
+                l0x = (f * mvx + 128) >> 8;
+                l0y = (f * mvy + 128) >> 8;
+                l1x = l0x - mvx;
+                l1y = l0y - mvy;
+            }
+
+            /* âš ï¸ Without direct_8x8_inference_flag every 4x4 asks its own
+             * co-located block, and they may land on different references.
+             * The motion field here keeps one reference index per 8x8, so
+             * that case is refused rather than quietly flattened. Encoders
+             * set the flag; it is mandatory above level 3.0. */
+            if (rif_otto < 0)
+                rif_otto = rif0;
+            else if (rif_otto != rif0)
+                return 1;
+
+            m->mv[0][b][0] = (int16_t)l0x;
+            m->mv[0][b][1] = (int16_t)l0y;
+            m->mv[1][b][0] = (int16_t)l1x;
+            m->mv[1][b][1] = (int16_t)l1y;
+            m->mvd[0][b][0] = m->mvd[0][b][1] = 0;
+            m->mvd[1][b][0] = m->mvd[1][b][1] = 0;
+        }
+
+        m->ref_idx[0][p8] = (int8_t)rif_otto;
+        m->ref[0][p8] = d->slice.ref_list[0][rif_otto];
+        m->ref_idx[1][p8] = 0;
+        m->ref[1][p8] = d->slice.ref_list[1][0];
+    }
+    return 0;
+}
+
+/* Which of the two a slice asked for. */
+int h264d_direct(h264_decoder_t *d, h264d_mb_t *m, int maschera)
+{
+    return d->slice.direct_spatial_mv_pred
+         ? h264d_direct_spatial(d, m, maschera)
+         : h264d_direct_temporal(d, m, maschera);
+}

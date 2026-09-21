@@ -674,7 +674,7 @@ static int leggi_movimento(h264_decoder_t *d, h264d_mb_t *m, bool bslice, int t)
     for (int i = 0; i < np; i++) {
         if (parte[i].pred == H264D_PRED_DIRECT) {
             const int maschera = (np == 1) ? 0xf : (1 << i);
-            if (h264d_direct_spatial(d, m, maschera) != 0)
+            if (h264d_direct(d, m, maschera) != 0)
                 return 1;
             continue;
         }
@@ -874,7 +874,7 @@ int h264d_decode_mb_cabac(h264_decoder_t *d)
                  * reference 1 tip the context of the next coded one, which
                  * desynchronised the slice twenty macroblocks from the end. */
                 m->direct = 0xf;
-                if (h264d_direct_spatial(d, m, 0xf) != 0)
+                if (h264d_direct(d, m, 0xf) != 0)
                     return 1;
                 memset(d->dc_luma, 0, sizeof(d->dc_luma));
                 memset(d->dc_chroma, 0, sizeof(d->dc_chroma));

@@ -357,7 +357,7 @@ static int leggi_movimento(h264_decoder_t *d, h264d_mb_t *m, bool bslice,
     for (int i = 0; i < np; i++) {
         if (parte[i].pred == H264D_PRED_DIRECT) {
             const int maschera = (np == 1) ? 0xf : (1 << i);
-            if (h264d_direct_spatial(d, m, maschera) != 0)
+            if (h264d_direct(d, m, maschera) != 0)
                 return 1;
             continue;
         }
@@ -520,7 +520,7 @@ int h264d_cavlc_skip(h264_decoder_t *d)
 
     if (bslice) {
         m->direct = 0xf;
-        if (h264d_direct_spatial(d, m, 0xf) != 0)
+        if (h264d_direct(d, m, 0xf) != 0)
             return 1;
     } else {
         int16_t mv[2];

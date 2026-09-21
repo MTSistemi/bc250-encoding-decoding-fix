@@ -73,7 +73,9 @@ SRC2="testsrc2=size=320x240:rate=25"
 SRC3="testsrc2=size=64x64:rate=25"
 
 echo "un fotogramma intra, vari QP e profili"
-for qp in 0 10 18 26 34 44 51; do
+# qp 0 is absent on purpose: libx264 encodes it losslessly, which is
+# High 4:4:4 Predictive, a profile this decoder refuses up front.
+for qp in 1 10 18 26 34 44 51; do
     prova "intra qp $qp, main" "$SRC1" 176x144 \
         -frames:v 1 -c:v libx264 -profile:v main -qp $qp
 done
@@ -170,6 +172,41 @@ prova "12 fotogrammi CAVLC B, 320x240" "$SRC2" 320x240 \
 prova "8 fotogrammi CAVLC, pesi espliciti" "$SRC1" 176x144 \
     -frames:v 8 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 4 \
     -x264opts cabac=0:weightp=2:weightb=1:b-pyramid=none
+
+echo
+echo "direct temporale"
+TD="-x264opts direct=temporal"
+prova "9 fotogrammi, direct temporale" "$SRC1" 176x144 \
+    -frames:v 9 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 30 \
+    -x264opts direct=temporal:b-pyramid=none
+prova "16 fotogrammi, 3 B, direct temporale" "$SRC1" 176x144 \
+    -frames:v 16 -c:v libx264 -profile:v main -qp 24 -bf 3 -g 8 \
+    -x264opts direct=temporal:b-pyramid=none
+prova "12 fotogrammi temporale, high 8x8" "$SRC1" 176x144 \
+    -frames:v 12 -c:v libx264 -profile:v high -qp 26 -bf 2 -g 6 \
+    -x264opts direct=temporal:b-pyramid=none
+prova "10 fotogrammi temporale, piramide B" "$SRC1" 176x144 \
+    -frames:v 10 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 30 $TD
+prova "20 fotogrammi temporale, piramide e 3 rif" "$SRC1" 176x144 \
+    -frames:v 20 -c:v libx264 -profile:v high -qp 24 -bf 3 -refs 3 -g 10 $TD
+prova "12 fotogrammi temporale, 320x240" "$SRC2" 320x240 \
+    -frames:v 12 -c:v libx264 -profile:v high -crf 24 -bf 2 -g 6 $TD
+prova "12 fotogrammi temporale, pesi impliciti" "$SRC1" 176x144 \
+    -frames:v 12 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 6 \
+    -x264opts direct=temporal:weightb=1
+prova "12 fotogrammi temporale CAVLC" "$SRC1" 176x144 \
+    -frames:v 12 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 6 \
+    -x264opts direct=temporal:cabac=0
+prova "16 fotogrammi temporale CAVLC, piramide" "$SRC1" 176x144 \
+    -frames:v 16 -c:v libx264 -profile:v high -qp 24 -bf 3 -g 8 \
+    -x264opts direct=temporal:cabac=0
+prova "20 fotogrammi temporale, preset lento" "$SRC1" 176x144 \
+    -frames:v 20 -c:v libx264 -profile:v high -preset slow -crf 25 -g 10 $TD
+prova "12 fotogrammi temporale, 4 slice" "$SRC1" 176x144 \
+    -frames:v 12 -c:v libx264 -profile:v main -qp 26 -bf 2 -g 6 \
+    -x264opts direct=temporal:slices=4
+prova "12 fotogrammi temporale, 58x50" "testsrc2=size=58x50:rate=25" 58x50 \
+    -frames:v 12 -c:v libx264 -profile:v high -qp 26 -bf 2 -g 6 $TD
 
 echo
 printf 'passate %d, fallite %d, saltate %d
