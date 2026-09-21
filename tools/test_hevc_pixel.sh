@@ -9,11 +9,11 @@
 # useful pass mark is "identical", and any difference at all is a bug
 # however small it looks.
 #
-# ⚠️ sao=0, for now. Sample adaptive offset is the one part of the
-# decoding loop still missing, so it is turned off in the streams rather
-# than ignored in the comparison. Deblocking is on: it was off here while
-# it was being written, and leaving it off afterwards would have meant a
-# suite that says yes without looking.
+# Nothing is turned off in the streams any more: both loop filters are
+# in, so the encoder is left to use whatever it wants. A comparison run
+# against a stream with the hard parts switched off says very little, and
+# the temptation to leave such a switch in place after the feature lands
+# is the reason to write this down.
 #
 # ⚠️ To turn deblocking off in x265 the switch is deblock=false. deblock=0
 # sets the filter's beta and tC offsets to zero and leaves it running,
@@ -36,7 +36,7 @@ prova() {
     local guasti="" dimensione="" wpp
     for wpp in 0 1; do
         ffmpeg -v error -y -f lavfi -i "$sorgente" -frames:v 1 -c:v libx265 \
-               -x265-params "log-level=none:sao=0:wpp=$wpp:$parametri" \
+               -x265-params "log-level=none:wpp=$wpp:$parametri" \
                -pix_fmt yuv420p -f hevc "$T/s.265" 2>/dev/null
         if [ ! -s "$T/s.265" ]; then
             guasti="$guasti wpp=$wpp:nessun-flusso"
@@ -115,6 +115,17 @@ prova "filtro a qp alto" "$S1" "qp=48"
 prova "filtro a qp basso" "$S1" "qp=6"
 prova "filtro con CTU 16" "$S1" "qp=34:ctu=16"
 prova "filtro con TU 4" "$S1" "qp=34:max-tu-size=4"
+
+echo
+echo "il sample adaptive offset"
+prova "sao spento" "$S1" "qp=28:sao=0"
+prova "sao a qp 34" "$S1" "qp=34"
+prova "sao a qp 44" "$S1" "qp=44"
+prova "sao prima del deblocking" "$S1" "qp=34:sao-non-deblock=1"
+prova "sao con CTU 16" "$S1" "qp=34:ctu=16"
+prova "sao con CTU 32" "$S1" "qp=34:ctu=32"
+prova "sao, limite di offset" "$S1" "qp=44:sao-lookahead-depth=0"
+prova "sao su mandelbrot" "mandelbrot=size=320x240" "qp=32"
 
 echo
 # ⚠️ Rate control is where the quantisation parameter stops standing still.

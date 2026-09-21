@@ -117,7 +117,7 @@ static void scrivi_immagine(FILE *f, hevcd_t *d, const hevc_sps_t *sps)
     /* ⚠️ The loop filters run here and not at the end of each slice: 8.7.2
      * is defined over the whole picture, and an edge between two coding
      * tree units cannot be filtered until both of them exist. */
-    if (d->slice) hevcd_deblocca(d);
+    if (d->slice) { hevcd_deblocca(d); hevcd_sao(d); }
     if (!f) return;
     const int x0 = sps->crop_left, y0 = sps->crop_top;
     const int w = sps->width - sps->crop_left - sps->crop_right;
@@ -183,7 +183,12 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
         d->no_filtro = calloc(serve_cb, 1);
         d->n_no_filtro = serve_cb;
     }
-    if (!d->bordi || !d->no_filtro) return 5;
+    if (!d->sao || d->n_sao < (size_t)sps->ctb_count) {
+        free(d->sao);
+        d->sao = calloc((size_t)sps->ctb_count, sizeof *d->sao);
+        d->n_sao = (size_t)sps->ctb_count;
+    }
+    if (!d->bordi || !d->no_filtro || !d->sao) return 5;
     d->bordi_passo = (sps->width + 7) >> 3;
     if (!d->qp_y_map || d->n_qp < serve_cb) {
         free(d->qp_y_map);
@@ -508,6 +513,7 @@ int main(int argc, char **argv)
     free(buf); free(rbsp); free(sps); free(pps); free(poc_visti);
     free(dec->ct_depth); free(dec->intra_mode); free(dec->min_tb_addr_zs);
     free(dec->qp_y_map); free(dec->bordi); free(dec->no_filtro);
+    hevcd_libera_filtri(dec);
     for (int k = 0; k < 3; k++) free(dec->piano[k]);
     free(dec);
     return (rifiutate || gruppi_rotti || slice_perse) ? 1 : 0;

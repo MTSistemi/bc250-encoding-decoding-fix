@@ -21,6 +21,7 @@
 #include "hevc_dec_internal.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 static inline int ritaglia(int v, int lo, int hi)
 {
@@ -274,4 +275,119 @@ void hevcd_deblocca(hevcd_t *d)
     if (!d->bordi || d->slice->deblocking_filter_disabled) return;
     una_direzione(d, true);
     una_direzione(d, false);
+}
+
+/* ------------------------------------------------- sample adaptive offset */
+
+/* 8.7.3. The last thing in the decoding loop, and the only part of it the
+ * encoder steers directly: four offsets per coding tree block per plane,
+ * chosen by measuring the error that everything upstream left behind.
+ *
+ * ⚠️ It reads the picture the deblocking filter produced and writes a
+ * different one. An implementation that reads and writes the same plane
+ * gets the band offset right and the edge offset wrong, in a way that is
+ * worth a handful of sample values and shows up only where the offsets
+ * are large - which is exactly where nobody looks first.
+ */
+static int segno(int v)
+{
+    return v > 0 ? 1 : (v < 0 ? -1 : 0);
+}
+
+/* Which two neighbours each edge class compares against: horizontal,
+ * vertical, and the two diagonals. */
+static const int8_t sao_dx[4][2] = { { -1, 1 }, { 0, 0 }, { -1, 1 }, { 1, -1 } };
+static const int8_t sao_dy[4][2] = { { 0, 0 }, { -1, 1 }, { -1, 1 }, { -1, 1 } };
+
+static void sao_blocco(hevcd_t *d, int c, int rx, int ry,
+                       const hevcd_sao_t *s)
+{
+    if (!s->tipo[c]) return;
+
+    const int giu = c ? 1 : 0;
+    const int log2 = d->sps->log2_ctb - giu;
+    const int w = d->sps->width >> giu, h = d->sps->height >> giu;
+    const int x0 = rx << log2, y0 = ry << log2;
+    const int lato = 1 << log2;
+    const int x1 = x0 + lato < w ? x0 + lato : w;
+    const int y1 = y0 + lato < h ? y0 + lato : h;
+    const int passo = d->passo[c];
+    uint8_t *piano = d->piano[c];
+    const uint8_t *prima = d->copia[c];
+
+    if (s->tipo[c] == 1) {
+        /* By band: the range of a sample is cut into thirty-two bands and
+         * four consecutive ones get an offset each. An encoder reaches for
+         * this where the error is a shift of level rather than a step -
+         * a flat area that came out slightly too dark, say. */
+        for (int y = y0; y < y1; y++)
+            for (int x = x0; x < x1; x++) {
+                if (intoccabile(d, x << giu, y << giu)) continue;
+                uint8_t *p = piano + (size_t)y * passo + x;
+                const int k = ((*p >> 3) - s->posizione[c]) & 31;
+                if (k < 4) *p = ritaglia8(*p + s->off[c][k]);
+            }
+        return;
+    }
+
+    /* By edge: each sample is compared with two neighbours along one of
+     * four directions, which sorts it into a valley, a step, or a peak,
+     * and each of those gets its own offset. */
+    const int cl = s->classe[c];
+    const int ax = sao_dx[cl][0], ay = sao_dy[cl][0];
+    const int bx = sao_dx[cl][1], by = sao_dy[cl][1];
+
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) {
+            /* A sample whose neighbour would be outside the picture is
+             * left alone: there is nothing to compare it with. */
+            if (x + ax < 0 || x + ax >= w || x + bx < 0 || x + bx >= w) continue;
+            if (y + ay < 0 || y + ay >= h || y + by < 0 || y + by >= h) continue;
+            if (intoccabile(d, x << giu, y << giu)) continue;
+
+            const int v = prima[(size_t)y * passo + x];
+            int idx = 2 + segno(v - prima[(size_t)(y + ay) * passo + x + ax])
+                        + segno(v - prima[(size_t)(y + by) * passo + x + bx]);
+            /* Table 8-x: the five cases are renumbered so that "neither up
+             * nor down" lands on zero, which is the one with no offset. */
+            if (idx <= 2) idx = (idx == 2) ? 0 : idx + 1;
+            if (!idx) continue;
+            piano[(size_t)y * passo + x] = ritaglia8(v + s->off[c][idx - 1]);
+        }
+}
+
+void hevcd_sao(hevcd_t *d)
+{
+    if (!d->sao || !d->piano[0]) return;
+
+    bool serve = false;
+    for (int i = 0; i < d->sps->ctb_count && !serve; i++)
+        serve = d->sao[i].tipo[0] || d->sao[i].tipo[1] || d->sao[i].tipo[2];
+    if (!serve) return;
+
+    const size_t misura[3] = { d->n_piano, d->n_piano / 4, d->n_piano / 4 };
+    for (int c = 0; c < 3; c++) {
+        if (!d->copia[c] || d->n_copia < d->n_piano) {
+            free(d->copia[c]);
+            d->copia[c] = malloc(misura[c]);
+            if (!d->copia[c]) return;
+        }
+        memcpy(d->copia[c], d->piano[c], misura[c]);
+    }
+    d->n_copia = d->n_piano;
+
+    for (int ry = 0; ry < d->sps->ctb_height; ry++)
+        for (int rx = 0; rx < d->sps->ctb_width; rx++) {
+            const hevcd_sao_t *s = &d->sao[ry * d->sps->ctb_width + rx];
+            for (int c = 0; c < 3; c++) sao_blocco(d, c, rx, ry, s);
+        }
+}
+
+void hevcd_libera_filtri(hevcd_t *d)
+{
+    free(d->sao);
+    d->sao = NULL;
+    d->n_sao = 0;
+    for (int c = 0; c < 3; c++) { free(d->copia[c]); d->copia[c] = NULL; }
+    d->n_copia = 0;
 }

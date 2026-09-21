@@ -42,12 +42,20 @@ static void leggi_sao(hevcd_t *d, int rx, int ry)
     hevcd_cabac_t *c = &d->cabac;
     const hevc_slice_t *sl = d->slice;
 
-    bool unisci = false;
-    if (rx > 0)
-        unisci = hevcd_bin(c, HEVCD_CTX_SAO_MERGE_FLAG) != 0;
-    if (!unisci && ry > 0)
-        unisci = hevcd_bin(c, HEVCD_CTX_SAO_MERGE_FLAG) != 0;
-    if (unisci) return;
+    const int passo_ctb = d->sps->ctb_width;
+    hevcd_sao_t *mio = &d->sao[ry * passo_ctb + rx];
+    memset(mio, 0, sizeof *mio);
+
+    /* Merging is how the encoder says "the same as next door" in two
+     * bins instead of thirty. */
+    if (rx > 0 && hevcd_bin(c, HEVCD_CTX_SAO_MERGE_FLAG)) {
+        *mio = d->sao[ry * passo_ctb + rx - 1];
+        return;
+    }
+    if (ry > 0 && hevcd_bin(c, HEVCD_CTX_SAO_MERGE_FLAG)) {
+        *mio = d->sao[(ry - 1) * passo_ctb + rx];
+        return;
+    }
 
     /* ⚠️ One type for luma and one for chroma, and the chroma one governs
      * both planes. The offsets are per plane all the same, and the edge
@@ -77,12 +85,24 @@ static void leggi_sao(hevcd_t *d, int rx, int ry)
             while (v < 7 && hevcd_bypass(c)) v++;
             assoluti[i] = v;
         }
+        mio->tipo[piano] = (uint8_t)tipo;
         if (tipo == 1) {
+            for (int i = 0; i < 4; i++) {
+                const int segno = (assoluti[i] && hevcd_bypass(c)) ? -1 : 1;
+                mio->off[piano][i] = (int8_t)(segno * assoluti[i]);
+            }
+            mio->posizione[piano] = (uint8_t)hevcd_bypass_n(c, 5);
+        } else {
+            /* ⚠️ An edge offset carries no signs. The first two are
+             * defined to be positive and the last two negative, because
+             * the four cases they answer to are a valley, a step up, a
+             * step down and a peak - and the filter only ever pushes a
+             * sample back towards its neighbours. */
             for (int i = 0; i < 4; i++)
-                if (assoluti[i]) hevcd_bypass(c);      /* the sign */
-            hevcd_bypass_n(c, 5);                      /* band position */
-        } else if (piano != 2) {
-            hevcd_bypass_n(c, 2);                      /* edge class */
+                mio->off[piano][i] = (int8_t)(i < 2 ? assoluti[i]
+                                                    : -assoluti[i]);
+            if (piano != 2) mio->classe[piano] = (uint8_t)hevcd_bypass_n(c, 2);
+            else mio->classe[2] = mio->classe[1];
         }
     }
 }
