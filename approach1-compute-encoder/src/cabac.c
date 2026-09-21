@@ -71,7 +71,7 @@
 
 /* ITU-T Table 9-46 (rangeTabLPS) == x264's x264_cabac_range_lps[64][4],
  * copied verbatim (spec-mandated constant table). */
-static const uint8_t cabac_range_lps[64][4] = {
+const uint8_t cabac_range_lps[64][4] = {
     {  2,   2,   2,   2}, {  6,   7,   8,   9}, {  6,   7,   9,  10}, {  6,   8,   9,  11},
     {  7,   8,  10,  11}, {  7,   9,  10,  12}, {  7,   9,  11,  12}, {  8,   9,  11,  13},
     {  8,  10,  12,  14}, {  9,  11,  12,  14}, {  9,  11,  13,  15}, { 10,  12,  14,  16},
@@ -93,7 +93,7 @@ static const uint8_t cabac_range_lps[64][4] = {
 /* ITU-T Table 9-45 (transIdxLPS / transIdxMPS) == x264's
  * x264_cabac_transition[128][2], copied verbatim. Row i (packed pStateIdx<<1
  * | valMPS) gives {new state if bin!=valMPS, new state if bin==valMPS}. */
-static const uint8_t cabac_transition[128][2] = {
+const uint8_t cabac_transition[128][2] = {
     {  0,   0}, {  1,   1}, {  2,  50}, { 51,   3}, {  2,  50}, { 51,   3}, {  4,  52}, { 53,   5},
     {  6,  52}, { 53,   7}, {  8,  52}, { 53,   9}, { 10,  54}, { 55,  11}, { 12,  54}, { 55,  13},
     { 14,  54}, { 55,  15}, { 16,  56}, { 57,  17}, { 18,  56}, { 57,  19}, { 20,  56}, { 57,  21},

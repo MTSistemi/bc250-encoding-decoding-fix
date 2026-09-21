@@ -164,6 +164,21 @@ void cabac_engine_init(cabac_engine_t *cb, uint8_t *p_data, uint8_t *p_end);
  * clamped to 0..51 by the caller. */
 void cabac_context_init(cabac_engine_t *cb, bool is_intra_slice, int cabac_init_idc, int qp);
 
+/* The two normative tables of clause 9.3.3.2, shared with the decoder's
+ * engine in h264_cabac_dec.h. They are the same numbers in both directions;
+ * only the code around them differs, which is why the engines are separate
+ * but the tables are not.
+ *
+ * ⚠️ cabac_renorm_shift[] is deliberately NOT shared. Its entry 0 covers
+ * codIRange 2..7 with a single shift of 6, which is wrong below 4. It is
+ * unreachable here (x264 state 0 is absorbing and initialisation never
+ * lands on it), but the decoder cannot rely on a stream it did not write,
+ * so it renormalises with a leading-zero count instead.
+ */
+extern const uint8_t cabac_range_lps[64][4];
+extern const uint8_t cabac_transition[128][2];
+
+
 #pragma GCC visibility push(hidden)
 void cabac_encode_decision(cabac_engine_t *cb, int ctx_idx, int bit);
 #pragma GCC visibility pop
