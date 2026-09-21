@@ -209,6 +209,54 @@ prova "12 fotogrammi temporale, 58x50" "testsrc2=size=58x50:rate=25" 58x50 \
     -frames:v 12 -c:v libx264 -profile:v high -qp 26 -bf 2 -g 6 $TD
 
 echo
+echo "matrici di quantizzazione"
+
+# A distinct value in every position: a list kept in the wrong order then
+# cannot come out right by accident. The 4x4 lists run 8..38 and the 8x8
+# ones 8..71, both in the raster order x264's file format expects.
+cqm_file() {
+    local f="$1"
+    { for nome in INTRA4X4_LUMA INTRA4X4_CHROMAU INTRA4X4_CHROMAV \
+                  INTER4X4_LUMA INTER4X4_CHROMAU INTER4X4_CHROMAV; do
+          echo "$nome"
+          for r in 0 1 2 3; do
+              for c in 0 1 2 3; do printf ' %d' $((8 + 2 * (r * 4 + c))); done
+              echo
+          done
+      done
+      for nome in INTRA8X8_LUMA INTER8X8_LUMA; do
+          echo "$nome"
+          for r in 0 1 2 3 4 5 6 7; do
+              for c in 0 1 2 3 4 5 6 7; do printf ' %d' $((8 + r * 8 + c)); done
+              echo
+          done
+      done
+    } > "$f"
+}
+cqm_file "$T/cqm.txt"
+
+prova "intra, matrici JVT" "$SRC1" 176x144 \
+    -frames:v 1 -c:v libx264 -profile:v high -qp 22 -x264opts cqm=jvt
+prova "12 fotogrammi, matrici JVT" "$SRC1" 176x144 \
+    -frames:v 12 -c:v libx264 -profile:v high -qp 24 -bf 2 -g 6 \
+    -x264opts cqm=jvt:b-pyramid=none
+prova "12 fotogrammi, matrici JVT CAVLC" "$SRC1" 176x144 \
+    -frames:v 12 -c:v libx264 -profile:v high -qp 24 -bf 2 -g 6 \
+    -x264opts cqm=jvt:cabac=0:b-pyramid=none
+prova "intra, matrici su misura" "$SRC1" 176x144 \
+    -frames:v 1 -c:v libx264 -profile:v high -qp 22 \
+    -x264opts "cqmfile=$T/cqm.txt"
+prova "12 fotogrammi, matrici su misura" "$SRC1" 176x144 \
+    -frames:v 12 -c:v libx264 -profile:v high -qp 24 -bf 2 -g 6 \
+    -x264opts "cqmfile=$T/cqm.txt:b-pyramid=none"
+prova "12 fotogrammi su misura, CAVLC" "$SRC1" 176x144 \
+    -frames:v 12 -c:v libx264 -profile:v high -qp 24 -bf 2 -g 6 \
+    -x264opts "cqmfile=$T/cqm.txt:cabac=0:b-pyramid=none"
+prova "20 fotogrammi su misura, preset lento" "$SRC2" 320x240 \
+    -frames:v 20 -c:v libx264 -profile:v high -preset slow -crf 24 -g 10 \
+    -x264opts "cqmfile=$T/cqm.txt"
+
+echo
 printf 'passate %d, fallite %d, saltate %d
 ' "$passate" "$fallite" "$saltate"
 [ "$fallite" -eq 0 ]

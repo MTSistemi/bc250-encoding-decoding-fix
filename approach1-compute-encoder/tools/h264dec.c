@@ -30,6 +30,7 @@
 
 #include "decoder_h264.h"
 #include "bitreader.h"
+#include "h264_dec_tables.h"   /* the two zig-zag scans, for the scaling lists */
 
 /* The harness runs the decoder with no GPU context, so end_picture keeps the
  * planes instead of uploading them. The upload is still referenced from the
@@ -69,6 +70,7 @@ typedef struct {
     int frame_mbs_only;
     int mb_adaptive;
     int direct_8x8_inference;
+    int scaling_present;
     uint8_t scaling4[6][16];
     uint8_t scaling8[6][64];
 } sps_t;
@@ -103,24 +105,88 @@ static void piatte(uint8_t s4[6][16], uint8_t s8[6][64])
     }
 }
 
-/* Clause 7.3.2.1.1.1. A list that is not sent is inherited, and the
- * "use default" case falls back to the flat matrix here rather than to the
- * standard's default lists: streams that ask for those are rare and the
- * harness refuses them loudly below. */
-static int lista_di_scala(br_t *br, uint8_t *lista, int n, int *usa_default)
+/* Table 7-3 and Table 7-4, in the order they would be sent: zig-zag. */
+static const uint8_t def4_intra[16] = {
+     6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42
+};
+static const uint8_t def4_inter[16] = {
+    10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34
+};
+static const uint8_t def8_intra[64] = {
+     6, 10, 10, 13, 11, 13, 16, 16, 16, 16, 18, 18, 18, 18, 18, 23,
+    23, 23, 23, 23, 23, 25, 25, 25, 25, 25, 25, 25, 27, 27, 27, 27,
+    27, 27, 27, 27, 29, 29, 29, 29, 29, 29, 29, 31, 31, 31, 31, 31,
+    31, 33, 33, 33, 33, 33, 36, 36, 36, 36, 38, 38, 38, 40, 40, 42
+};
+static const uint8_t def8_inter[64] = {
+     9, 13, 13, 15, 13, 15, 17, 17, 17, 17, 19, 19, 19, 19, 19, 21,
+    21, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 24, 24, 24, 24,
+    24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 27, 27, 27, 27, 27,
+    27, 28, 28, 28, 28, 28, 30, 30, 30, 30, 32, 32, 32, 33, 33, 35
+};
+
+/* âš ï¸ Everything below stores a scaling list in RASTER order, because that
+ * is how the dequantiser indexes it - and how VA-API hands it over. The
+ * bitstream sends it in zig-zag, and so do the tables above. */
+static void da_zigzag(const uint8_t *src, uint8_t *dst, int n)
 {
+    const uint8_t *z = (n == 16) ? h264d_zigzag4 : h264d_zigzag8;
+    for (int j = 0; j < n; j++)
+        dst[z[j]] = src[j];
+}
+
+static void lista_di_serie(int i, uint8_t *dst)
+{
+    if (i < 6)
+        da_zigzag(i < 3 ? def4_intra : def4_inter, dst, 16);
+    else
+        da_zigzag(i == 6 ? def8_intra : def8_inter, dst, 64);
+}
+
+/* Clause 7.3.2.1.1.1. Returns 1 when the list asked to be taken from the
+ * standard's defaults, 0 when it was sent in full. */
+static int lista_di_scala(br_t *br, uint8_t *lista, int n)
+{
+    uint8_t zz[64];
     int last = 8, next = 8;
-    *usa_default = 0;
     for (int j = 0; j < n; j++) {
         if (next) {
             const int delta = br_read_se(br);
             next = (last + delta + 256) % 256;
-            if (j == 0 && next == 0) { *usa_default = 1; return 0; }
+            if (j == 0 && next == 0) return 1;
         }
-        lista[j] = (uint8_t)(next ? next : last);
-        last = lista[j];
+        zz[j] = (uint8_t)(next ? next : last);
+        last = zz[j];
     }
+    da_zigzag(zz, lista, n);
     return 0;
+}
+
+/* Table 7-2: what a list that was not sent inherits.
+ *
+ * Fall-back rule A (a sequence's own matrix, or a picture's when the
+ * sequence had none) takes the standard default for the first list of each
+ * group and the previous list for the rest. Fall-back rule B (a picture's
+ * matrix layered over a sequence's) takes the sequence's list in those
+ * same places. `base` is the sequence's set under rule B and NULL under
+ * rule A. */
+static void scala_assente(int i, uint8_t s4[6][16], uint8_t s8[6][64],
+                          const uint8_t (*b4)[16], const uint8_t (*b8)[64])
+{
+    uint8_t *dst = (i < 6) ? s4[i] : s8[i - 6];
+    const int n = (i < 6) ? 16 : 64;
+    const int primo = (i == 0 || i == 3 || i == 6 || i == 7);
+
+    if (!primo) {
+        memcpy(dst, (i < 6) ? (const uint8_t *)s4[i - 1]
+                            : (const uint8_t *)s8[i - 7], (size_t)n);
+        return;
+    }
+    if (b4)
+        memcpy(dst, (i < 6) ? (const uint8_t *)b4[i]
+                            : (const uint8_t *)b8[i - 6], (size_t)n);
+    else
+        lista_di_serie(i, dst);
 }
 
 static int leggi_sps(const uint8_t *rbsp, size_t n)
@@ -149,17 +215,16 @@ static int leggi_sps(const uint8_t *rbsp, size_t n)
         s.bit_depth_luma = 8 + (int)br_read_ue(&br);
         s.bit_depth_chroma = 8 + (int)br_read_ue(&br);
         br_read1(&br);                      /* qpprime_y_zero_transform_bypass */
-        if (br_read1(&br)) {                /* seq_scaling_matrix_present */
+        s.scaling_present = (int)br_read1(&br);
+        if (s.scaling_present) {
             for (int i = 0; i < 8; i++) {
-                if (!br_read1(&br)) continue;
-                int def = 0;
-                if (i < 6) lista_di_scala(&br, s.scaling4[i], 16, &def);
-                else       lista_di_scala(&br, s.scaling8[i - 6], 64, &def);
-                if (def) {
-                    fprintf(stderr, "questo flusso chiede le liste di scala "
-                                    "di serie, non implementate\n");
-                    return -1;
+                if (!br_read1(&br)) {
+                    scala_assente(i, s.scaling4, s.scaling8, NULL, NULL);
+                    continue;
                 }
+                uint8_t *dst = (i < 6) ? s.scaling4[i] : s.scaling8[i - 6];
+                if (lista_di_scala(&br, dst, (i < 6) ? 16 : 64))
+                    lista_di_serie(i, dst);
             }
         }
     }
@@ -238,16 +303,23 @@ static int leggi_pps(const uint8_t *rbsp, size_t n)
     if (br_more_rbsp_data(&br)) {
         p.transform_8x8_mode = (int)br_read1(&br);
         if (br_read1(&br)) {                /* pic_scaling_matrix_present */
+            /* Rule B when the sequence sent a matrix of its own, rule A
+             * when it did not. The picture's lists start as copies of the
+             * sequence's, so a list that is neither sent nor a first-of-
+             * group already holds the right thing. */
+            const sps_t *sq = &sps_store[p.sps_id];
+            const int regola_b = sq->scaling_present;
             const int quante = 6 + (p.transform_8x8_mode ? 2 : 0);
             for (int i = 0; i < quante; i++) {
-                if (!br_read1(&br)) continue;
-                int def = 0;
-                if (i < 6) lista_di_scala(&br, p.scaling4[i], 16, &def);
-                else       lista_di_scala(&br, p.scaling8[i - 6], 64, &def);
-                if (def) {
-                    fprintf(stderr, "liste di scala di serie, non implementate\n");
-                    return -1;
+                if (!br_read1(&br)) {
+                    scala_assente(i, p.scaling4, p.scaling8,
+                                  regola_b ? sq->scaling4 : NULL,
+                                  regola_b ? sq->scaling8 : NULL);
+                    continue;
                 }
+                uint8_t *dst = (i < 6) ? p.scaling4[i] : p.scaling8[i - 6];
+                if (lista_di_scala(&br, dst, (i < 6) ? 16 : 64))
+                    lista_di_serie(i, dst);
             }
         }
         p.second_chroma_qp_index_offset = br_read_se(&br);
