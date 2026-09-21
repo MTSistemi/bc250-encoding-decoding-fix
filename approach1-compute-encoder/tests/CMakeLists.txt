@@ -70,6 +70,12 @@ add_executable(test_pred test_pred.c ../src/h264_pred.c)
 target_include_directories(test_pred PRIVATE ../src)
 target_link_libraries(test_pred PRIVATE m)
 
+# The H.265 inverse transforms against the matrices of clause 8.6.4.2.
+add_executable(test_hevc_transform test_hevc_transform.c
+               ../src/hevc_transform.c ../src/hevc_dec_tables.c)
+target_include_directories(test_hevc_transform PRIVATE ../src)
+target_link_libraries(test_hevc_transform PRIVATE m)
+
 enable_testing()
 add_test(NAME BitstreamTest COMMAND test_bitstream)
 add_test(NAME CavlcUnitTest COMMAND test_cavlc)
@@ -81,3 +87,4 @@ add_test(NAME DynamicGovernorTest COMMAND test_dynamic_governor)
 add_test(NAME CabacRoundtripTest COMMAND test_cabac_roundtrip)
 add_test(NAME McUnitTest COMMAND test_mc)
 add_test(NAME IntraPredUnitTest COMMAND test_pred)
+add_test(NAME HevcTransformUnitTest COMMAND test_hevc_transform)

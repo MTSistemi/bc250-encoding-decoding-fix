@@ -53,7 +53,14 @@ typedef struct {
      * derivation and for which way the coefficients are scanned. */
     uint8_t *intra_mode;            /* [h >> 2][w >> 2] */
     uint8_t *skip;                  /* per min coding block */
-    size_t n_ct_depth, n_intra_mode;
+    /* ⚠️ Where each smallest transform block sits in the z-scan order of
+     * the whole picture. Whether a neighbour has been decoded yet is a
+     * question about that order and not about coordinates: a coding tree
+     * unit is a quadtree, so the block above right of a transform block
+     * may or may not have come first. */
+    int32_t *min_tb_addr_zs;
+    int8_t *qp_y_map;               /* per min coding block */
+    size_t n_ct_depth, n_intra_mode, n_zs, n_qp;
     int min_pu_width, min_pu_height;
 
     /* The coding unit being read. */
@@ -68,16 +75,25 @@ typedef struct {
 
     /* Quantisation, 8.6.1. QpY carries across coding units. */
     int qp_y, qp_y_pred;
+    /* The last coding unit's QpY, which is qPY_PREV for the next
+     * quantisation group, and where that group starts. */
+    int qp_y_prev;
+    int qg_x, qg_y;
+    /* The group takes the slice's parameter rather than the previous
+     * group's: first of a slice, of a tile, or of a row under WPP. */
+    bool qg_riparte;
     bool cu_qp_delta_coded;
     int cu_qp_delta;
 
     /* One transform block's coefficients, in raster order inside it. */
     int16_t coeff[32 * 32];
+    bool transform_skip;            /* of the block just read */
 
     /* Where the picture is written. The decoder owns these; the harness
      * reads them back. */
     uint8_t *piano[3];
     int passo[3];
+    size_t n_piano;
 
     int ctb_addr;                   /* in the picture's raster order */
     bool fine_slice;
@@ -90,5 +106,20 @@ int hevcd_leggi_ctu(hevcd_t *d, int x0, int y0);
 /* residual_coding(), clause 7.3.8.11. The coefficients land in d->coeff,
  * in raster order inside the transform block. */
 void hevcd_leggi_residuo(hevcd_t *d, int x0, int y0, int log2_size, int c_idx);
+
+/* Intra prediction, 8.4.4.2: writes the prediction straight into the
+ * picture, where the residual is then added to it. */
+void hevcd_predici_intra(hevcd_t *d, int c_idx, int x0, int y0, int log2_size,
+                         int modo);
+
+/* 8.6.2 to 8.6.4: the coefficients into a residual, and onto the picture. */
+void hevcd_dequantizza(int16_t *coeff, int log2_size, int qp);
+void hevcd_trasforma(int16_t *coeff, int log2_size, bool dst);
+void hevcd_salta_trasformata(int16_t *coeff, int log2_size);
+void hevcd_aggiungi(uint8_t *dst, int passo, const int16_t *res, int log2_size);
+
+/* 6.5.2: the z-scan address of every smallest transform block. Built once
+ * per sequence parameter set. */
+int hevcd_prepara_zscan(hevcd_t *d);
 
 #endif /* BC250_HEVC_DEC_INTERNAL_H */

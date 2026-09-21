@@ -20,6 +20,7 @@
  */
 #include "hevc_dec_internal.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* ------------------------------------------------------------- neighbours */
@@ -178,28 +179,142 @@ static void leggi_qp_delta(hevcd_t *d)
     if (valore && hevcd_bypass(c))
         valore = -valore;
     d->cu_qp_delta = valore;
+    d->qp_y = ((d->qp_y_pred + valore + 52) % 52 + 52) % 52;
+}
+
+/* 8.6.1: the luma quantisation parameter's prediction, worked out once
+ * per quantisation group.
+ *
+ * The prediction is the average of the group to the left and the group
+ * above, and neither of them counts unless it sits inside the same coding
+ * tree block. A neighbour one block over has certainly been decoded, and
+ * the standard refuses it anyway, so that a decoder never has to keep a
+ * whole row of parameters alive to decode the next one. What is left when
+ * both are refused is qPY_PREV: the parameter of the last coding unit
+ * decoded before this group.
+ *
+ * ⚠️ This runs for every group and not only for the ones that carry a
+ * delta. A group with no delta still takes the prediction as its
+ * parameter, so a decoder that simply lets QpY stand is right exactly as
+ * long as the previous group happened to be the left neighbour - which at
+ * the start of a row it is not.
+ */
+static void inizia_qg(hevcd_t *d, int x0, int y0)
+{
+    const int log2_ctb = d->sps->log2_ctb;
+    const int log2_cb = d->sps->log2_min_cb;
+    const int passo = d->sps->min_cb_width;
+
+    d->qg_x = x0;
+    d->qg_y = y0;
+
+    /* ⚠️ Not cleared here. This runs once per quadtree node down to the
+     * group's own size, and only the last of those calls is the group's;
+     * clearing on the first one hands the group the previous group's
+     * parameter at the exact point where the standard says not to. It is
+     * cleared once a coding unit has been read. */
+    const int prima = d->qg_riparte ? d->slice->qp : d->qp_y_prev;
+
+    int a = prima, b = prima;
+    if (x0 > 0 && ((x0 - 1) >> log2_ctb) == (x0 >> log2_ctb))
+        a = d->qp_y_map[(y0 >> log2_cb) * passo + ((x0 - 1) >> log2_cb)];
+    if (y0 > 0 && ((y0 - 1) >> log2_ctb) == (y0 >> log2_ctb))
+        b = d->qp_y_map[((y0 - 1) >> log2_cb) * passo + (x0 >> log2_cb)];
+
+    d->qp_y_pred = (a + b + 1) >> 1;
+    d->qp_y = d->qp_y_pred;
+}
+
+/* Table 8-10: the chroma quantisation parameter, which is not the luma one
+ * even before the offsets. Above 29 it stops following, because chroma
+ * tolerates coarser quantisation than luma does and the standard says so
+ * in a table rather than a formula. */
+static int qp_croma(int qp_i)
+{
+    if (qp_i < 30) return qp_i < 0 ? 0 : qp_i;
+    if (qp_i > 43) return qp_i - 6;
+    return hevcd_qp_c[qp_i - 30];
+}
+
+/* 8.6.1, for the coding unit being reconstructed. */
+static int qp_del_blocco(const hevcd_t *d, int c_idx)
+{
+    if (c_idx == 0) return d->qp_y;
+    const int off = (c_idx == 1)
+        ? d->pps->cb_qp_offset + d->slice->cb_qp_offset
+        : d->pps->cr_qp_offset + d->slice->cr_qp_offset;
+    int q = d->qp_y + off;
+    if (q < 0) q = 0;
+    if (q > 57) q = 57;
+    return qp_croma(q);
+}
+
+/* One transform block: predict it, then add whatever residual it has.
+ *
+ * ⚠️ In that order and one block at a time. The next block predicts from
+ * this one's reconstructed samples, so a version that read all the
+ * residuals first and reconstructed afterwards would predict from
+ * whatever was in the picture before. */
+static void ricostruisci_tb(hevcd_t *d, int c_idx, int x, int y,
+                            int log2_size, bool ha_residuo)
+{
+    /* The luma mode is per prediction block; chroma has one per coding
+     * unit. For a chroma block the coordinates are halved, so the mode is
+     * looked up at the luma position it covers. */
+    const int lx = c_idx ? x * 2 : x, ly = c_idx ? y * 2 : y;
+    const int modo = (c_idx == 0)
+        ? d->intra_mode[(ly >> 2) * d->min_pu_width + (lx >> 2)]
+        : d->cu.intra_mode_c;
+
+    hevcd_predici_intra(d, c_idx, x, y, log2_size, modo);
+    if (!ha_residuo) return;
+
+    /* 8.6.2: with the bypass the coefficients are the residual already.
+     * Everything below this point - the scaling, the two transform stages,
+     * the rounding - exists to undo a quantisation that never happened. */
+    if (d->cu.transquant_bypass) {
+        hevcd_aggiungi(d->piano[c_idx] + (size_t)y * d->passo[c_idx] + x,
+                       d->passo[c_idx], d->coeff, log2_size);
+        return;
+    }
+
+    hevcd_dequantizza(d->coeff, log2_size, qp_del_blocco(d, c_idx));
+    if (d->transform_skip)
+        hevcd_salta_trasformata(d->coeff, log2_size);
+    else
+        hevcd_trasforma(d->coeff, log2_size,
+                        c_idx == 0 && log2_size == 2
+                        && d->cu.pred_mode == HEVCD_MODE_INTRA);
+    hevcd_aggiungi(d->piano[c_idx] + (size_t)y * d->passo[c_idx] + x,
+                   d->passo[c_idx], d->coeff, log2_size);
 }
 
 static void leggi_tu(hevcd_t *d, int x0, int y0, int x_base, int y_base,
                      int log2_size, int depth, int blk,
                      bool cbf_luma, bool cbf_cb, bool cbf_cr)
 {
-    if (!cbf_luma && !cbf_cb && !cbf_cr) return;
-
-    leggi_qp_delta(d);
+    if (cbf_luma || cbf_cb || cbf_cr)
+        leggi_qp_delta(d);
 
     if (cbf_luma)
         hevcd_leggi_residuo(d, x0, y0, log2_size, 0);
+    ricostruisci_tb(d, 0, x0, y0, log2_size, cbf_luma);
 
     if (log2_size > 2) {
+        const int cx = x0 >> 1, cy = y0 >> 1;
         if (cbf_cb) hevcd_leggi_residuo(d, x0, y0, log2_size - 1, 1);
+        ricostruisci_tb(d, 1, cx, cy, log2_size - 1, cbf_cb);
         if (cbf_cr) hevcd_leggi_residuo(d, x0, y0, log2_size - 1, 2);
+        ricostruisci_tb(d, 2, cx, cy, log2_size - 1, cbf_cr);
     } else if (blk == 3) {
         /* ⚠️ At the smallest luma size the four 4x4 blocks share one 4x4
          * chroma block, which is read with the last of them and lives at
          * the parent's corner. */
+        const int cx = x_base >> 1, cy = y_base >> 1;
         if (cbf_cb) hevcd_leggi_residuo(d, x_base, y_base, 2, 1);
+        ricostruisci_tb(d, 1, cx, cy, 2, cbf_cb);
         if (cbf_cr) hevcd_leggi_residuo(d, x_base, y_base, 2, 2);
+        ricostruisci_tb(d, 2, cx, cy, 2, cbf_cr);
     }
     (void)depth;
 }
@@ -383,6 +498,7 @@ static void leggi_quadtree(hevcd_t *d, int x0, int y0, int log2_size, int depth)
         && log2_size >= sps->log2_ctb - d->pps->diff_cu_qp_delta_depth) {
         d->cu_qp_delta_coded = false;
         d->cu_qp_delta = 0;
+        inizia_qg(d, x0, y0);
     }
 
     if (dividi) {
@@ -409,6 +525,54 @@ static void leggi_quadtree(hevcd_t *d, int x0, int y0, int log2_size, int depth)
         }
 
     leggi_cu(d, x0, y0, log2_size);
+
+    /* And what parameter it ended up with, for the groups that come after
+     * and, later, for the deblocking filter. */
+    for (int j = 0; j < n; j++)
+        for (int i = 0; i < n; i++) {
+            const int px = (x0 >> sps->log2_min_cb) + i;
+            const int py = (y0 >> sps->log2_min_cb) + j;
+            if (px < sps->min_cb_width && py < sps->min_cb_height)
+                d->qp_y_map[py * passo + px] = (int8_t)d->qp_y;
+        }
+    d->qp_y_prev = d->qp_y;
+    d->qg_riparte = false;
+}
+
+
+/* 6.5.2: the z-scan address of every smallest transform block, so that
+ * "has this neighbour been decoded yet" can be answered by comparing two
+ * numbers. With one tile and one slice the coding tree units are in raster
+ * order, and inside each of them the address is the interleaving of the
+ * bits of x and y - which is what a quadtree walk is. */
+int hevcd_prepara_zscan(hevcd_t *d)
+{
+    const hevc_sps_t *sps = d->sps;
+    const int w = sps->width >> sps->log2_min_tb;
+    const int h = sps->height >> sps->log2_min_tb;
+    const size_t serve = (size_t)w * h;
+
+    if (!d->min_tb_addr_zs || d->n_zs < serve) {
+        free(d->min_tb_addr_zs);
+        d->min_tb_addr_zs = calloc(serve, sizeof(int32_t));
+        d->n_zs = serve;
+        if (!d->min_tb_addr_zs) return -1;
+    }
+
+    const int diff = sps->log2_ctb - sps->log2_min_tb;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            const int cx = (x << sps->log2_min_tb) >> sps->log2_ctb;
+            const int cy = (y << sps->log2_min_tb) >> sps->log2_ctb;
+            int32_t a = (int32_t)(sps->ctb_width * cy + cx) << (diff * 2);
+            for (int i = 0; i < diff; i++) {
+                const int m = 1 << i;
+                a += ((m & x) ? m * m : 0) + ((m & y) ? 2 * m * m : 0);
+            }
+            d->min_tb_addr_zs[y * w + x] = a;
+        }
+    }
+    return 0;
 }
 
 int hevcd_leggi_ctu(hevcd_t *d, int x0, int y0)

@@ -45,9 +45,11 @@ void hevcd_leggi_residuo(hevcd_t *d, int x0, int y0, int log2_size, int c_idx)
     const int lato = 1 << log2_size;
     memset(d->coeff, 0, (size_t)lato * lato * sizeof(int16_t));
 
+    d->transform_skip = false;
     if (pps->transform_skip_enabled && !d->cu.transquant_bypass
         && log2_size == 2)
-        hevcd_bin(c, HEVCD_CTX_TRANSFORM_SKIP_FLAG + (c_idx ? 1 : 0));
+        d->transform_skip =
+            hevcd_bin(c, HEVCD_CTX_TRANSFORM_SKIP_FLAG + (c_idx ? 1 : 0)) != 0;
 
     /* 8.4.4.2. An intra block small enough has its scan chosen by the
      * prediction mode: a near-horizontal prediction leaves a residual with

@@ -97,6 +97,7 @@ extern const uint8_t hevcd_diag8_inv[8][8];
 extern const uint8_t hevcd_horiz8_inv[8][8];
 extern const int8_t hevcd_epel[8][4];
 extern const int8_t hevcd_qpel[4][8];
+extern const int8_t hevcd_dct[32][32];
 extern const int16_t hevcd_intra_angle[33];
 extern const int16_t hevcd_inv_angle[15];
 

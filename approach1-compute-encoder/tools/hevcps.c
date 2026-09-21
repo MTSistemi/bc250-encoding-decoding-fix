@@ -91,6 +91,43 @@ static bool verifica_gruppo(const int *poc, int quanti)
 }
 
 
+
+/* The three planes of one picture, at the coded size. The visible size is
+ * smaller and is applied when writing out. */
+static int apri_immagine(hevcd_t *d, const hevc_sps_t *sps)
+{
+    const int w = sps->width, h = sps->height;
+    if (d->piano[0] && d->passo[0] == w && d->n_piano == (size_t)w * h)
+        return 0;
+    for (int i = 0; i < 3; i++) { free(d->piano[i]); d->piano[i] = NULL; }
+    d->piano[0] = malloc((size_t)w * h);
+    d->piano[1] = malloc((size_t)(w / 2) * (h / 2));
+    d->piano[2] = malloc((size_t)(w / 2) * (h / 2));
+    if (!d->piano[0] || !d->piano[1] || !d->piano[2]) return -1;
+    d->passo[0] = w;
+    d->passo[1] = d->passo[2] = w / 2;
+    d->n_piano = (size_t)w * h;
+    return 0;
+}
+
+/* Cropped on the way out: the coded picture is a whole number of smallest
+ * coding blocks and the visible one is not. */
+static void scrivi_immagine(FILE *f, const hevcd_t *d, const hevc_sps_t *sps)
+{
+    if (!f) return;
+    const int x0 = sps->crop_left, y0 = sps->crop_top;
+    const int w = sps->width - sps->crop_left - sps->crop_right;
+    const int h = sps->height - sps->crop_top - sps->crop_bottom;
+
+    for (int y = 0; y < h; y++)
+        fwrite(d->piano[0] + (size_t)(y0 + y) * d->passo[0] + x0, 1,
+               (size_t)w, f);
+    for (int p = 1; p < 3; p++)
+        for (int y = 0; y < h / 2; y++)
+            fwrite(d->piano[p] + (size_t)(y0 / 2 + y) * d->passo[p] + x0 / 2,
+                   1, (size_t)(w / 2), f);
+}
+
 /* Why a slice could not be walked through. */
 static const char *motivo_slice(int e)
 {
@@ -130,16 +167,26 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
         d->intra_mode = calloc(serve_pu, 1);
         d->n_intra_mode = serve_pu;
     }
-    if (!d->ct_depth || !d->intra_mode) return 5;
+    if (!d->qp_y_map || d->n_qp < serve_cb) {
+        free(d->qp_y_map);
+        d->qp_y_map = calloc(serve_cb, 1);
+        d->n_qp = serve_cb;
+    }
+    if (!d->ct_depth || !d->intra_mode || !d->qp_y_map) return 5;
     memset(d->ct_depth, 0, serve_cb);
     memset(d->intra_mode, HEVCD_INTRA_DC, serve_pu);
 
     d->sps = sps;
+    if (apri_immagine(d, sps)) return 5;
+    if (hevcd_prepara_zscan(d)) return 5;
     d->pps = pps;
     d->slice = sl;
     d->min_pu_width = sps->width >> 2;
     d->min_pu_height = sps->height >> 2;
     d->qp_y = sl->qp;
+    d->qp_y_pred = sl->qp;
+    d->qp_y_prev = sl->qp;
+    d->qg_riparte = true;
     d->fine_slice = false;
 
     const size_t primo = sl->data_bit_offset >> 3;
@@ -198,6 +245,9 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
             base += usati;
             resto -= usati;
             h264d_cabac_init_engine(&d->cabac, base, resto);
+            /* 8.6.1: a row under WPP predicts its first group from the
+             * slice's parameter and not from the end of the row above. */
+            d->qg_riparte = true;
 
             /* 9.3.1: from the snapshot of the row above when the unit
              * above right exists, and from nothing when it does not -
@@ -215,14 +265,15 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
 int main(int argc, char **argv)
 {
     bool zitto = false, solo_intestazioni = false;
-    const char *nome = NULL;
+    const char *nome = NULL, *uscita = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) zitto = true;
         else if (strcmp(argv[i], "-h") == 0) solo_intestazioni = true;
-        else nome = argv[i];
+        else if (!nome) nome = argv[i];
+        else uscita = argv[i];
     }
     if (!nome) {
-        fprintf(stderr, "uso: hevcps [-q] <file.265>\n");
+        fprintf(stderr, "uso: hevcps [-q] [-h] <file.265> [uscita.yuv]\n");
         return 2;
     }
 
@@ -257,7 +308,10 @@ int main(int argc, char **argv)
 
     hevcd_t *dec = calloc(1, sizeof(hevcd_t));
     if (!dec) return 2;
-    int slice_lette = 0, slice_perse = 0;
+    int slice_lette = 0, slice_perse = 0, slice_saltate = 0;
+    FILE *fo = uscita ? fopen(uscita, "wb") : NULL;
+    if (uscita && !fo) { perror(uscita); return 2; }
+    bool immagine_aperta = false;
 
     for (long i = 0; i + 3 < len; ) {
         /* Find the start code, then the next one. */
@@ -391,24 +445,44 @@ int main(int argc, char **argv)
             slice_totali++;
 
             if (!solo_intestazioni) {
-                const int e = percorri_slice(dec, &sps[pps[s.pps_id].sps_id],
-                                             &pps[s.pps_id], &s, rbsp, n);
-                if (e) { slice_perse++; if (!zitto) printf("     ^ %s\n",
-                                                           motivo_slice(e)); }
-                else slice_lette++;
+                const hevc_sps_t *sp = &sps[pps[s.pps_id].sps_id];
+                if (s.first_slice_in_pic && immagine_aperta) {
+                    scrivi_immagine(fo, dec, sp);
+                    immagine_aperta = false;
+                }
+                const int e = percorri_slice(dec, sp, &pps[s.pps_id], &s,
+                                             rbsp, n);
+                if (e == 4) {
+                    slice_saltate++;
+                    if (immagine_aperta) scrivi_immagine(fo, dec, sp);
+                    immagine_aperta = false;
+                    if (fo) { fclose(fo); fo = NULL; }
+                } else if (e) {
+                    slice_perse++;
+                    if (!zitto) printf("     ^ %s\n", motivo_slice(e));
+                } else { slice_lette++; immagine_aperta = true; }
             }
         }
     }
     if (immagini && !zitto)
         printf("     (%d slice)\n", slice_di_questa);
 
+    if (immagine_aperta) {
+        const hevc_sps_t *sp = NULL;
+        for (int k = 0; k < 16; k++) if (sps[k].valid) { sp = &sps[k]; break; }
+        if (sp) scrivi_immagine(fo, dec, sp);
+    }
+    if (fo) fclose(fo);
     if (!verifica_gruppo(poc_visti, n_visti)) gruppi_rotti++;
 
     printf("%d immagini, %d slice, %d rifiutate, %d gruppi con poc rotti, "
-           "%d percorse, %d perse\n",
+           "%d percorse, %d saltate, %d perse\n",
            immagini, slice_totali, rifiutate, gruppi_rotti,
-           slice_lette, slice_perse);
+           slice_lette, slice_saltate, slice_perse);
     free(buf); free(rbsp); free(sps); free(pps); free(poc_visti);
-    free(dec->ct_depth); free(dec->intra_mode); free(dec);
+    free(dec->ct_depth); free(dec->intra_mode); free(dec->min_tb_addr_zs);
+    free(dec->qp_y_map);
+    for (int k = 0; k < 3; k++) free(dec->piano[k]);
+    free(dec);
     return (rifiutate || gruppi_rotti || slice_perse) ? 1 : 0;
 }

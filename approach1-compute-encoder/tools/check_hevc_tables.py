@@ -166,6 +166,53 @@ def main():
              if ang[k + 9] and inv[k] != inverso(ang[k + 9])]
     dire(not fuori, "ogni inverso e' 8192 diviso il suo angolo (%s)" % fuori)
 
+    print("la matrice della trasformata")
+    dct = righe(c, "hevcd_dct", 32)
+    dire(len(dct) == 32, "trentadue righe da trentadue (%d)" % len(dct))
+    dire(all(v == 64 for v in dct[0]), "la prima riga e' tutta 64")
+    # 8.6.4.2: the n-point matrix is rows k * (32 / n) of this one. Both of
+    # these are typed from the standard, not read from the same source the
+    # generator read, so they say something the generator cannot.
+    q4 = [[64, 64, 64, 64], [83, 36, -36, -83],
+          [64, -64, -64, 64], [36, -83, 83, -36]]
+    letto4 = [[dct[k * 8][i] for i in range(4)] for k in range(4)]
+    dire(letto4 == q4, "le quattro righe sono la matrice a 4 punti")
+    q8 = [[64, 64, 64, 64, 64, 64, 64, 64],
+          [89, 75, 50, 18, -18, -50, -75, -89],
+          [83, 36, -36, -83, -83, -36, 36, 83],
+          [75, -18, -89, -50, 50, 89, 18, -75],
+          [64, -64, -64, 64, 64, -64, -64, 64],
+          [50, -89, 18, 75, -75, -18, 89, -50],
+          [36, -83, 83, -36, -36, 83, -83, 36],
+          [18, -50, 75, -89, 89, -75, 50, -18]]
+    letto8 = [[dct[k * 4][i] for i in range(8)] for k in range(8)]
+    dire(letto8 == q8, "le otto righe sono la matrice a 8 punti")
+    # ⚠️ Nearly orthogonal, not orthogonal. The basis functions are cosines
+    # rounded to integers, and above four points the rounding leaves a
+    # residue: the worst pair of the 32-point matrix dots to 376 against a
+    # norm of 131244, which is three parts in a thousand. Asking for exact
+    # zeros fails on a correct table, which is how this check first read.
+    # What a wrong digit does is nothing like three parts in a thousand.
+    def prodotto(a, b, n):
+        s = 32 // n
+        return sum(dct[a * s][i] * dct[b * s][i] for i in range(n))
+
+    for n in (4, 8, 16, 32):
+        norma = prodotto(1, 1, n)
+        peggio = max(abs(prodotto(a, b, n))
+                     for a in range(n) for b in range(a + 1, n))
+        limite = 0 if n == 4 else norma // 100
+        dire(peggio <= limite,
+             "%d punti: righe quasi ortogonali (%d su %d)"
+             % (n, peggio, norma))
+    # Even rows read the same backwards, odd rows read the same negated:
+    # the basis functions are symmetric and antisymmetric in turn.
+    specchio = [k for k in range(32)
+                if any(dct[k][31 - i] != (dct[k][i] if k % 2 == 0
+                                          else -dct[k][i]) for i in range(32))]
+    dire(not specchio, "pari a specchio e dispari a specchio col segno (%s)"
+         % specchio)
+
     print("livelli di quantizzazione")
     ls = leggi(c, "hevcd_level_scale")
     dire(ls == [40, 45, 51, 57, 64, 72], "levelScale come 8.6.3 (%s)" % ls)

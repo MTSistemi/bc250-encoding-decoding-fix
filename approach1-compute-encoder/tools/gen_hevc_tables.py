@@ -242,6 +242,11 @@ def main():
     angolo = piatta(pred, "intra_pred_angle[]")
     inv_angolo = piatta(pred, "inv_angle[]")
 
+    # The DCT-II matrix of clause 8.6.4.2. One 32x32 table holds all four
+    # sizes: the 16-point transform is its even rows, the 8-point the even
+    # rows of those, and so on, which is why the standard writes only one.
+    dct = righe(blocco(dsp, "transform[32][32]"))
+
     # --- the header ---------------------------------------------------
     h = [INTESTAZIONE % ("hevc_dec_tables.h", TAG),
          "#ifndef BC250_HEVC_DEC_TABLES_H",
@@ -275,6 +280,7 @@ def main():
         h.append("extern const uint8_t %s[%d][%d];" % (nome, len(m), len(m[0])))
     h.append("extern const int8_t hevcd_epel[%d][%d];" % (len(epel), 4))
     h.append("extern const int8_t hevcd_qpel[%d][%d];" % (len(qpel), 8))
+    h.append("extern const int8_t hevcd_dct[%d][%d];" % (len(dct), len(dct[0])))
     h.append("extern const int16_t hevcd_intra_angle[%d];" % len(angolo))
     h.append("extern const int16_t hevcd_inv_angle[%d];" % len(inv_angolo))
     h.append("")
@@ -306,6 +312,8 @@ def main():
     c.append(due("hevcd_qpel", "int8_t", riempi(qpel, 8), 8))
     c.append("")
     c.append(due("hevcd_epel", "int8_t", riempi(epel, 4), 4))
+    c.append("")
+    c.append(due("hevcd_dct", "int8_t", dct, 16))
     c.append("")
     c.append(uno("hevcd_intra_angle", "int16_t", angolo))
     c.append("")
