@@ -41,6 +41,45 @@ enum { HEVCD_INTRA_PLANAR = 0, HEVCD_INTRA_DC = 1,
 enum { HEVCD_SCAN_DIAG = 0, HEVCD_SCAN_HORIZ = 1, HEVCD_SCAN_VERT = 2 };
 
 /* One picture's worth of decoding state. */
+/* Which reference lists a prediction unit uses. */
+enum { HEVCD_PF_L0 = 1, HEVCD_PF_L1 = 2, HEVCD_PF_BI = 3 };
+
+/* One prediction unit's motion, on the grid of the smallest one.
+ *
+ * ⚠️ Kept per four samples and not per prediction unit. Every neighbour
+ * question in 8.5.3.2 is asked at a sample position - "the block covering
+ * (x0 - 1, y0 + nPbH - 1)" - and answering it from a list of units would
+ * mean searching. Four samples is the finest a unit can be, so a grid of
+ * that size answers by indexing. */
+typedef struct {
+    int16_t mv[2][2];               /* [list][x, y], in quarter samples */
+    int8_t ref_idx[2];
+    uint8_t pred_flag;              /* zero for an intra block */
+    /* ⚠️ Which picture, and not only which index. Two blocks either side
+     * of an edge may have been written by different slices, and an index
+     * means nothing outside the slice that wrote it: the deblocking
+     * filter asks whether they point at the same picture. */
+    int32_t ref_poc[2];
+} hevcd_mvf_t;
+
+/* A picture that later ones predict from.
+ *
+ * ⚠️ It carries its own reference lists as picture order counts and not as
+ * indices. A temporal candidate asks what picture the collocated block
+ * pointed at, and the index it used means nothing outside the slice that
+ * wrote it. */
+typedef struct {
+    uint8_t *piano[3];
+    int passo[3];
+    size_t n_piano;
+    int poc;
+    bool valida;
+    hevcd_mvf_t *mvf;
+    size_t n_mvf;
+    int poc_lista[2][16];
+    int n_lista[2];
+} hevcd_img_t;
+
 /* One coding tree block's sample adaptive offset, 7.3.8.3.
  *
  * The filter is a lookup table with four entries that the encoder chose
@@ -88,6 +127,10 @@ typedef struct {
     /* Per min coding block: a unit whose samples the loop filters must
      * leave exactly as they are. Lossless coding, today. */
     uint8_t *no_filtro;
+    /* Per smallest transform block: does it carry a luma residual. The
+     * boundary strength asks, and only about luma. */
+    uint8_t *cbf_map;
+    size_t n_cbf;
     /* Per coding tree block, and the picture as the deblocking filter left
      * it: the offset by an edge asks what the neighbours were before this
      * filter touched them, so it cannot read the plane it is writing. */
@@ -132,6 +175,14 @@ typedef struct {
     int passo[3];
     size_t n_piano;
 
+    /* The picture being decoded, its motion field, and what it predicts
+     * from. The harness owns the buffer and fills these in per slice. */
+    hevcd_img_t *corrente;
+    hevcd_mvf_t *mvf;
+    const hevcd_img_t *rif[2][16];
+    int n_rif[2];
+    const hevcd_img_t *col;         /* the collocated picture, or NULL */
+
     int ctb_addr;                   /* in the picture's raster order */
     bool fine_slice;
 } hevcd_t;
@@ -144,6 +195,15 @@ int hevcd_leggi_ctu(hevcd_t *d, int x0, int y0);
 void hevcd_deblocca(hevcd_t *d);
 void hevcd_sao(hevcd_t *d);
 void hevcd_libera_filtri(hevcd_t *d);
+
+/* 8.5.3.2: what motion one prediction unit ended up with, and 8.5.3.3:
+ * the samples that motion fetches. */
+void hevcd_merge(hevcd_t *d, int x0, int y0, int w, int h, int part_idx,
+                 int merge_idx, hevcd_mvf_t *fuori);
+void hevcd_amvp(hevcd_t *d, int x0, int y0, int w, int h, int lista,
+                int mvp_flag, hevcd_mvf_t *mv);
+void hevcd_predici_inter(hevcd_t *d, int x0, int y0, int w, int h,
+                         const hevcd_mvf_t *m);
 
 /* How many prediction units a partition mode has, and where the k-th one
  * sits inside a coding block of side `lato`. */

@@ -199,6 +199,71 @@ static bool bordo(const hevcd_t *d, int x, int y, int quale)
     return (d->bordi[(y >> 3) * d->bordi_passo + (x >> 3)] & quale) != 0;
 }
 
+/* 8.7.2.4. Two, one, or nothing at all.
+ *
+ * Two means an intra block is involved and the step across the edge is
+ * whatever the prediction could not reach; that is worth the strong
+ * filter and it is the only case where chroma is touched at all. One
+ * means two inter blocks that disagree - a coded residual at a transform
+ * edge, different reference pictures, or motion a quarter sample apart.
+ * Nothing means two blocks that were predicted the same way from the same
+ * place, where any step across the edge would be something the filter
+ * invented.
+ */
+static int forza(const hevcd_t *d, int xp, int yp, int xq, int yq,
+                 bool bordo_trasformata)
+{
+    const int passo = d->min_pu_width;
+    const hevcd_mvf_t *p = &d->mvf[(yp >> 2) * passo + (xp >> 2)];
+    const hevcd_mvf_t *q = &d->mvf[(yq >> 2) * passo + (xq >> 2)];
+
+    if (!p->pred_flag || !q->pred_flag) return 2;
+
+    if (bordo_trasformata && d->cbf_map
+        && (d->cbf_map[(yp >> 2) * passo + (xp >> 2)]
+            || d->cbf_map[(yq >> 2) * passo + (xq >> 2)]))
+        return 1;
+
+    const int np = (p->pred_flag == HEVCD_PF_BI) ? 2 : 1;
+    const int nq = (q->pred_flag == HEVCD_PF_BI) ? 2 : 1;
+    if (np != nq) return 1;
+
+#define LONTANI(a, la, b, lb)                                   \
+    (abs((a)->mv[la][0] - (b)->mv[lb][0]) >= 4                  \
+     || abs((a)->mv[la][1] - (b)->mv[lb][1]) >= 4)
+
+    if (np == 1) {
+        const int lp = (p->pred_flag & HEVCD_PF_L0) ? 0 : 1;
+        const int lq = (q->pred_flag & HEVCD_PF_L0) ? 0 : 1;
+        if (p->ref_poc[lp] != q->ref_poc[lq]) return 1;
+        return LONTANI(p, lp, q, lq) ? 1 : 0;
+    }
+
+    /* Both predict from two places. They agree only if the two pairs of
+     * pictures are the same pair - in either order - and the vectors that
+     * go with them are close enough. */
+    const bool stesse = (p->ref_poc[0] == q->ref_poc[0]
+                         && p->ref_poc[1] == q->ref_poc[1]);
+    const bool incrociate = (p->ref_poc[0] == q->ref_poc[1]
+                             && p->ref_poc[1] == q->ref_poc[0]);
+    if (!stesse && !incrociate) return 1;
+
+    if (p->ref_poc[0] != p->ref_poc[1]) {
+        /* ⚠️ Two different pictures: there is only one way to pair them
+         * up, and it is whichever way makes the pictures match. */
+        if (stesse)
+            return (LONTANI(p, 0, q, 0) || LONTANI(p, 1, q, 1)) ? 1 : 0;
+        return (LONTANI(p, 0, q, 1) || LONTANI(p, 1, q, 0)) ? 1 : 0;
+    }
+
+    /* The same picture twice: either pairing will do, and the edge is
+     * quiet if either one is close enough. */
+    const bool dritte = !(LONTANI(p, 0, q, 0) || LONTANI(p, 1, q, 1));
+    const bool storte = !(LONTANI(p, 0, q, 1) || LONTANI(p, 1, q, 0));
+    return (dritte || storte) ? 0 : 1;
+#undef LONTANI
+}
+
 /* One direction over the whole picture. `verticale` says which edges are
  * looked at, not which way the filter reads: a vertical edge is filtered
  * along x and stepped along y. */
@@ -216,18 +281,14 @@ static void una_direzione(hevcd_t *d, bool verticale)
             if (verticale ? x == 0 : y == 0) continue;
             if (!bordo(d, x, y, quale)) continue;
 
-            /* In an intra picture every block boundary has boundary
-             * strength two: the derivation in 8.7.2.4 asks whether either
-             * side is intra coded, and both are.
-             *
-             * ⚠️ When inter arrives this stops being a constant. It
-             * becomes two only for intra, one for a coded residual or for
-             * motion vectors far enough apart, and zero otherwise - and a
-             * zero means the edge is not filtered at all. */
-            const int bs = 2;
-
             const int xp = verticale ? x - 1 : x;
             const int yp = verticale ? y : y - 1;
+            const int bs = d->mvf
+                ? forza(d, xp, yp, x, y,
+                        (d->bordi[(y >> 3) * d->bordi_passo + (x >> 3)]
+                         & (verticale ? 4 : 8)) != 0)
+                : 2;
+            if (!bs) continue;
             const int qp = (qp_di(d, x, y) + qp_di(d, xp, yp) + 1) >> 1;
             const bool tieni_p = intoccabile(d, xp, yp);
             const bool tieni_q = intoccabile(d, x, y);

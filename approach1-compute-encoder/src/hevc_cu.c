@@ -183,18 +183,70 @@ static int modo_croma(int idx, int luma)
  * ignores it: filtering on a four grid would leave no unfiltered sample
  * anywhere, since the filter reaches four samples each way.
  */
-static void segna_bordi(hevcd_t *d, int x0, int y0, int log2_size)
+static void segna_bordi(hevcd_t *d, int x0, int y0, int log2_size,
+                        bool trasformata)
 {
     if (!d->bordi) return;
     const int lato = 1 << log2_size;
     const int passo = d->bordi_passo;
+    /* Bits two and three say the same edge is also a transform block's,
+     * which is a different question from whether it may be filtered: a
+     * coded residual on either side of a transform edge is worth
+     * smoothing, the same residual in the middle of one is not. */
+    const int v = trasformata ? 1 | 4 : 1;
+    const int o = trasformata ? 2 | 8 : 2;
 
     if ((x0 & 7) == 0)
         for (int j = 0; j < lato; j += 8)
-            d->bordi[((y0 + j) >> 3) * passo + (x0 >> 3)] |= 1;
+            d->bordi[((y0 + j) >> 3) * passo + (x0 >> 3)] |= v;
     if ((y0 & 7) == 0)
         for (int i = 0; i < lato; i += 8)
+            d->bordi[(y0 >> 3) * passo + ((x0 + i) >> 3)] |= o;
+
+    /* ⚠️ And the far side too. A block's right edge is its neighbour's
+     * left one and the neighbour marks it - unless the neighbour has no
+     * transform blocks of its own, which a skipped coding unit does not.
+     * Marking only the near edges loses every transform boundary that
+     * happens to have a skipped unit on the other side of it. */
+    if (!trasformata) return;
+    const int xf = x0 + lato, yf = y0 + lato;
+    if ((xf & 7) == 0 && xf < d->sps->width)
+        for (int j = 0; j < lato; j += 8)
+            d->bordi[((y0 + j) >> 3) * passo + (xf >> 3)] |= v;
+    if ((yf & 7) == 0 && yf < d->sps->height)
+        for (int i = 0; i < lato; i += 8)
+            d->bordi[(yf >> 3) * passo + ((x0 + i) >> 3)] |= o;
+}
+
+/* The same, for a rectangle: a prediction unit's own edges. 8.7.2.2
+ * filters transform block edges and prediction block edges alike, and an
+ * asymmetric partition puts one where no transform ever will.
+ *
+ * ⚠️ Not a transform boundary, so a coded residual either side of it does
+ * not raise the strength. Only the motion does. */
+static void segna_bordi_rett(hevcd_t *d, int x0, int y0, int w, int h)
+{
+    if (!d->bordi) return;
+    const int passo = d->bordi_passo;
+    if ((x0 & 7) == 0)
+        for (int j = 0; j < h; j += 8)
+            d->bordi[((y0 + j) >> 3) * passo + (x0 >> 3)] |= 1;
+    if ((y0 & 7) == 0)
+        for (int i = 0; i < w; i += 8)
             d->bordi[(y0 >> 3) * passo + ((x0 + i) >> 3)] |= 2;
+}
+
+/* Which smallest transform blocks carry a luma residual. */
+static void segna_cbf(hevcd_t *d, int x0, int y0, int log2_size)
+{
+    if (!d->cbf_map) return;
+    const int lato = 1 << log2_size;
+    for (int j = 0; j < lato; j += 4)
+        for (int i = 0; i < lato; i += 4) {
+            const int px = (x0 + i) >> 2, py = (y0 + j) >> 2;
+            if (px < d->min_pu_width && py < d->min_pu_height)
+                d->cbf_map[py * d->min_pu_width + px] = 1;
+        }
 }
 
 
@@ -238,6 +290,30 @@ void hevcd_rettangolo_pu(int part_mode, int k, int lato,
     default:
         *x = 0; *y = 0; *w = lato; *h = lato; return;
     }
+}
+
+/* What this prediction unit's motion was, written over every smallest
+ * block it covers. The neighbours that come after read it there. */
+static void scrivi_campo(hevcd_t *d, int x0, int y0, int w, int h,
+                         const hevcd_mvf_t *m)
+{
+    if (!d->mvf) return;
+    for (int j = 0; j < h; j += 4)
+        for (int i = 0; i < w; i += 4) {
+            const int px = (x0 + i) >> 2, py = (y0 + j) >> 2;
+            if (px < d->min_pu_width && py < d->min_pu_height)
+                d->mvf[py * d->min_pu_width + px] = *m;
+        }
+}
+
+/* An intra coding unit has no motion, and saying so is not the same as
+ * leaving whatever the last picture put there: the neighbours ask. */
+static void campo_intra(hevcd_t *d, int x0, int y0, int lato)
+{
+    hevcd_mvf_t vuoto;
+    memset(&vuoto, 0, sizeof vuoto);
+    vuoto.ref_idx[0] = vuoto.ref_idx[1] = -1;
+    scrivi_campo(d, x0, y0, lato, lato, &vuoto);
 }
 
 /* 9.3.3.3: exp-Golomb of order k, entirely in bypass. */
@@ -337,14 +413,30 @@ static void leggi_mvd(hevcd_t *d, int16_t mvd[2])
 /* 7.3.8.6. Everything a prediction unit says about where it copies from:
  * which lists, which pictures in them, and how far off the prediction
  * the true motion was. */
-static bool leggi_pu(hevcd_t *d, int w, int h, bool salta)
+static bool leggi_pu(hevcd_t *d, int x0, int y0, int w, int h,
+                     int part_idx, bool salta)
 {
     hevcd_cabac_t *c = &d->cabac;
     const hevc_slice_t *sl = d->slice;
     const int quanti_merge = 5 - sl->five_minus_max_num_merge_cand;
+    hevcd_mvf_t m;
+
+    memset(&m, 0, sizeof m);
+    m.ref_idx[0] = m.ref_idx[1] = -1;
 
     if (salta || hevcd_bin(c, HEVCD_CTX_MERGE_FLAG)) {
-        leggi_merge_idx(d, quanti_merge);
+        const int idx = leggi_merge_idx(d, quanti_merge);
+        hevcd_merge(d, x0, y0, w, h, part_idx, idx, &m);
+        /* ⚠️ A merged unit copies its neighbour's index, and the
+         * neighbour's index was resolved against the same lists, so it
+         * still means the same picture. Its recorded picture may not be:
+         * a temporal candidate has no index of its own. */
+        for (int l = 0; l < 2; l++)
+            if ((m.pred_flag & (1 << l)) && m.ref_idx[l] >= 0
+                && m.ref_idx[l] < d->n_rif[l])
+                m.ref_poc[l] = d->rif[l][m.ref_idx[l]]->poc;
+        scrivi_campo(d, x0, y0, w, h, &m);
+        hevcd_predici_inter(d, x0, y0, w, h, &m);
         return true;
     }
 
@@ -362,17 +454,30 @@ static bool leggi_pu(hevcd_t *d, int w, int h, bool salta)
             liste = hevcd_bin(c, HEVCD_CTX_INTER_PRED_IDC + 4) ? 2 : 1;
     }
 
+    m.pred_flag = (uint8_t)liste;
     for (int l = 0; l < 2; l++) {
         if (!(liste & (1 << l))) continue;
-        if (sl->num_ref_idx[l] > 1) leggi_ref_idx(d, sl->num_ref_idx[l]);
+        m.ref_idx[l] = (int8_t)(sl->num_ref_idx[l] > 1
+                                ? leggi_ref_idx(d, sl->num_ref_idx[l]) : 0);
+        if (m.ref_idx[l] < d->n_rif[l])
+            m.ref_poc[l] = d->rif[l][m.ref_idx[l]]->poc;
         int16_t mvd[2] = { 0, 0 };
         if (l == 1 && sl->mvd_l1_zero && liste == 3) {
             /* Sent as nothing at all: the slice header promised it. */
         } else {
             leggi_mvd(d, mvd);
         }
-        hevcd_bin(c, HEVCD_CTX_MVP_LX_FLAG);
+        const int mvp = hevcd_bin(c, HEVCD_CTX_MVP_LX_FLAG);
+        hevcd_amvp(d, x0, y0, w, h, l, mvp, &m);
+        /* ⚠️ The difference is added after the predictor is derived and
+         * wraps at sixteen bits: the standard says the sum is taken
+         * modulo 2^16, so a vector near the limit comes back round rather
+         * than being clipped. */
+        m.mv[l][0] = (int16_t)(m.mv[l][0] + mvd[0]);
+        m.mv[l][1] = (int16_t)(m.mv[l][1] + mvd[1]);
     }
+    scrivi_campo(d, x0, y0, w, h, &m);
+    hevcd_predici_inter(d, x0, y0, w, h, &m);
     return false;
 }
 
@@ -635,7 +740,8 @@ static void leggi_albero_trasformate(hevcd_t *d, int x0, int y0,
     if (d->cu.pred_mode == HEVCD_MODE_INTRA || depth != 0 || cbf_cb || cbf_cr)
         cbf_luma = hevcd_bin(c, HEVCD_CTX_CBF_LUMA + (depth == 0 ? 1 : 0)) != 0;
 
-    segna_bordi(d, x0, y0, log2_size);
+    segna_bordi(d, x0, y0, log2_size, true);
+    if (cbf_luma) segna_cbf(d, x0, y0, log2_size);
     leggi_tu(d, x0, y0, x_base, y_base, log2_size, depth, blk,
              cbf_luma, cbf_cb, cbf_cr);
 }
@@ -670,7 +776,7 @@ static void leggi_cu(hevcd_t *d, int x0, int y0, int log2_size)
             /* A skipped unit is one merge index and nothing else: no
              * partition, no residual, not even a prediction mode. */
             d->cu.pred_mode = HEVCD_MODE_INTER;
-            leggi_pu(d, lato, lato, true);
+            leggi_pu(d, x0, y0, lato, lato, 0, true);
             return;
         }
         if (!hevcd_bin(c, HEVCD_CTX_PRED_MODE_FLAG))
@@ -678,6 +784,7 @@ static void leggi_cu(hevcd_t *d, int x0, int y0, int log2_size)
     } else {
         segna_salto(d, x0, y0, log2_size, false);
     }
+    campo_intra(d, x0, y0, lato);
 
     if (d->cu.pred_mode == HEVCD_MODE_INTER) {
         d->cu.part_mode = leggi_part_mode(d, log2_size);
@@ -687,8 +794,8 @@ static void leggi_cu(hevcd_t *d, int x0, int y0, int log2_size)
         for (int k = 0; k < quante; k++) {
             int px, py, pw, ph;
             hevcd_rettangolo_pu(d->cu.part_mode, k, lato, &px, &py, &pw, &ph);
-            (void)px; (void)py;
-            unito = leggi_pu(d, pw, ph, false);
+            segna_bordi_rett(d, x0 + px, y0 + py, pw, ph);
+            unito = leggi_pu(d, x0 + px, y0 + py, pw, ph, k, false);
         }
 
         /* 7.3.8.5: a whole-block merge says nothing about its residual,
@@ -766,6 +873,8 @@ static void leggi_cu(hevcd_t *d, int x0, int y0, int log2_size)
         idx_c = (int)hevcd_bypass_n(c, 2);
     d->cu.intra_mode_c = modo_croma(idx_c, modo_luma_0);
 
+    campo_intra(d, x0, y0, lato);
+
     /* An intra coding unit's rqt_root_cbf is not sent: it is one. */
     leggi_albero_trasformate(d, x0, y0, x0, y0, log2_size, 0, 0, false, false);
 }
@@ -829,7 +938,7 @@ static void leggi_quadtree(hevcd_t *d, int x0, int y0, int log2_size, int depth)
                 d->ct_depth[py * passo + px] = (uint8_t)depth;
         }
 
-    segna_bordi(d, x0, y0, log2_size);
+    segna_bordi(d, x0, y0, log2_size, false);
     d->cu.depth = depth;
     leggi_cu(d, x0, y0, log2_size);
 

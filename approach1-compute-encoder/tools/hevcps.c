@@ -92,46 +92,228 @@ static bool verifica_gruppo(const int *poc, int quanti)
 
 
 
-/* The three planes of one picture, at the coded size. The visible size is
- * smaller and is applied when writing out. */
-static int apri_immagine(hevcd_t *d, const hevc_sps_t *sps)
+/* The decoded picture buffer.
+ *
+ * ⚠️ Every picture here is one another may still point at. A picture is
+ * let go when the reference picture set of a later one stops naming it,
+ * and not a moment before: the set is the only thing that says so, and a
+ * decoder that frees on its own idea of "old" loses a reference the
+ * stream was still counting on. */
+#define QUANTE_IMG 20
+
+static hevcd_img_t buffer[QUANTE_IMG];
+
+static void libera_img(hevcd_img_t *g)
+{
+    for (int i = 0; i < 3; i++) { free(g->piano[i]); g->piano[i] = NULL; }
+    free(g->mvf);
+    g->mvf = NULL;
+    g->n_piano = 0;
+    g->n_mvf = 0;
+    g->valida = false;
+}
+
+static hevcd_img_t *trova_img(int poc)
+{
+    for (int i = 0; i < QUANTE_IMG; i++)
+        if (buffer[i].valida && buffer[i].poc == poc) return &buffer[i];
+    return NULL;
+}
+
+/* Everything the reference picture set no longer names can go. */
+static void sfoltisci(const hevc_slice_t *sl)
+{
+    if (sl->nal_type == HEVC_NAL_IDR_W_RADL || sl->nal_type == HEVC_NAL_IDR_N_LP) {
+        for (int i = 0; i < QUANTE_IMG; i++) buffer[i].valida = false;
+        return;
+    }
+    const hevc_st_rps_t *r = &sl->st_rps;
+    const int quanti = r->num_negative + r->num_positive;
+    for (int i = 0; i < QUANTE_IMG; i++) {
+        if (!buffer[i].valida) continue;
+        bool serve = false;
+        for (int k = 0; k < quanti && !serve; k++)
+            if (buffer[i].poc == sl->poc + r->delta_poc[k]) serve = true;
+        if (!serve) buffer[i].valida = false;
+    }
+}
+
+/* The three planes of one picture at the coded size, and the motion field
+ * a later picture will read for its temporal candidate. The visible size
+ * is smaller and is applied when writing out. */
+static int apri_immagine(hevcd_t *d, const hevc_sps_t *sps, int poc)
 {
     const int w = sps->width, h = sps->height;
-    if (d->piano[0] && d->passo[0] == w && d->n_piano == (size_t)w * h)
-        return 0;
-    for (int i = 0; i < 3; i++) { free(d->piano[i]); d->piano[i] = NULL; }
-    d->piano[0] = malloc((size_t)w * h);
-    d->piano[1] = malloc((size_t)(w / 2) * (h / 2));
-    d->piano[2] = malloc((size_t)(w / 2) * (h / 2));
-    if (!d->piano[0] || !d->piano[1] || !d->piano[2]) return -1;
-    d->passo[0] = w;
-    d->passo[1] = d->passo[2] = w / 2;
-    d->n_piano = (size_t)w * h;
+    const size_t n_mvf = (size_t)(w >> 2) * (h >> 2);
+
+    hevcd_img_t *g = NULL;
+    for (int i = 0; i < QUANTE_IMG && !g; i++)
+        if (!buffer[i].valida) g = &buffer[i];
+    if (!g) return -1;
+
+    if (g->n_piano != (size_t)w * h) {
+        libera_img(g);
+        g->piano[0] = malloc((size_t)w * h);
+        g->piano[1] = malloc((size_t)(w / 2) * (h / 2));
+        g->piano[2] = malloc((size_t)(w / 2) * (h / 2));
+        g->n_piano = (size_t)w * h;
+    }
+    if (g->n_mvf != n_mvf) {
+        free(g->mvf);
+        g->mvf = malloc(n_mvf * sizeof *g->mvf);
+        g->n_mvf = n_mvf;
+    }
+    if (!g->piano[0] || !g->piano[1] || !g->piano[2] || !g->mvf) return -1;
+
+    memset(g->mvf, 0, n_mvf * sizeof *g->mvf);
+    g->passo[0] = w;
+    g->passo[1] = g->passo[2] = w / 2;
+    g->poc = poc;
+    g->valida = true;
+    g->n_lista[0] = g->n_lista[1] = 0;
+
+    d->corrente = g;
+    d->mvf = g->mvf;
+    for (int i = 0; i < 3; i++) { d->piano[i] = g->piano[i]; d->passo[i] = g->passo[i]; }
+    d->n_piano = g->n_piano;
     return 0;
+}
+
+/* 8.3.4: the lists are the pictures before this one, then the ones after,
+ * repeated until the list is as long as the slice header asked for.
+ *
+ * ⚠️ List one starts from the other end. That is the whole point of having
+ * two: a B picture with one reference each way sends the shorter index
+ * for whichever direction it meant. */
+static void costruisci_liste(hevcd_t *d, const hevc_slice_t *sl)
+{
+    const hevc_st_rps_t *r = &sl->st_rps;
+    const hevcd_img_t *prima[16], *dopo[16];
+    int np = 0, nd = 0;
+
+    for (int i = 0; i < r->num_negative && np < 16; i++) {
+        if (!r->used[i]) continue;
+        const hevcd_img_t *g = trova_img(sl->poc + r->delta_poc[i]);
+        if (g) prima[np++] = g;
+    }
+    for (int i = r->num_negative; i < r->num_negative + r->num_positive
+             && nd < 16; i++) {
+        if (!r->used[i]) continue;
+        const hevcd_img_t *g = trova_img(sl->poc + r->delta_poc[i]);
+        if (g) dopo[nd++] = g;
+    }
+
+    for (int l = 0; l < 2; l++) {
+        d->n_rif[l] = 0;
+        const int quante = sl->num_ref_idx[l];
+        const hevcd_img_t **a = l ? dopo : prima;
+        const hevcd_img_t **b = l ? prima : dopo;
+        const int na = l ? nd : np, nb = l ? np : nd;
+        if (!na && !nb) continue;
+        while (d->n_rif[l] < quante) {
+            for (int i = 0; i < na && d->n_rif[l] < quante; i++)
+                d->rif[l][d->n_rif[l]++] = a[i];
+            for (int i = 0; i < nb && d->n_rif[l] < quante; i++)
+                d->rif[l][d->n_rif[l]++] = b[i];
+        }
+    }
+
+    /* What the indices mean, kept with the picture: a later one that takes
+     * this as its collocated picture asks what it pointed at, and an index
+     * means nothing outside the slice that wrote it. */
+    for (int l = 0; l < 2; l++) {
+        d->corrente->n_lista[l] = d->n_rif[l];
+        for (int i = 0; i < d->n_rif[l]; i++)
+            d->corrente->poc_lista[l][i] = d->rif[l][i]->poc;
+    }
+
+    d->col = NULL;
+    if (sl->temporal_mvp_enabled) {
+        const int l = sl->collocated_from_l0 ? 0 : 1;
+        if (sl->collocated_ref_idx < d->n_rif[l])
+            d->col = d->rif[l][sl->collocated_ref_idx];
+    }
+}
+
+/* Pictures wait here until the stream ends, because the order they come
+ * out in is not the order they were decoded in. */
+typedef struct {
+    long ordine;
+    uint8_t *dati;
+    size_t n;
+} fotogramma_t;
+
+static fotogramma_t *ordine_uscita;
+static int n_uscita, cap_uscita;
+
+static int confronta_ordine(const void *a, const void *b)
+{
+    const long x = ((const fotogramma_t *)a)->ordine;
+    const long y = ((const fotogramma_t *)b)->ordine;
+    return x < y ? -1 : (x > y ? 1 : 0);
 }
 
 /* Cropped on the way out: the coded picture is a whole number of smallest
  * coding blocks and the visible one is not. */
-static void scrivi_immagine(FILE *f, hevcd_t *d, const hevc_sps_t *sps)
+static void scrivi_immagine(FILE *f, hevcd_t *d, const hevc_sps_t *sps,
+                            long ordine)
 {
     /* ⚠️ The loop filters run here and not at the end of each slice: 8.7.2
      * is defined over the whole picture, and an edge between two coding
      * tree units cannot be filtered until both of them exist. */
     if (d->slice) { hevcd_deblocca(d); hevcd_sao(d); }
-    if (!f) return;
+    if (!f || !d->piano[0]) return;
+
     const int x0 = sps->crop_left, y0 = sps->crop_top;
     const int w = sps->width - sps->crop_left - sps->crop_right;
     const int h = sps->height - sps->crop_top - sps->crop_bottom;
+    const size_t n = (size_t)w * h + 2 * (size_t)(w / 2) * (h / 2);
 
-    for (int y = 0; y < h; y++)
-        fwrite(d->piano[0] + (size_t)(y0 + y) * d->passo[0] + x0, 1,
-               (size_t)w, f);
+    if (n_uscita == cap_uscita) {
+        const int nuovo = cap_uscita ? cap_uscita * 2 : 32;
+        fotogramma_t *p = realloc(ordine_uscita, (size_t)nuovo * sizeof *p);
+        if (!p) return;
+        ordine_uscita = p;
+        cap_uscita = nuovo;
+    }
+    uint8_t *dati = malloc(n);
+    if (!dati) return;
+
+    size_t o = 0;
+    for (int y = 0; y < h; y++) {
+        memcpy(dati + o, d->piano[0] + (size_t)(y0 + y) * d->passo[0] + x0,
+               (size_t)w);
+        o += (size_t)w;
+    }
     for (int p = 1; p < 3; p++)
-        for (int y = 0; y < h / 2; y++)
-            fwrite(d->piano[p] + (size_t)(y0 / 2 + y) * d->passo[p] + x0 / 2,
-                   1, (size_t)(w / 2), f);
+        for (int y = 0; y < h / 2; y++) {
+            memcpy(dati + o,
+                   d->piano[p] + (size_t)(y0 / 2 + y) * d->passo[p] + x0 / 2,
+                   (size_t)(w / 2));
+            o += (size_t)(w / 2);
+        }
+
+    ordine_uscita[n_uscita].ordine = ordine;
+    ordine_uscita[n_uscita].dati = dati;
+    ordine_uscita[n_uscita].n = n;
+    n_uscita++;
 }
 
+/* Display order at last: sorted by picture order count, and by which
+ * instantaneous refresh they belong to, since the count restarts at every
+ * one of those. */
+static void svuota_uscita(FILE *f)
+{
+    if (ordine_uscita) qsort(ordine_uscita, (size_t)n_uscita,
+                             sizeof *ordine_uscita, confronta_ordine);
+    for (int i = 0; i < n_uscita; i++) {
+        if (f) fwrite(ordine_uscita[i].dati, 1, ordine_uscita[i].n, f);
+        free(ordine_uscita[i].dati);
+    }
+    free(ordine_uscita);
+    ordine_uscita = NULL;
+    n_uscita = cap_uscita = 0;
+}
 /* 7.4.7.1: the entry point offsets count the NAL unit's bytes, the
  * emulation prevention ones included. The decoder reads the payload with
  * those already removed, so each offset has to lose however many of them
@@ -240,6 +422,13 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
         d->sao = calloc((size_t)sps->ctb_count, sizeof *d->sao);
         d->n_sao = (size_t)sps->ctb_count;
     }
+    if (!d->cbf_map || d->n_cbf < serve_pu) {
+        free(d->cbf_map);
+        d->cbf_map = calloc(serve_pu, 1);
+        d->n_cbf = serve_pu;
+    }
+    if (!d->cbf_map) return 5;
+    memset(d->cbf_map, 0, serve_pu);
     if (!d->skip || d->n_skip < serve_cb) {
         free(d->skip);
         d->skip = calloc(serve_cb, 1);
@@ -260,7 +449,7 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
     memset(d->intra_mode, HEVCD_INTRA_DC, serve_pu);
 
     d->sps = sps;
-    if (apri_immagine(d, sps)) return 5;
+    if (!d->corrente) return 5;
     if (hevcd_prepara_zscan(d)) return 5;
     d->pps = pps;
     d->slice = sl;
@@ -411,6 +600,7 @@ int main(int argc, char **argv)
     if (uscita && !fo) { perror(uscita); return 2; }
     bool immagine_aperta = false;
     hevc_slice_t ultima_slice;
+    long base_ordine = 0, prossimo_ordine = 0, ordine_corrente = 0;
 
     for (long i = 0; i + 3 < len; ) {
         /* Find the start code, then the next one. */
@@ -547,15 +737,29 @@ int main(int argc, char **argv)
                 const hevc_sps_t *sp = &sps[pps[s.pps_id].sps_id];
                 sposta_entry_point(&s, buf + inizio, (size_t)(fine - inizio),
                                    s.data_bit_offset >> 3);
-                if (s.first_slice_in_pic && immagine_aperta) {
-                    scrivi_immagine(fo, dec, sp);
-                    immagine_aperta = false;
+                if (s.first_slice_in_pic) {
+                    if (immagine_aperta) {
+                        scrivi_immagine(fo, dec, sp, ordine_corrente);
+                        immagine_aperta = false;
+                    }
+                    if (s.nal_type == HEVC_NAL_IDR_W_RADL
+                        || s.nal_type == HEVC_NAL_IDR_N_LP)
+                        base_ordine = prossimo_ordine;
+                    sfoltisci(&s);
+                    if (apri_immagine(dec, sp, s.poc)) { slice_perse++; continue; }
+                    ordine_corrente = base_ordine + s.poc;
+                    if (ordine_corrente >= prossimo_ordine)
+                        prossimo_ordine = ordine_corrente + 1;
                 }
+                if (!dec->corrente) { slice_perse++; continue; }
+                dec->slice = &s;
+                costruisci_liste(dec, &s);
                 const int e = percorri_slice(dec, sp, &pps[s.pps_id], &s,
                                              rbsp, n);
                 if (e == 4) {
                     slice_saltate++;
-                    if (immagine_aperta) scrivi_immagine(fo, dec, sp);
+                    if (immagine_aperta)
+                        scrivi_immagine(fo, dec, sp, ordine_corrente);
                     immagine_aperta = false;
                     if (fo) { fclose(fo); fo = NULL; }
                 } else if (e) {
@@ -576,8 +780,9 @@ int main(int argc, char **argv)
     if (immagine_aperta) {
         const hevc_sps_t *sp = NULL;
         for (int k = 0; k < 16; k++) if (sps[k].valid) { sp = &sps[k]; break; }
-        if (sp) scrivi_immagine(fo, dec, sp);
+        if (sp) scrivi_immagine(fo, dec, sp, ordine_corrente);
     }
+    svuota_uscita(fo);
     if (fo) fclose(fo);
     if (!verifica_gruppo(poc_visti, n_visti)) gruppi_rotti++;
 
@@ -588,7 +793,9 @@ int main(int argc, char **argv)
     free(buf); free(rbsp); free(sps); free(pps); free(poc_visti);
     free(dec->ct_depth); free(dec->intra_mode); free(dec->min_tb_addr_zs);
     free(dec->qp_y_map); free(dec->bordi); free(dec->no_filtro);
-    hevcd_libera_filtri(dec); free(dec->skip);
+    hevcd_libera_filtri(dec); free(dec->skip); free(dec->cbf_map);
+    for (int k = 0; k < QUANTE_IMG; k++) libera_img(&buffer[k]);
+    dec->piano[0] = dec->piano[1] = dec->piano[2] = NULL;
     for (int k = 0; k < 3; k++) free(dec->piano[k]);
     free(dec);
     return (rifiutate || gruppi_rotti || slice_perse) ? 1 : 0;
