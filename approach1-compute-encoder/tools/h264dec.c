@@ -452,6 +452,23 @@ static void svuota(FILE *fo)
 /* ---------------------------------------------------------- the driver */
 
 
+#define SCARICA_SLICE()                                                   \
+    do {                                                                  \
+        if (n_pronte > 0) {                                               \
+            const uint64_t t0 = adesso();                                 \
+            const int r = h264_decoder_slices(dec, pronte, n_pronte);     \
+            tempo_decodifica += adesso() - t0;                            \
+            const int mb0 = r ? pronte[0].primo_mb_diag : 0;              \
+            n_pronte = 0;                                                 \
+            if (r) {                                                      \
+                fprintf(stderr, "slice rifiutata (%d) al macroblocco %d " \
+                                "del fotogramma %d\n", r, mb0, fotogrammi); \
+                saltati++;                                                \
+                return (r == -2 || r == -3) ? 3 : 4;                      \
+            }                                                             \
+        }                                                                 \
+    } while (0)
+
 int main(int argc, char **argv)
 {
     if (argc != 3) {
@@ -484,6 +501,9 @@ int main(int argc, char **argv)
     uint32_t superficie_corrente = 0;
     int corrente_riferimento = 0, corrente_poc = 0, corrente_frame_num = 0;
     int n_mmco_attesa = 0, mmco_op_attesa[32], mmco_val_attesa[32];
+    /* The slices of the picture being read, decoded together when it ends. */
+    h264d_slice_input_t *pronte = NULL;
+    int n_pronte = 0, cap_pronte = 0;
     int n_mmco_precedente = 0, mmco_op_precedente[32], mmco_val_precedente[32];
 
     long i = 0;
@@ -735,6 +755,9 @@ int main(int argc, char **argv)
         }
 
         if (first_mb == 0) {
+            /* The picture that was being read is complete: decode its
+             * slices before anything is said about the picture itself. */
+            SCARICA_SLICE();
             if (in_corso && corrente_riferimento) {
                 marca(rifs, &n_rif, sp->max_num_ref_frames, superficie_corrente,
                       corrente_poc, corrente_frame_num, sp->log2_max_frame_num,
@@ -936,17 +959,20 @@ int main(int argc, char **argv)
             fprintf(stderr, "\n");
         }
 
-        const uint64_t t0 = adesso();
-        const int r = h264_decoder_slice(dec, &sl, buf + inizio,
-                                        (size_t)(fine - inizio), bit_offset);
-        tempo_decodifica += adesso() - t0;
-        if (r) {
-            fprintf(stderr, "slice rifiutata (%d) al macroblocco %d del "
-                            "fotogramma %d\n", r, first_mb, fotogrammi);
-            saltati++;
-            if (r == -2 || r == -3) return 3;
-            return 4;
+        if (n_pronte == cap_pronte) {
+            const int nuova = cap_pronte ? cap_pronte * 2 : 16;
+            h264d_slice_input_t *p2 = realloc(pronte,
+                                              (size_t)nuova * sizeof(*p2));
+            if (!p2) return 1;
+            pronte = p2;
+            cap_pronte = nuova;
         }
+        pronte[n_pronte].slice = sl;
+        pronte[n_pronte].data = buf + inizio;
+        pronte[n_pronte].size = (size_t)(fine - inizio);
+        pronte[n_pronte].bit_offset = bit_offset;
+        pronte[n_pronte].primo_mb_diag = first_mb;
+        n_pronte++;
 
         /* ⚠️ Remembered, not applied: a picture joins the reference list
          * once, when it is finished. Doing it per slice pushed the older
@@ -963,6 +989,7 @@ int main(int argc, char **argv)
         }
     }
 
+    SCARICA_SLICE();
     if (in_corso && dec) {
         { const uint64_t te = adesso();
           h264_decoder_end_picture(dec, (gpu_image_t){0}, (gpu_memory_t){0});

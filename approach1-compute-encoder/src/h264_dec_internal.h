@@ -200,6 +200,15 @@ void h264d_pool_stop(h264_decoder_t *d);
  * pool. Same result as h264d_deblock_picture(), to the byte. */
 void h264d_deblock_wavefront(h264_decoder_t *d, const h264d_deblock_pic_t *dp);
 
+/* One slice on the cursor it is handed. The pool calls this on a copy of
+ * the decoder with buffers of its own. */
+int h264d_decodifica_slice(h264_decoder_t *d, const h264d_slice_input_t *in,
+                           int numero);
+
+/* Several slices at once, one per worker. Returns the first failure. */
+int h264d_slices_pool(h264_decoder_t *d, const h264d_slice_input_t *in,
+                      int n, int primo_numero);
+
 /* Motion vector prediction, 8.4.1.3. */
 void h264d_predict_mv(h264_decoder_t *d, int list, int blk, int w4, int h4,
                       int ref_idx, int16_t out[2]);

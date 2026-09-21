@@ -189,11 +189,30 @@ void h264_decoder_destroy(h264_decoder_t *decoder);
 int h264_decoder_begin_picture(h264_decoder_t *dec, const h264d_pic_t *pic,
                                uint32_t surface, int poc, int frame_num);
 
-/* Decode one slice. `data` is the slice NAL payload including its header;
- * `bit_offset` is where the slice data itself begins, which is what
+/* One slice, ready to decode. `data` is the slice NAL payload including
+ * its header and its emulation prevention bytes; `bit_offset` is where the
+ * slice data itself begins, counted in that buffer, which is what
  * VASliceParameterBufferH264::slice_data_bit_offset gives. */
+typedef struct {
+    h264d_slice_t slice;
+    const uint8_t *data;
+    size_t size;
+    int bit_offset;
+    /* Not used by the decoder: somewhere for a caller to keep the
+     * macroblock the slice starts at, for its own error messages. */
+    int primo_mb_diag;
+} h264d_slice_input_t;
+
+/* Decode one slice. */
 int h264_decoder_slice(h264_decoder_t *dec, const h264d_slice_t *slice,
                        const uint8_t *data, size_t size, int bit_offset);
+
+/* Decode a picture's slices. They are independent - no prediction crosses a
+ * slice boundary - so with more than one and a thread pool to run them on,
+ * they are decoded at the same time, entropy decoding included. Returns the
+ * first failure, or zero. */
+int h264_decoder_slices(h264_decoder_t *dec, const h264d_slice_input_t *in,
+                        int n);
 
 /* Finish the picture: deblock, then upload into the VA surface. */
 int h264_decoder_end_picture(h264_decoder_t *dec, gpu_image_t out,

@@ -249,18 +249,18 @@ static inline void scarica(h264_decoder_t *d, int numero)
     d->da_ricostruire = d->mb_idx;
 }
 
-int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
-                       const uint8_t *data, size_t size, int bit_offset)
+/* One slice, on whatever cursor it is handed. `numero` is the slice's
+ * number within the picture, assigned by the caller before any of them
+ * start so that the per-slice tables can be filled in serially. */
+int h264d_decodifica_slice(h264_decoder_t *d, const h264d_slice_input_t *in,
+                           int numero)
 {
-    if (d->cur < 0) return -1;
-    if (d->n_slices >= H264D_MAX_SLICES) return -1;
+    const h264d_slice_t *slice = &in->slice;
+    const uint8_t *data = in->data;
+    const size_t size = in->size;
+    const int bit_offset = in->bit_offset;
 
     d->slice = *slice;
-    const int numero = d->n_slices++;
-    d->slices[numero] = *slice;
-    d->deblock[numero].disable_idc = (int8_t)slice->disable_deblocking_filter_idc;
-    d->deblock[numero].alpha_offset = (int8_t)slice->alpha_c0_offset;
-    d->deblock[numero].beta_offset = (int8_t)slice->beta_offset;
     if (getenv("BC250_H264_TRACE"))
         fprintf(stderr, "slice %d: deblk idc %d alpha %d beta %d, qp %d, "
                         "cabac_idc %d, tipo %d\n", numero,
@@ -388,6 +388,45 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
                                     fine - d->da_ricostruire, numero);
     }
     return 0;
+}
+
+
+int h264_decoder_slices(h264_decoder_t *d, const h264d_slice_input_t *in, int n)
+{
+    if (d->cur < 0) return -1;
+    if (n <= 0) return 0;
+    if (d->n_slices + n > H264D_MAX_SLICES) return -1;
+
+    /* The numbers and the per-slice tables are filled in here, before
+     * anything starts: a worker writes only its own entries, and nothing
+     * has to be locked. */
+    const int primo = d->n_slices;
+    for (int i = 0; i < n; i++) {
+        const h264d_slice_t *s = &in[i].slice;
+        d->slices[primo + i] = *s;
+        d->deblock[primo + i].disable_idc =
+            (int8_t)s->disable_deblocking_filter_idc;
+        d->deblock[primo + i].alpha_offset = (int8_t)s->alpha_c0_offset;
+        d->deblock[primo + i].beta_offset = (int8_t)s->beta_offset;
+    }
+    d->n_slices += n;
+
+    if (n >= 2 && d->pool)
+        return h264d_slices_pool(d, in, n, primo);
+
+    int primo_errore = 0;
+    for (int i = 0; i < n; i++) {
+        const int r = h264d_decodifica_slice(d, &in[i], primo + i);
+        if (r && !primo_errore) primo_errore = r;
+    }
+    return primo_errore;
+}
+
+int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
+                       const uint8_t *data, size_t size, int bit_offset)
+{
+    const h264d_slice_input_t uno = { *slice, data, size, bit_offset, 0 };
+    return h264_decoder_slices(d, &uno, 1);
 }
 
 int h264_decoder_end_picture(h264_decoder_t *d, gpu_image_t out,

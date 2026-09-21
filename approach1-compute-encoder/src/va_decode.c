@@ -295,6 +295,11 @@ VAStatus bc250_dec_decode(bc250_context *c, gpu_image_t out, gpu_memory_t mem)
                                    poc_di(&pp->CurrPic), pp->frame_num) != 0)
         return VA_STATUS_ERROR_OPERATION_FAILED;
 
+    h264d_slice_input_t *pronte =
+        calloc((size_t)c->dec_state.n_slices, sizeof(*pronte));
+    if (!pronte) return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    int n_pronte = 0;
+
     for (int i = 0; i < c->dec_state.n_slices; i++) {
         const VASliceParameterBufferH264 *sp = &c->dec_state.slices[i].p;
         if (c->dec_state.slices[i].off == (size_t)-1)
@@ -319,9 +324,20 @@ VAStatus bc250_dec_decode(bc250_context *c, gpu_image_t out, gpu_memory_t mem)
 
         pesi_di(sp, &sl);
 
-        h264_decoder_slice(dec, &sl, c->dec_state.data + c->dec_state.slices[i].off,
-                           c->dec_state.slices[i].len, sp->slice_data_bit_offset);
+        if (n_pronte < c->dec_state.n_slices) {
+            pronte[n_pronte].slice = sl;
+            pronte[n_pronte].data = c->dec_state.data + c->dec_state.slices[i].off;
+            pronte[n_pronte].size = c->dec_state.slices[i].len;
+            pronte[n_pronte].bit_offset = sp->slice_data_bit_offset;
+            n_pronte++;
+        }
     }
+
+    /* All of them at once: they are independent, so the decoder can read
+     * several at the same time. */
+    if (n_pronte > 0)
+        h264_decoder_slices(dec, pronte, n_pronte);
+    free(pronte);
 
     /* âš ï¸ Always finished, even when every slice was refused. A picture that
      * is never ended leaves the frame store holding a slot that no later
