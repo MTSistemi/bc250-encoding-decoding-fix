@@ -23,9 +23,24 @@ typedef struct {
     int     valid;
 } h264d_dequant_t;
 
+/* All six at once, indexed by qp % 6.
+ *
+ * âš ï¸ The factors depend on the quantisation parameter only through qp % 6.
+ * The rest of it is a shift, and the transforms apply that themselves from
+ * the qp they are given. So this is rebuilt when the scaling lists change
+ * and at no other time. */
+typedef struct {
+    h264d_dequant_t per_resto[6];
+    int valid;
+} h264d_dequant_set_t;
+
 void h264d_dequant_build(h264d_dequant_t *dq, int qp,
                          const uint8_t scaling4[6][16],
                          const uint8_t scaling8[6][64]);
+
+void h264d_dequant_build_all(h264d_dequant_set_t *set,
+                             const uint8_t scaling4[6][16],
+                             const uint8_t scaling8[6][64]);
 
 /* 8.5.12.1 scaling, then 8.5.12.2 transformation, then the add and the clip.
  * `block` holds the coefficients in raster order and is destroyed. */

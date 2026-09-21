@@ -297,20 +297,18 @@ void h264d_deblock_picture(uint8_t *y, int sy,
                 const int qpc_p  = qp_croma(qp_p, cqp_off);
                 const int qpc2_p = qp_croma(qp_p, cqp_off2);
 
+                /* Chroma has an edge only where luma has one every eight
+                 * samples, so only edges 0 and 2 - but the strength is the
+                 * same answer, derived once here for both. */
+                const bool con_croma = (e == 0 || e == 2);
                 for (int r = 0; r < 4; r++) {
                     const int bq = blocco(e, r);
                     const int bp = e ? blocco(e - 1, r) : blocco(3, r);
                     const int bs = forza(vicino, bp, m, bq, e == 0);
+                    if (!bs) continue;              /* nothing is filtered */
                     bordo_luma(py + (size_t)r * 4 * sy + e * 4, 1, sy, bs,
                                qp_p, m->qpy, oa, ob);
-                }
-                /* Chroma has an edge only where luma has one every eight
-                 * samples, so only edges 0 and 2. */
-                if (e == 0 || e == 2) {
-                    for (int r = 0; r < 4; r++) {
-                        const int bq = blocco(e, r);
-                        const int bp = e ? blocco(e - 1, r) : blocco(3, r);
-                        const int bs = forza(vicino, bp, m, bq, e == 0);
+                    if (con_croma) {
                         bordo_croma(pcb + (size_t)r * 2 * sc + e * 2, 1, sc, bs,
                                     qpc_p, qpc, oa, ob);
                         bordo_croma(pcr + (size_t)r * 2 * sc + e * 2, 1, sc, bs,
@@ -329,18 +327,15 @@ void h264d_deblock_picture(uint8_t *y, int sy,
                 const int qpc_p  = qp_croma(qp_p, cqp_off);
                 const int qpc2_p = qp_croma(qp_p, cqp_off2);
 
+                const bool con_croma = (e == 0 || e == 2);
                 for (int c = 0; c < 4; c++) {
                     const int bq = blocco(c, e);
                     const int bp = e ? blocco(c, e - 1) : blocco(c, 3);
                     const int bs = forza(vicino, bp, m, bq, e == 0);
+                    if (!bs) continue;
                     bordo_luma(py + (size_t)e * 4 * sy + c * 4, sy, 1, bs,
                                qp_p, m->qpy, oa, ob);
-                }
-                if (e == 0 || e == 2) {
-                    for (int c = 0; c < 4; c++) {
-                        const int bq = blocco(c, e);
-                        const int bp = e ? blocco(c, e - 1) : blocco(c, 3);
-                        const int bs = forza(vicino, bp, m, bq, e == 0);
+                    if (con_croma) {
                         bordo_croma(pcb + (size_t)e * 2 * sc + c * 2, sc, 1, bs,
                                     qpc_p, qpc, oa, ob);
                         bordo_croma(pcr + (size_t)e * 2 * sc + c * 2, sc, 1, bs,

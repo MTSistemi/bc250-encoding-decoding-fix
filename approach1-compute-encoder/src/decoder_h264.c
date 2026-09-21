@@ -175,8 +175,9 @@ int h264_decoder_begin_picture(h264_decoder_t *d, const h264d_pic_t *pic,
     }
     memset(d->slice_of_mb, 0xff, (size_t)d->mb_count);
     d->n_slices = 0;
-    d->dequant.valid = 0;
-    d->dequant_c[0].valid = d->dequant_c[1].valid = 0;
+    /* Rebuilt only when the scaling lists could have changed, which is
+     * here: a new picture may carry a new picture parameter set. */
+    h264d_dequant_build_all(&d->dequant, d->pic.scaling4, d->pic.scaling8);
     return 0;
 }
 

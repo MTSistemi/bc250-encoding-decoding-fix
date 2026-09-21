@@ -82,8 +82,7 @@ struct h264_decoder {
     /* Rebuilt whenever QP changes, which is rarely. Chroma gets its own two
      * because its QP comes from a different table and each plane has its own
      * offset. */
-    h264d_dequant_t dequant;
-    h264d_dequant_t dequant_c[2];
+    h264d_dequant_set_t dequant;
 
     int qpy;                      /* running QP through the slice */
     int last_qp_delta_nonzero;    /* the mb_qp_delta context needs it */

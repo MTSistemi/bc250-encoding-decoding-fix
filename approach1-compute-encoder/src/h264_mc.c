@@ -138,6 +138,19 @@ static void mezzi_campioni(const uint8_t *src, int ss, int w, int h,
     }
 }
 
+/* Which of b, v and j each of the sixteen positions actually reads, as
+ * bits 0, 1 and 2. The table is the switch below, read backwards. */
+static const uint8_t serve_mezzi[16] = {
+    0,  /* G */  1,  /* a */  1,  /* b */  1,  /* c */
+    2,  /* d */  3,  /* e */  5,  /* f */  3,  /* g */
+    2,  /* h */  6,  /* i */  4,  /* j */  6,  /* k */
+    2,  /* n */  3,  /* p */  5,  /* q */  3,  /* r */
+};
+
+/* The unrounded horizontal intermediates span the rows the vertical filter
+ * of j reaches: two above the block and four below. */
+#define MAXHT (MAXH + 6)
+
 void h264d_mc_luma(uint8_t *dst, int ds, const uint8_t *src, int ss,
                    int w, int h, int xfrac, int yfrac)
 {
@@ -148,26 +161,31 @@ void h264d_mc_luma(uint8_t *dst, int ds, const uint8_t *src, int ss,
     }
 
     uint8_t b[MAXH][MAXW], v[MAXH][MAXW], j[MAXH][MAXW];
-    const int serve_j = (xfrac != 0 && yfrac != 0);
+    const int quali = serve_mezzi[yfrac * 4 + xfrac];
 
-    mezzi_campioni(src, ss, w, h, b, v, xfrac != 0, yfrac != 0);
-
-    if (serve_j) {
-        /* Filtered from the unrounded horizontal intermediates, then shifted
-         * once by ten - never from the rounded `b` values, which would round
-         * twice and come out one low on a large share of samples. */
-        for (int y = 0; y <= h; y++) {
-            for (int x = 0; x <= w; x++) {
-                const uint8_t *r = src + (size_t)y * ss + x;
-                int32_t c[6];
-                for (int k = -2; k <= 3; k++) {
-                    const uint8_t *rr = r + (ptrdiff_t)k * ss;
-                    c[k + 2] = TAP(rr[-2], rr[-1], rr[0], rr[1], rr[2], rr[3]);
-                }
-                j[y][x] = clip_uint8((TAP(c[0], c[1], c[2], c[3], c[4], c[5])
-                                      + 512) >> 10);
-            }
+    if (quali & 4) {
+        /* One pass over the source for the horizontal intermediates, then
+         * one down the strip for j. b is the same strip rounded. */
+        int32_t ht[MAXHT][MAXW];
+        for (int y = -2; y <= h + 3; y++) {
+            const uint8_t *r = src + (ptrdiff_t)y * ss;
+            int32_t *o = ht[y + 2];
+            for (int x = 0; x <= w; x++)
+                o[x] = TAP(r[x - 2], r[x - 1], r[x], r[x + 1], r[x + 2], r[x + 3]);
         }
+        for (int y = 0; y <= h; y++) {
+            for (int x = 0; x <= w; x++)
+                j[y][x] = clip_uint8((TAP(ht[y][x], ht[y + 1][x], ht[y + 2][x],
+                                          ht[y + 3][x], ht[y + 4][x], ht[y + 5][x])
+                                      + 512) >> 10);
+        }
+        if (quali & 1)
+            for (int y = 0; y <= h; y++)
+                for (int x = 0; x <= w; x++)
+                    b[y][x] = clip_uint8((ht[y + 2][x] + 16) >> 5);
+        mezzi_campioni(src, ss, w, h, b, v, 0, (quali & 2) != 0);
+    } else {
+        mezzi_campioni(src, ss, w, h, b, v, (quali & 1) != 0, (quali & 2) != 0);
     }
 
     for (int y = 0; y < h; y++) {
@@ -203,6 +221,39 @@ void h264d_mc_luma(uint8_t *dst, int ds, const uint8_t *src, int ss,
 void h264d_mc_chroma(uint8_t *dst, int ds, const uint8_t *src, int ss,
                      int w, int h, int xfrac, int yfrac)
 {
+    /* âš ï¸ The three cases below are the general one with the zero weights
+     * dropped, not approximations of it: (8-f)*8 and f*8 divided through by
+     * eight give the same result with the same rounding, because the
+     * rounding constant divides through too. */
+    if (!xfrac && !yfrac) {
+        for (int y = 0; y < h; y++)
+            memcpy(dst + (size_t)y * ds, src + (size_t)y * ss, (size_t)w);
+        return;
+    }
+
+    if (!yfrac) {
+        const int a = 8 - xfrac;
+        for (int y = 0; y < h; y++) {
+            const uint8_t *r = src + (size_t)y * ss;
+            uint8_t *o = dst + (size_t)y * ds;
+            for (int x = 0; x < w; x++)
+                o[x] = (uint8_t)((a * r[x] + xfrac * r[x + 1] + 4) >> 3);
+        }
+        return;
+    }
+
+    if (!xfrac) {
+        const int a = 8 - yfrac;
+        for (int y = 0; y < h; y++) {
+            const uint8_t *r0 = src + (size_t)y * ss;
+            const uint8_t *r1 = r0 + ss;
+            uint8_t *o = dst + (size_t)y * ds;
+            for (int x = 0; x < w; x++)
+                o[x] = (uint8_t)((a * r0[x] + yfrac * r1[x] + 4) >> 3);
+        }
+        return;
+    }
+
     const int a = (8 - xfrac) * (8 - yfrac);
     const int b = xfrac * (8 - yfrac);
     const int c = (8 - xfrac) * yfrac;

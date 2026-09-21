@@ -387,12 +387,13 @@ static void aggiungi_luma(h264_decoder_t *d, h264d_mb_t *m, uint8_t *y, int sy)
 {
     const int lista4 = m->intra ? 0 : 3;     /* scaling list, Table 7-2 */
     const int lista8 = m->intra ? 0 : 1;
+    const h264d_dequant_t *dq = &d->dequant.per_resto[m->qpy % 6];
 
     if (m->transform8x8) {
         for (int b8 = 0; b8 < 4; b8++) {
             if (!((m->cbp >> b8) & 1)) continue;
             uint8_t *dst = y + (size_t)((b8 >> 1) * 8) * sy + (b8 & 1) * 8;
-            h264d_idct8_add(dst, sy, d->coeff8[b8], d->dequant.d8[lista8], m->qpy);
+            h264d_idct8_add(dst, sy, d->coeff8[b8], dq->d8[lista8], m->qpy);
         }
         return;
     }
@@ -408,7 +409,7 @@ static void aggiungi_luma(h264_decoder_t *d, h264d_mb_t *m, uint8_t *y, int sy)
          * separately and is not in that count, so it is tested on its own. */
         if (m->nnz[0][b] == 0 && (!i16 || d->coeff[0][b][0] == 0))
             continue;
-        h264d_idct4_add(dst, sy, d->coeff[0][b], d->dequant.d4[lista4],
+        h264d_idct4_add(dst, sy, d->coeff[0][b], dq->d4[lista4],
                         m->qpy, i16);
     }
 }
@@ -425,8 +426,7 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
     uint8_t *cr = f->cr + (size_t)(d->mb_y * 8) * f->stride_c + d->mb_x * 8;
     const int sy = f->stride_y, sc = f->stride_c;
 
-    if (d->dequant.qp != m->qpy || !d->dequant.valid)
-        h264d_dequant_build(&d->dequant, m->qpy, d->pic.scaling4, d->pic.scaling8);
+    /* nothing to build: the set covers every quantisation parameter */
 
     if (m->intra) {
         if (m->type == H264D_MB_I_16x16) {
@@ -462,7 +462,8 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
                 }
             }
 
-            h264d_luma_dc_transform(d->dc_luma, m->qpy, d->dequant.d4[0][0]);
+            h264d_luma_dc_transform(d->dc_luma, m->qpy,
+                                    d->dequant.per_resto[m->qpy % 6].d4[0][0]);
             for (int k = 0; k < 16; k++)
                 d->coeff[0][k][0] = d->dc_luma[k];
 
@@ -489,7 +490,8 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
                 const int modo = m->ipred[(b8 >> 1) * 8 + (b8 & 1) * 2];
                 h264d_pred8x8_luma(dst, sy, modo, top, left, ang, at, al, ac, atr);
                 if ((m->cbp >> b8) & 1)
-                    h264d_idct8_add(dst, sy, d->coeff8[b8], d->dequant.d8[0], m->qpy);
+                    h264d_idct8_add(dst, sy, d->coeff8[b8],
+                                d->dequant.per_resto[m->qpy % 6].d8[0], m->qpy);
             }
         } else {
             /* Intra_4x4 predicts and reconstructs one block at a time: the
@@ -526,7 +528,8 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
 
                 if ((m->cbp >> h264d_part8(b)) & 1)
                     h264d_idct4_add(dst, sy, d->coeff[0][b],
-                                    d->dequant.d4[0], m->qpy, false);
+                                    d->dequant.per_resto[m->qpy % 6].d4[0],
+                                    m->qpy, false);
 
                 if (dmb == d->mb_idx && dbl == b) {
                     fprintf(stderr, "  ricostruito:%s", NEWLINE);
@@ -636,9 +639,7 @@ void h264d_reconstruct_mb(h264_decoder_t *d)
         qpi = qpi < 0 ? 0 : (qpi > 51 ? 51 : qpi);
         const int qpc = h264d_chroma_qp[qpi];
 
-        h264d_dequant_t *dqc = &d->dequant_c[p];
-        if (!dqc->valid || dqc->qp != qpc)
-            h264d_dequant_build(dqc, qpc, d->pic.scaling4, d->pic.scaling8);
+        const h264d_dequant_t *dqc = &d->dequant.per_resto[qpc % 6];
 
         if ((m->cbp >> 4) != 0)
             h264d_chroma_dc_transform(d->dc_chroma[p], qpc, dqc->d4[lista_c][0]);

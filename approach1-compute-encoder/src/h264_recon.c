@@ -66,6 +66,15 @@ void h264d_dequant_build(h264d_dequant_t *dq, int qp,
     dq->valid = 1;
 }
 
+void h264d_dequant_build_all(h264d_dequant_set_t *set,
+                             const uint8_t scaling4[6][16],
+                             const uint8_t scaling8[6][64])
+{
+    for (int r = 0; r < 6; r++)
+        h264d_dequant_build(&set->per_resto[r], r, scaling4, scaling8);
+    set->valid = 1;
+}
+
 /* 8.5.12.1. Returns the scaled coefficient. */
 static inline int scala4(int c, int32_t fattore, int qp)
 {
