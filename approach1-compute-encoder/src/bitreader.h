@@ -166,4 +166,68 @@ static inline size_t br_extract_rbsp(uint8_t *dst, size_t dst_cap,
     return o;
 }
 
+/* As br_extract_rbsp, and it also moves a bit offset counted in `src` into
+ * the coordinates of `dst`.
+ *
+ * âš ï¸ An offset can only be moved if the bytes removed before it are
+ * counted while they are removed. Doing it afterwards means scanning the
+ * source twice and getting the straddling cases wrong; doing it here costs
+ * one comparison per byte. */
+static inline size_t br_extract_rbsp_map(uint8_t *dst, size_t dst_cap,
+                                         const uint8_t *src, size_t src_len,
+                                         size_t *bit_offset)
+{
+    const size_t limite = bit_offset ? (*bit_offset >> 3) : src_len;
+    size_t tolti = 0;
+    size_t o = 0;
+    size_t zeros = 0;
+    for (size_t i = 0; i < src_len && o < dst_cap; i++) {
+        uint8_t c = src[i];
+        if (zeros >= 2 && c == 0x03) {
+            if (i + 1 < src_len && src[i + 1] > 0x03) {
+                dst[o++] = c;
+                zeros = 0;
+                continue;
+            }
+            zeros = 0;
+            if (i < limite) tolti++;
+            continue;
+        }
+        dst[o++] = c;
+        zeros = (c == 0x00) ? zeros + 1 : 0;
+    }
+    if (bit_offset) *bit_offset -= tolti * 8;
+    return o;
+}
+
+/* The inverse of br_extract_rbsp_map's offset move: a bit position in the
+ * un-escaped buffer, back into the raw one it came from.
+ *
+ * Only a caller that un-escaped a NAL for its own use needs this, to say
+ * where it got to in terms the raw buffer understands. */
+static inline size_t br_raw_offset(const uint8_t *src, size_t src_len,
+                                   size_t rbsp_bit)
+{
+    const size_t bersaglio = rbsp_bit >> 3;
+    size_t o = 0;
+    size_t zeros = 0;
+    for (size_t i = 0; i < src_len; i++) {
+        if (o == bersaglio)
+            return (i << 3) | (rbsp_bit & 7);
+        uint8_t c = src[i];
+        if (zeros >= 2 && c == 0x03) {
+            if (i + 1 < src_len && src[i + 1] > 0x03) {
+                o++;
+                zeros = 0;
+                continue;
+            }
+            zeros = 0;
+            continue;
+        }
+        o++;
+        zeros = (c == 0x00) ? zeros + 1 : 0;
+    }
+    return rbsp_bit;
+}
+
 #endif /* BC250_BITREADER_H */

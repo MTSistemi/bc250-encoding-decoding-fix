@@ -232,15 +232,16 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
      * before the engine ever sees them. */
     d->cabac_mode = d->pic.entropy_coding_mode;
 
-    size_t n = 0;
-    if (d->cabac_mode) {
-        const int primo_byte = (bit_offset + 7) / 8;
-        if ((size_t)primo_byte >= size) return -1;
-        n = br_extract_rbsp(d->rbsp, d->rbsp_cap,
-                            data + primo_byte, size - primo_byte);
-    } else if ((size_t)bit_offset >= size * 8) {
-        return -1;
-    }
+    /* âš ï¸ The whole NAL is un-escaped, from its first byte, and the offset
+     * travels with it. Un-escaping only the tail would miss a sequence that
+     * straddles the boundary, and leaving the offset alone would put the
+     * first macroblock in the wrong place as soon as a slice header
+     * contains an escaped byte. */
+    if (bit_offset < 0 || (size_t)bit_offset >= size * 8) return -1;
+    size_t primo_bit = (size_t)bit_offset;
+    const size_t n = br_extract_rbsp_map(d->rbsp, d->rbsp_cap, data, size,
+                                         &primo_bit);
+    if (primo_bit >= n * 8) return -1;
 
     d->qpy = slice->qpy;
     d->last_qp_delta_nonzero = 0;
@@ -250,13 +251,17 @@ int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
     d->mb_y = d->mb_idx / d->mb_w;
 
     if (d->cabac_mode) {
-        h264d_cabac_init(&d->cabac, d->rbsp, n, slice->type == 2,
-                         slice->cabac_init_idc, slice->qpy);
+        /* cabac_alignment_one_bit: the arithmetic decoder loads bytes, so
+         * it starts on one. */
+        const size_t primo_byte = (primo_bit + 7) / 8;
+        if (primo_byte >= n) return -1;
+        h264d_cabac_init(&d->cabac, d->rbsp + primo_byte, n - primo_byte,
+                         slice->type == 2, slice->cabac_init_idc, slice->qpy);
     } else {
-        /* âš ï¸ No alignment and no re-extraction: the bit after the slice
-         * header, in the buffer the caller already un-escaped. */
-        br_init(&d->br, data, size);
-        br_skip(&d->br, bit_offset);
+        /* CAVLC has no alignment element: slice_data() begins at the very
+         * next bit. */
+        br_init(&d->br, d->rbsp, n);
+        br_skip(&d->br, (int)primo_bit);
     }
 
     const char *traccia = getenv("BC250_H264_TRACE");

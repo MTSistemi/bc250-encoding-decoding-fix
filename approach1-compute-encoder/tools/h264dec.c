@@ -638,7 +638,12 @@ int main(int argc, char **argv)
             }
         }
 
-        const int bit_offset = (int)br.bitpos;
+        /* âš ï¸ In the raw NAL's coordinates, because that is what the
+         * decoder is handed - the same thing VA-API's
+         * slice_data_bit_offset counts. */
+        const int bit_offset = (int)br_raw_offset(buf + inizio,
+                                                  (size_t)(fine - inizio),
+                                                  br.bitpos);
 
         /* ---- the picture ---- */
         if (!dec) {
@@ -847,7 +852,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "\n");
         }
 
-        const int r = h264_decoder_slice(dec, &sl, rbsp, n, bit_offset);
+        const int r = h264_decoder_slice(dec, &sl, buf + inizio,
+                                        (size_t)(fine - inizio), bit_offset);
         if (r) {
             fprintf(stderr, "slice rifiutata (%d) al macroblocco %d del "
                             "fotogramma %d\n", r, first_mb, fotogrammi);
