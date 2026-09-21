@@ -24,6 +24,7 @@
 
 #include "bitreader.h"
 #include "hevc_ps.h"
+#include "hevc_dec_internal.h"
 
 static const char *nome_nal(int t)
 {
@@ -89,12 +90,98 @@ static bool verifica_gruppo(const int *poc, int quanti)
     return true;
 }
 
+
+/* Why a slice could not be walked through. */
+static const char *motivo_slice(int e)
+{
+    switch (e) {
+    case 1: return "finita prima dell'ultimo CTU";
+    case 2: return "non e' finita dove doveva";
+    case 3: return "ha letto oltre la fine del NAL";
+    case 4: return "tipo di slice non ancora percorribile";
+    case 5: return "memoria";
+    default: return "?";
+    }
+}
+
+/* Read every bin of a slice's coding tree, and check it lands.
+ *
+ * ⚠️ Nothing is reconstructed. What this proves is that the syntax was
+ * read correctly, which CABAC makes checkable without any samples: a slice
+ * read correctly ends with end_of_slice_segment_flag set exactly after the
+ * last coding tree unit, and with the arithmetic decoder at the end of the
+ * NAL. One bin read against the wrong context almost never lands there. */
+static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
+                          const hevc_pps_t *pps, const hevc_slice_t *sl,
+                          const uint8_t *rbsp, size_t n)
+{
+    if (sl->type != 2) return 4;            /* only I slices, for now */
+
+    const size_t serve_cb = (size_t)sps->min_cb_width * sps->min_cb_height;
+    const size_t serve_pu = (size_t)(sps->width >> 2) * (sps->height >> 2);
+    if (!d->ct_depth || d->n_ct_depth < serve_cb) {
+        free(d->ct_depth);
+        d->ct_depth = calloc(serve_cb, 1);
+        d->n_ct_depth = serve_cb;
+    }
+    if (!d->intra_mode || d->n_intra_mode < serve_pu) {
+        free(d->intra_mode);
+        d->intra_mode = calloc(serve_pu, 1);
+        d->n_intra_mode = serve_pu;
+    }
+    if (!d->ct_depth || !d->intra_mode) return 5;
+    memset(d->ct_depth, 0, serve_cb);
+    memset(d->intra_mode, HEVCD_INTRA_DC, serve_pu);
+
+    d->sps = sps;
+    d->pps = pps;
+    d->slice = sl;
+    d->min_pu_width = sps->width >> 2;
+    d->min_pu_height = sps->height >> 2;
+    d->qp_y = sl->qp;
+    d->fine_slice = false;
+
+    const size_t primo = sl->data_bit_offset >> 3;
+    if (primo >= n) return 3;
+    hevcd_cabac_init(&d->cabac, rbsp + primo, n - primo,
+                     sl->type, sl->cabac_init_flag, sl->qp);
+
+    const int quanti = sps->ctb_count;
+    int fatti = 0;
+    for (int addr = sl->segment_address; addr < quanti; addr++) {
+        const int x = (addr % sps->ctb_width) << sps->log2_ctb;
+        const int y = (addr / sps->ctb_width) << sps->log2_ctb;
+        if (hevcd_leggi_ctu(d, x, y)) return 4;   /* refused inside */
+        fatti++;
+        /* HEVC_TRACE: how far into the NAL each coding tree unit got.
+         * When a slice does not land, this says where it stopped being
+         * right - a unit that consumed implausibly little is where to
+         * look, not the one that ran out of data. */
+        if (getenv("HEVC_TRACE")) {
+            const long letti = (long)((d->cabac.ptr - d->cabac.start) * 8
+                                      - d->cabac.cache_bits);
+            fprintf(stderr, "ctu %d (%d,%d): %ld bit su %ld" "\n",
+                    addr, x, y, letti, (long)(n - primo) * 8);
+        }
+        if (hevcd_overrun(&d->cabac)) return 3;
+
+        const int fine = hevcd_terminate(&d->cabac);
+        if (fine) {
+            /* ⚠️ It has to end after the LAST one, not merely end. */
+            return (addr == quanti - 1) ? 0 : 1;
+        }
+    }
+    (void)fatti;
+    return 2;                                 /* ran out of CTUs first */
+}
+
 int main(int argc, char **argv)
 {
-    bool zitto = false;
+    bool zitto = false, solo_intestazioni = false;
     const char *nome = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) zitto = true;
+        else if (strcmp(argv[i], "-h") == 0) solo_intestazioni = true;
         else nome = argv[i];
     }
     if (!nome) {
@@ -130,6 +217,10 @@ int main(int argc, char **argv)
     int *poc_visti = calloc(4096, sizeof(int));
     int n_visti = 0, gruppi_rotti = 0;
     if (!poc_visti) return 2;
+
+    hevcd_t *dec = calloc(1, sizeof(hevcd_t));
+    if (!dec) return 2;
+    int slice_lette = 0, slice_perse = 0;
 
     for (long i = 0; i + 3 < len; ) {
         /* Find the start code, then the next one. */
@@ -261,6 +352,14 @@ int main(int argc, char **argv)
             }
             slice_di_questa++;
             slice_totali++;
+
+            if (!solo_intestazioni) {
+                const int e = percorri_slice(dec, &sps[pps[s.pps_id].sps_id],
+                                             &pps[s.pps_id], &s, rbsp, n);
+                if (e) { slice_perse++; if (!zitto) printf("     ^ %s\n",
+                                                           motivo_slice(e)); }
+                else slice_lette++;
+            }
         }
     }
     if (immagini && !zitto)
@@ -268,8 +367,11 @@ int main(int argc, char **argv)
 
     if (!verifica_gruppo(poc_visti, n_visti)) gruppi_rotti++;
 
-    printf("%d immagini, %d slice, %d rifiutate, %d gruppi con poc rotti\n",
-           immagini, slice_totali, rifiutate, gruppi_rotti);
+    printf("%d immagini, %d slice, %d rifiutate, %d gruppi con poc rotti, "
+           "%d percorse, %d perse\n",
+           immagini, slice_totali, rifiutate, gruppi_rotti,
+           slice_lette, slice_perse);
     free(buf); free(rbsp); free(sps); free(pps); free(poc_visti);
-    return (rifiutate || gruppi_rotti) ? 1 : 0;
+    free(dec->ct_depth); free(dec->intra_mode); free(dec);
+    return (rifiutate || gruppi_rotti || slice_perse) ? 1 : 0;
 }
