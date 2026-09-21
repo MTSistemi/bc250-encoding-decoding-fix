@@ -141,6 +141,28 @@ struct bc250_context {
         unsigned int rc_target_percentage;
     } h264_state;
 
+    /* Everything a decode picture needs, accumulated during
+     * vaRenderPicture and consumed by vaEndPicture. */
+    struct {
+        VAPictureParameterBufferH264 pic;
+        VAIQMatrixBufferH264 iq;
+        int has_pic;
+        int has_iq;
+        /* âš ï¸ The slices are copied, not pointed at, because they are
+         * decoded from vaEndPicture with the driver lock dropped: by then
+         * nothing guarantees the application's buffers are still where they
+         * were. Copying a slice costs a memcpy; decoding one costs
+         * milliseconds. */
+        struct bc250_dec_slice {
+            VASliceParameterBufferH264 p;
+            size_t off;               /* into `data`; (size_t)-1 = no data yet */
+            size_t len;
+        } *slices;
+        int n_slices, cap_slices;
+        uint8_t *data;
+        size_t n_data, cap_data;
+    } dec_state;
+
     struct {
         VAEncSequenceParameterBufferHEVC seq_param;
         VAEncPictureParameterBufferHEVC pic_param;
@@ -192,6 +214,14 @@ typedef struct {
 
 #define DRIVER_LOCK(data)   pthread_mutex_lock(&(data)->lock)
 #define DRIVER_UNLOCK(data) pthread_mutex_unlock(&(data)->lock)
+
+/* H.264 decoding, VAEntrypointVLD - va_decode.c */
+void bc250_dec_reset(bc250_context *c);
+void bc250_dec_free(bc250_context *c);
+VAStatus bc250_dec_render(bc250_context *c, bc250_buffer *b);
+/* âš ï¸ Call with the driver lock DROPPED and the target surface pinned: this
+ * is where the picture is actually decoded, and it is all CPU. */
+VAStatus bc250_dec_decode(bc250_context *c, gpu_image_t out, gpu_memory_t mem);
 
 /* Core VA-API Driver Functions */
 VAStatus __vaDriverInit_1_0(VADriverContextP ctx);

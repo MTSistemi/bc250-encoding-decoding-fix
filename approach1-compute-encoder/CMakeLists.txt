@@ -197,6 +197,17 @@ set(SOURCES
     src/hevc_cabac.c
     src/hevc_intra.c
     src/decoder_h264.c
+    src/va_decode.c
+    src/h264_mb_cabac.c
+    src/h264_mb_cavlc.c
+    src/h264_cavlc_dec.c
+    src/h264_mb_motion.c
+    src/h264_recon_mb.c
+    src/h264_recon.c
+    src/h264_pred.c
+    src/h264_mc.c
+    src/h264_deblock.c
+    src/h264_dec_tables.c
     src/cpu_simd_me.c
     src/dynamic_governor.c
 )
