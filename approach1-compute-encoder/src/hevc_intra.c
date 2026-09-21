@@ -373,7 +373,7 @@ static inline int32_t clip_coeff(int32_t v) {
 #if defined(__x86_64__) || defined(_M_X64)
 
 __attribute__((target("sse4.1")))
-static inline __m128i riga_i32(const int16_t *p) {
+static inline __m128i row_i32(const int16_t *p) {
     return _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)p));
 }
 
@@ -381,29 +381,29 @@ __attribute__((target("sse4.1")))
 static void forward_transform_4x4_sse(const int16_t residual[16], const int16_t M[4][4],
                                       int32_t out[16]) {
     __m128i res[4];
-    for (int r = 0; r < 4; r++) res[r] = riga_i32(&residual[r * 4]);
+    for (int r = 0; r < 4; r++) res[r] = row_i32(&residual[r * 4]);
 
     /* pass 1: tmp[i][c] = (sum_r M[i][r] * residual[r*4+c] + 1) >> 1 */
     __m128i tmp[4];
-    const __m128i uno = _mm_set1_epi32(1);
+    const __m128i one_pred = _mm_set1_epi32(1);
     for (int i = 0; i < 4; i++) {
         __m128i acc = _mm_setzero_si128();
         for (int r = 0; r < 4; r++)
             acc = _mm_add_epi32(acc, _mm_mullo_epi32(_mm_set1_epi32(M[i][r]), res[r]));
-        tmp[i] = _mm_srai_epi32(_mm_add_epi32(acc, uno), 1);
+        tmp[i] = _mm_srai_epi32(_mm_add_epi32(acc, one_pred), 1);
     }
 
     /* pass 2: out[i*4+j] = (sum_c M[j][c] * tmp[i][c] + 128) >> 8 */
-    __m128i colonna[4];
+    __m128i column[4];
     for (int c = 0; c < 4; c++)
-        colonna[c] = _mm_setr_epi32(M[0][c], M[1][c], M[2][c], M[3][c]);
+        column[c] = _mm_setr_epi32(M[0][c], M[1][c], M[2][c], M[3][c]);
     const __m128i centoventotto = _mm_set1_epi32(128);
     for (int i = 0; i < 4; i++) {
         int32_t t[4];
         _mm_storeu_si128((__m128i *)t, tmp[i]);
         __m128i acc = _mm_setzero_si128();
         for (int c = 0; c < 4; c++)
-            acc = _mm_add_epi32(acc, _mm_mullo_epi32(_mm_set1_epi32(t[c]), colonna[c]));
+            acc = _mm_add_epi32(acc, _mm_mullo_epi32(_mm_set1_epi32(t[c]), column[c]));
         _mm_storeu_si128((__m128i *)&out[i * 4],
                          _mm_srai_epi32(_mm_add_epi32(acc, centoventotto), 8));
     }
@@ -413,29 +413,29 @@ __attribute__((target("sse4.1")))
 static void inverse_transform_4x4_sse(const int16_t coeff[16], const int16_t M[4][4],
                                       int16_t out[16]) {
     __m128i co[4];
-    for (int k = 0; k < 4; k++) co[k] = riga_i32(&coeff[k * 4]);
+    for (int k = 0; k < 4; k++) co[k] = row_i32(&coeff[k * 4]);
 
     /* pass 1: tmp[r][c] = clip((sum_k M[k][r] * coeff[k*4+c] + 64) >> 7) */
-    const __m128i sessantaquattro = _mm_set1_epi32(64);
+    const __m128i sixtyfour = _mm_set1_epi32(64);
     const __m128i alto = _mm_set1_epi32(32767), basso = _mm_set1_epi32(-32768);
     int32_t tmp[4][4];
     for (int r = 0; r < 4; r++) {
         __m128i acc = _mm_setzero_si128();
         for (int k = 0; k < 4; k++)
             acc = _mm_add_epi32(acc, _mm_mullo_epi32(_mm_set1_epi32(M[k][r]), co[k]));
-        acc = _mm_srai_epi32(_mm_add_epi32(acc, sessantaquattro), 7);
+        acc = _mm_srai_epi32(_mm_add_epi32(acc, sixtyfour), 7);
         acc = _mm_min_epi32(_mm_max_epi32(acc, basso), alto);
         _mm_storeu_si128((__m128i *)tmp[r], acc);
     }
 
     /* pass 2: out[r*4+c] = clip((sum_k M[k][c] * tmp[r][k] + 2048) >> 12) */
-    __m128i riga_m[4];
-    for (int k = 0; k < 4; k++) riga_m[k] = riga_i32(M[k]);
+    __m128i row_m[4];
+    for (int k = 0; k < 4; k++) row_m[k] = row_i32(M[k]);
     const __m128i duemila48 = _mm_set1_epi32(2048);
     for (int r = 0; r < 4; r++) {
         __m128i acc = _mm_setzero_si128();
         for (int k = 0; k < 4; k++)
-            acc = _mm_add_epi32(acc, _mm_mullo_epi32(_mm_set1_epi32(tmp[r][k]), riga_m[k]));
+            acc = _mm_add_epi32(acc, _mm_mullo_epi32(_mm_set1_epi32(tmp[r][k]), row_m[k]));
         acc = _mm_srai_epi32(_mm_add_epi32(acc, duemila48), 12);
         /* packs saturates to int16 exactly as clip_coeff does */
         _mm_storel_epi64((__m128i *)&out[r * 4], _mm_packs_epi32(acc, acc));
@@ -443,13 +443,13 @@ static void inverse_transform_4x4_sse(const int16_t coeff[16], const int16_t M[4
 }
 
 static int ha_sse41(void) {
-    static int risposta = -1;
-    if (risposta < 0) risposta = __builtin_cpu_supports("sse4.1") ? 1 : 0;
-    return risposta;
+    static int answer = -1;
+    if (answer < 0) answer = __builtin_cpu_supports("sse4.1") ? 1 : 0;
+    return answer;
 }
 #endif
 
-static void forward_transform_4x4_scalare(const int16_t residual[16], const int16_t M[4][4], int32_t out[16]) {
+static void forward_transform_4x4_scalar(const int16_t residual[16], const int16_t M[4][4], int32_t out[16]) {
     int32_t tmp[4][4];
     for (int c = 0; c < 4; c++) {
         for (int i = 0; i < 4; i++) {
@@ -474,7 +474,7 @@ static void forward_transform_4x4_scalare(const int16_t residual[16], const int1
  * This exact process is what a real HEVC decoder performs, and this
  * encoder uses the SAME code for its own reconstruction chaining, so the
  * two are trivially identical by construction. */
-static void inverse_transform_4x4_scalare(const int16_t coeff[16], const int16_t M[4][4], int16_t out[16]) {
+static void inverse_transform_4x4_scalar(const int16_t coeff[16], const int16_t M[4][4], int16_t out[16]) {
     int32_t tmp[4][4];
     for (int c = 0; c < 4; c++) {
         for (int r = 0; r < 4; r++) {
@@ -592,7 +592,7 @@ static inline void forward_transform_4x4(const int16_t residual[16], const int16
 #if defined(__x86_64__) || defined(_M_X64)
     if (ha_sse41()) { forward_transform_4x4_sse(residual, M, out); return; }
 #endif
-    forward_transform_4x4_scalare(residual, M, out);
+    forward_transform_4x4_scalar(residual, M, out);
 }
 
 static inline void inverse_transform_4x4(const int16_t coeff[16], const int16_t M[4][4],
@@ -600,7 +600,7 @@ static inline void inverse_transform_4x4(const int16_t coeff[16], const int16_t 
 #if defined(__x86_64__) || defined(_M_X64)
     if (ha_sse41()) { inverse_transform_4x4_sse(coeff, M, out); return; }
 #endif
-    inverse_transform_4x4_scalare(coeff, M, out);
+    inverse_transform_4x4_scalar(coeff, M, out);
 }
 
 void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,

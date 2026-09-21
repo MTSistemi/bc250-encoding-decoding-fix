@@ -28,7 +28,7 @@ static inline int clip3(int lo, int hi, int v)
  * edge, so p0 is q[-d], p1 is q[-2d] and so on. A vertical edge has d = 1, a
  * horizontal one d = stride.
  */
-static inline void luma_normale(uint8_t *q, int d, int alpha, int beta, int tc0)
+static inline void luma_plain(uint8_t *q, int d, int alpha, int beta, int tc0)
 {
     const int p0 = q[-d], p1 = q[-2 * d], p2 = q[-3 * d];
     const int q0 = q[0],  q1 = q[d],     q2 = q[2 * d];
@@ -63,9 +63,9 @@ static inline void luma_forte(uint8_t *q, int d, int alpha, int beta)
     if (abs(p0 - q0) >= alpha || abs(p1 - p0) >= beta || abs(q1 - q0) >= beta)
         return;
 
-    const int stretto = abs(p0 - q0) < ((alpha >> 2) + 2);
+    const int narrow = abs(p0 - q0) < ((alpha >> 2) + 2);
 
-    if (abs(p2 - p0) < beta && stretto) {
+    if (abs(p2 - p0) < beta && narrow) {
         q[-d]     = (uint8_t)((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
         q[-2 * d] = (uint8_t)((p2 + p1 + p0 + q0 + 2) >> 2);
         q[-3 * d] = (uint8_t)((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
@@ -73,7 +73,7 @@ static inline void luma_forte(uint8_t *q, int d, int alpha, int beta)
         q[-d] = (uint8_t)((2 * p1 + p0 + q1 + 2) >> 2);
     }
 
-    if (abs(q2 - q0) < beta && stretto) {
+    if (abs(q2 - q0) < beta && narrow) {
         q[0]     = (uint8_t)((q2 + 2 * q1 + 2 * q0 + 2 * p0 + p1 + 4) >> 3);
         q[d]     = (uint8_t)((q2 + q1 + q0 + p0 + 2) >> 2);
         q[2 * d] = (uint8_t)((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3);
@@ -84,7 +84,7 @@ static inline void luma_forte(uint8_t *q, int d, int alpha, int beta)
 
 /* Clause 8.7.2.3 and 8.7.2.4 for chroma: p1 and q1 are never written, and
  * the normal filter's tc is one higher because there is no ap/aq term. */
-static inline void chroma_normale(uint8_t *q, int d, int alpha, int beta, int tc0)
+static inline void chroma_plain(uint8_t *q, int d, int alpha, int beta, int tc0)
 {
     const int p0 = q[-d], p1 = q[-2 * d];
     const int q0 = q[0],  q1 = q[d];
@@ -113,7 +113,7 @@ static inline void chroma_forte(uint8_t *q, int d, int alpha, int beta)
 /* ------------------------------------------------------- strength, 8.7.2.1 */
 
 /* The 4x4 block index inside a macroblock, from its position in samples. */
-static inline int blocco(int x4, int y4) { return y4 * 4 + x4; }
+static inline int block(int x4, int y4) { return y4 * 4 + x4; }
 
 /* Whether the block containing 4x4 position `b` of macroblock `m` carries
  * any coefficient, clause 8.7.2.1.
@@ -125,24 +125,24 @@ static inline int blocco(int x4, int y4) { return y4 * 4 + x4; }
  * block and writes a flag into all four, while CAVLC reads four real counts
  * and needs to keep them - they are the context of the next block's
  * coeff_token. */
-static inline bool ha_coefficienti(const h264d_mb_t *m, int b)
+static inline bool has_coefficients(const h264d_mb_t *m, int b)
 {
     if (!m->transform8x8)
         return m->nnz[0][b] != 0;
     /* The 8x8 block's corner: clear the low bit of the row and of the
      * column, which are bits 2 and 0 of the raster index. */
-    const int angolo = b & 10;
-    return m->nnz[0][angolo] || m->nnz[0][angolo + 1]
-        || m->nnz[0][angolo + 4] || m->nnz[0][angolo + 5];
+    const int angle = b & 10;
+    return m->nnz[0][angle] || m->nnz[0][angle + 1]
+        || m->nnz[0][angle + 4] || m->nnz[0][angle + 5];
 }
 
-static int forza(const h264d_mb_t *p, int bp, const h264d_mb_t *q, int bq,
-                 bool bordo_macroblocco)
+static int strength(const h264d_mb_t *p, int bp, const h264d_mb_t *q, int bq,
+                 bool macroblock_edge)
 {
     if (p->intra || q->intra)
-        return bordo_macroblocco ? 4 : 3;
+        return macroblock_edge ? 4 : 3;
 
-    if (ha_coefficienti(p, bp) || ha_coefficienti(q, bq))
+    if (has_coefficients(p, bp) || has_coefficients(q, bq))
         return 2;
 
     /* Clause 8.7.2.1, the motion test. Two blocks predicted from different
@@ -189,11 +189,11 @@ static int forza(const h264d_mb_t *p, int bp, const h264d_mb_t *q, int bq,
     if (rp0 == rq0 && rp1 == rq1) {
         if (rp0 == rp1) {
             /* both lists on the same picture: either pairing will do */
-            bool dritto = abs(mp0[0] - mq0[0]) < 4 && abs(mp0[1] - mq0[1]) < 4
+            bool straight = abs(mp0[0] - mq0[0]) < 4 && abs(mp0[1] - mq0[1]) < 4
                        && abs(mp1[0] - mq1[0]) < 4 && abs(mp1[1] - mq1[1]) < 4;
-            bool incrociato = abs(mp0[0] - mq1[0]) < 4 && abs(mp0[1] - mq1[1]) < 4
+            bool crossed_one = abs(mp0[0] - mq1[0]) < 4 && abs(mp0[1] - mq1[1]) < 4
                            && abs(mp1[0] - mq0[0]) < 4 && abs(mp1[1] - mq0[1]) < 4;
-            return (dritto || incrociato) ? 0 : 1;
+            return (straight || crossed_one) ? 0 : 1;
         }
         return (abs(mp0[0] - mq0[0]) < 4 && abs(mp0[1] - mq0[1]) < 4
              && abs(mp1[0] - mq1[0]) < 4 && abs(mp1[1] - mq1[1]) < 4) ? 0 : 1;
@@ -209,13 +209,13 @@ static int forza(const h264d_mb_t *p, int bp, const h264d_mb_t *q, int bq,
 
 /* Clause 8.5.8. At eight bits QpBdOffsetC is zero, so qPI never goes
  * negative and the table covers the whole range. */
-static inline int qp_croma(int qpy, int offset)
+static inline int qp_chroma(int qpy, int offset)
 {
     return h264d_chroma_qp[clip3(0, 51, qpy + offset)];
 }
 
 /* One edge of four lines, luma. */
-static void bordo_luma(uint8_t *q, int d, int passo, int bs,
+static void luma_edge(uint8_t *q, int d, int stride, int bs,
                        int qp_p, int qp_q, int off_a, int off_b)
 {
     if (!bs) return;
@@ -228,16 +228,16 @@ static void bordo_luma(uint8_t *q, int d, int passo, int bs,
 
     if (bs == 4)
         for (int i = 0; i < 4; i++)
-            luma_forte(q + (size_t)i * passo, d, alpha, beta);
+            luma_forte(q + (size_t)i * stride, d, alpha, beta);
     else {
         const int tc0 = h264d_tc0[ia][bs - 1];
         for (int i = 0; i < 4; i++)
-            luma_normale(q + (size_t)i * passo, d, alpha, beta, tc0);
+            luma_plain(q + (size_t)i * stride, d, alpha, beta, tc0);
     }
 }
 
 /* One edge of two lines, chroma. */
-static void bordo_croma(uint8_t *q, int d, int passo, int bs,
+static void chroma_edge(uint8_t *q, int d, int stride, int bs,
                         int qp_p, int qp_q, int off_a, int off_b)
 {
     if (!bs) return;
@@ -250,11 +250,11 @@ static void bordo_croma(uint8_t *q, int d, int passo, int bs,
 
     if (bs == 4)
         for (int i = 0; i < 2; i++)
-            chroma_forte(q + (size_t)i * passo, d, alpha, beta);
+            chroma_forte(q + (size_t)i * stride, d, alpha, beta);
     else {
         const int tc0 = h264d_tc0[ia][bs - 1];
         for (int i = 0; i < 2; i++)
-            chroma_normale(q + (size_t)i * passo, d, alpha, beta, tc0);
+            chroma_plain(q + (size_t)i * stride, d, alpha, beta, tc0);
     }
 }
 
@@ -280,39 +280,39 @@ void h264d_deblock_mb(const h264d_deblock_pic_t *p, int mx, int my)
     uint8_t *pcb = cb + (size_t)my * 8 * sc + mx * 8;
     uint8_t *pcr = cr + (size_t)my * 8 * sc + mx * 8;
 
-    const bool salta_sinistra = mx == 0
+    const bool skip_left = mx == 0
         || (pr->disable_idc == 2 && slice_of_mb[idx - 1] != slice_of_mb[idx]);
-    const bool salta_sopra = my == 0
+    const bool skip_above = my == 0
         || (pr->disable_idc == 2 && slice_of_mb[idx - mb_w] != slice_of_mb[idx]);
 
-    const int qpc  = qp_croma(m->qpy, cqp_off);
-    const int qpc2 = qp_croma(m->qpy, cqp_off2);
+    const int qpc  = qp_chroma(m->qpy, cqp_off);
+    const int qpc2 = qp_chroma(m->qpy, cqp_off2);
 
     /* --- vertical edges, left to right --------------------------- */
     for (int e = 0; e < 4; e++) {
-        if (e == 0 && salta_sinistra) continue;
+        if (e == 0 && skip_left) continue;
         if (e && m->transform8x8 && (e & 1)) continue;
 
-        const h264d_mb_t *vicino = e ? m : &mbs[idx - 1];
-        const int qp_p = vicino->qpy;
-        const int qpc_p  = qp_croma(qp_p, cqp_off);
-        const int qpc2_p = qp_croma(qp_p, cqp_off2);
+        const h264d_mb_t *neighbour = e ? m : &mbs[idx - 1];
+        const int qp_p = neighbour->qpy;
+        const int qpc_p  = qp_chroma(qp_p, cqp_off);
+        const int qpc2_p = qp_chroma(qp_p, cqp_off2);
 
         /* Chroma has an edge only where luma has one every eight
          * samples, so only edges 0 and 2 - but the strength is the
          * same answer, derived once here for both. */
-        const bool con_croma = (e == 0 || e == 2);
+        const bool con_chroma = (e == 0 || e == 2);
         for (int r = 0; r < 4; r++) {
-            const int bq = blocco(e, r);
-            const int bp = e ? blocco(e - 1, r) : blocco(3, r);
-            const int bs = forza(vicino, bp, m, bq, e == 0);
+            const int bq = block(e, r);
+            const int bp = e ? block(e - 1, r) : block(3, r);
+            const int bs = strength(neighbour, bp, m, bq, e == 0);
             if (!bs) continue;              /* nothing is filtered */
-            bordo_luma(py + (size_t)r * 4 * sy + e * 4, 1, sy, bs,
+            luma_edge(py + (size_t)r * 4 * sy + e * 4, 1, sy, bs,
                        qp_p, m->qpy, oa, ob);
-            if (con_croma) {
-                bordo_croma(pcb + (size_t)r * 2 * sc + e * 2, 1, sc, bs,
+            if (con_chroma) {
+                chroma_edge(pcb + (size_t)r * 2 * sc + e * 2, 1, sc, bs,
                             qpc_p, qpc, oa, ob);
-                bordo_croma(pcr + (size_t)r * 2 * sc + e * 2, 1, sc, bs,
+                chroma_edge(pcr + (size_t)r * 2 * sc + e * 2, 1, sc, bs,
                             qpc2_p, qpc2, oa, ob);
             }
         }
@@ -320,26 +320,26 @@ void h264d_deblock_mb(const h264d_deblock_pic_t *p, int mx, int my)
 
     /* --- horizontal edges, top to bottom ------------------------- */
     for (int e = 0; e < 4; e++) {
-        if (e == 0 && salta_sopra) continue;
+        if (e == 0 && skip_above) continue;
         if (e && m->transform8x8 && (e & 1)) continue;
 
-        const h264d_mb_t *vicino = e ? m : &mbs[idx - mb_w];
-        const int qp_p = vicino->qpy;
-        const int qpc_p  = qp_croma(qp_p, cqp_off);
-        const int qpc2_p = qp_croma(qp_p, cqp_off2);
+        const h264d_mb_t *neighbour = e ? m : &mbs[idx - mb_w];
+        const int qp_p = neighbour->qpy;
+        const int qpc_p  = qp_chroma(qp_p, cqp_off);
+        const int qpc2_p = qp_chroma(qp_p, cqp_off2);
 
-        const bool con_croma = (e == 0 || e == 2);
+        const bool con_chroma = (e == 0 || e == 2);
         for (int c = 0; c < 4; c++) {
-            const int bq = blocco(c, e);
-            const int bp = e ? blocco(c, e - 1) : blocco(c, 3);
-            const int bs = forza(vicino, bp, m, bq, e == 0);
+            const int bq = block(c, e);
+            const int bp = e ? block(c, e - 1) : block(c, 3);
+            const int bs = strength(neighbour, bp, m, bq, e == 0);
             if (!bs) continue;
-            bordo_luma(py + (size_t)e * 4 * sy + c * 4, sy, 1, bs,
+            luma_edge(py + (size_t)e * 4 * sy + c * 4, sy, 1, bs,
                        qp_p, m->qpy, oa, ob);
-            if (con_croma) {
-                bordo_croma(pcb + (size_t)e * 2 * sc + c * 2, sc, 1, bs,
+            if (con_chroma) {
+                chroma_edge(pcb + (size_t)e * 2 * sc + c * 2, sc, 1, bs,
                             qpc_p, qpc, oa, ob);
-                bordo_croma(pcr + (size_t)e * 2 * sc + c * 2, sc, 1, bs,
+                chroma_edge(pcr + (size_t)e * 2 * sc + c * 2, sc, 1, bs,
                             qpc2_p, qpc2, oa, ob);
             }
         }

@@ -74,7 +74,7 @@ typedef struct {
      * context of 9.3.3.1.1.6 skips a direct neighbour. */
     uint8_t  direct;
     /* Debug only: the four sub_mb_types of a P_8x8 or B_8x8. */
-    int8_t   sub_tipo[4];
+    int8_t   sub_type[4];
     uint8_t  cbp;               /* bits 0..3 luma 8x8s, bits 4..5 chroma */
     int8_t   qpy;
     int8_t   chroma_pred_mode;
@@ -200,7 +200,7 @@ typedef struct {
     int bit_offset;
     /* Not used by the decoder: somewhere for a caller to keep the
      * macroblock the slice starts at, for its own error messages. */
-    int primo_mb_diag;
+    int first_mb_diag;
 } h264d_slice_input_t;
 
 /* Decode one slice. */

@@ -22,12 +22,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-static inline uint8_t ritaglia8(int v)
+static inline uint8_t clip8(int v)
 {
     return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
 }
 
-/* The reference array, laid out around the corner: indice 0 is the corner
+/* The reference array, laid out around the corner: index 0 is the corner
  * sample p[-1][-1], 1..2N is the row above, and -1..-2N the column to the
  * left. One array instead of two, so the angular modes that reach across
  * the corner can walk straight through it. */
@@ -47,59 +47,59 @@ static bool gia_decodificato(const hevcd_t *d, int x, int y, int x_cur, int y_cu
     const hevc_sps_t *sps = d->sps;
     if (x < 0 || y < 0 || x >= sps->width || y >= sps->height)
         return false;
-    const int passo = sps->width >> sps->log2_min_tb;
-    const int a = d->min_tb_addr_zs[(y >> sps->log2_min_tb) * passo
+    const int stride = sps->width >> sps->log2_min_tb;
+    const int a = d->min_tb_addr_zs[(y >> sps->log2_min_tb) * stride
                                     + (x >> sps->log2_min_tb)];
-    const int b = d->min_tb_addr_zs[(y_cur >> sps->log2_min_tb) * passo
+    const int b = d->min_tb_addr_zs[(y_cur >> sps->log2_min_tb) * stride
                                     + (x_cur >> sps->log2_min_tb)];
     return a < b;
 }
 
 /* 8.4.4.2.2: gather, then substitute. */
-static void riferimenti(const hevcd_t *d, int c_idx, int x0, int y0, int n,
+static void references(const hevcd_t *d, int c_idx, int x0, int y0, int n,
                         uint8_t *r)
 {
-    const uint8_t *piano = d->piano[c_idx];
-    const int passo = d->passo[c_idx];
-    const int scala = c_idx ? 1 : 0;          /* chroma is half resolution */
-    const int lx = x0 << scala, ly = y0 << scala;   /* in luma coordinates */
-    const int unita = 1 << scala;             /* luma samples per sample */
+    const uint8_t *plane = d->plane[c_idx];
+    const int stride = d->stride[c_idx];
+    const int scale_of = c_idx ? 1 : 0;          /* chroma is half resolution */
+    const int lx = x0 << scale_of, ly = y0 << scale_of;   /* in luma coordinates */
+    const int unit = 1 << scale_of;             /* luma samples per sample */
 
     bool c_e[4 * 64 + 1];
     memset(c_e, 0, sizeof(c_e));
-    bool qualcosa = false;
+    bool something = false;
 
     /* The column to the left, from the bottom up, then the corner, then
      * the row above from left to right: the order the substitution walks. */
     for (int i = 0; i < 2 * n; i++) {
         const int y = y0 + 2 * n - 1 - i;
-        const int ok = gia_decodificato(d, lx - unita, ly + ((2 * n - 1 - i) << scala),
+        const int ok = gia_decodificato(d, lx - unit, ly + ((2 * n - 1 - i) << scale_of),
                                         lx, ly);
-        if (ok && y < (d->sps->height >> scala)) {
-            RIF(r, -(2 * n - i)) = piano[y * passo + x0 - 1];
+        if (ok && y < (d->sps->height >> scale_of)) {
+            RIF(r, -(2 * n - i)) = plane[y * stride + x0 - 1];
             c_e[64 - (2 * n - i)] = true;
-            qualcosa = true;
+            something = true;
         }
     }
     {
-        const int ok = gia_decodificato(d, lx - unita, ly - unita, lx, ly);
+        const int ok = gia_decodificato(d, lx - unit, ly - unit, lx, ly);
         if (ok) {
-            RIF(r, 0) = piano[(y0 - 1) * passo + x0 - 1];
+            RIF(r, 0) = plane[(y0 - 1) * stride + x0 - 1];
             c_e[64] = true;
-            qualcosa = true;
+            something = true;
         }
     }
     for (int i = 0; i < 2 * n; i++) {
         const int x = x0 + i;
-        const int ok = gia_decodificato(d, lx + (i << scala), ly - unita, lx, ly);
-        if (ok && x < (d->sps->width >> scala)) {
-            RIF(r, i + 1) = piano[(y0 - 1) * passo + x];
+        const int ok = gia_decodificato(d, lx + (i << scale_of), ly - unit, lx, ly);
+        if (ok && x < (d->sps->width >> scale_of)) {
+            RIF(r, i + 1) = plane[(y0 - 1) * stride + x];
             c_e[64 + i + 1] = true;
-            qualcosa = true;
+            something = true;
         }
     }
 
-    if (!qualcosa) {
+    if (!something) {
         memset(r, 128, 4 * 64 + 1);           /* 1 << (bitDepth - 1) */
         return;
     }
@@ -118,9 +118,9 @@ static void riferimenti(const hevcd_t *d, int c_idx, int x0, int y0, int n,
 }
 
 /* 8.4.4.2.3: whether to smooth the references, and how much. */
-static void filtra(const hevcd_t *d, int modo, int n, int c_idx, uint8_t *r)
+static void filter_edge(const hevcd_t *d, int mode, int n, int c_idx, uint8_t *r)
 {
-    if (c_idx != 0 || n == 4 || modo == HEVCD_INTRA_DC)
+    if (c_idx != 0 || n == 4 || mode == HEVCD_INTRA_DC)
         return;
 
     /* Table 8-3, by log2 of the block side: 8 has a threshold of seven,
@@ -131,14 +131,14 @@ static void filtra(const hevcd_t *d, int modo, int n, int c_idx, uint8_t *r)
      * this was off by one place and read past the end for a 32, which is
      * a wrong smoothing decision on exactly the blocks where smoothing
      * matters most. */
-    static const int soglia[6] = { 0, 0, 0, 7, 1, 0 };
+    static const int threshold[6] = { 0, 0, 0, 7, 1, 0 };
     int lg = 0;
     while ((1 << lg) < n) lg++;
     /* For planar this comes out as ten, which is what the clause intends:
      * the mode is as far from horizontal and vertical as anything gets. */
-    const int dv = abs(modo - 26), dh = abs(modo - 10);
+    const int dv = abs(mode - 26), dh = abs(mode - 10);
     const int dist = dv < dh ? dv : dh;
-    if (dist <= soglia[lg])
+    if (dist <= threshold[lg])
         return;
 
     uint8_t f[4 * 64 + 1];
@@ -169,11 +169,11 @@ static void filtra(const hevcd_t *d, int modo, int n, int c_idx, uint8_t *r)
 }
 
 /* 8.4.4.2.5, planar: a bilinear ramp between the four edges. */
-static void planare(const uint8_t *r, int n, int lg, uint8_t *dst, int passo)
+static void planare(const uint8_t *r, int n, int lg, uint8_t *dst, int stride)
 {
     for (int y = 0; y < n; y++)
         for (int x = 0; x < n; x++)
-            dst[y * passo + x] = (uint8_t)
+            dst[y * stride + x] = (uint8_t)
                 (((n - 1 - x) * RIF(r, -(y + 1)) + (x + 1) * RIF(r, n + 1)
                   + (n - 1 - y) * RIF(r, x + 1) + (y + 1) * RIF(r, -(n + 1))
                   + n) >> (lg + 1));
@@ -181,17 +181,17 @@ static void planare(const uint8_t *r, int n, int lg, uint8_t *dst, int passo)
 
 /* 8.4.4.2.5, DC: the average, with the two edges smoothed into it on small
  * luma blocks so the join does not show. */
-static void continuo(const uint8_t *r, int n, int lg, int c_idx,
-                     uint8_t *dst, int passo)
+static void smoothed(const uint8_t *r, int n, int lg, int c_idx,
+                     uint8_t *dst, int stride)
 {
-    int somma = n;
+    int sum = n;
     for (int i = 0; i < n; i++)
-        somma += RIF(r, i + 1) + RIF(r, -(i + 1));
-    const int dc = somma >> (lg + 1);
+        sum += RIF(r, i + 1) + RIF(r, -(i + 1));
+    const int dc = sum >> (lg + 1);
 
     for (int y = 0; y < n; y++)
         for (int x = 0; x < n; x++)
-            dst[y * passo + x] = (uint8_t)dc;
+            dst[y * stride + x] = (uint8_t)dc;
 
     if (c_idx != 0 || n >= 32)
         return;
@@ -199,7 +199,7 @@ static void continuo(const uint8_t *r, int n, int lg, int c_idx,
     for (int x = 1; x < n; x++)
         dst[x] = (uint8_t)((RIF(r, x + 1) + 3 * dc + 2) >> 2);
     for (int y = 1; y < n; y++)
-        dst[y * passo] = (uint8_t)((RIF(r, -(y + 1)) + 3 * dc + 2) >> 2);
+        dst[y * stride] = (uint8_t)((RIF(r, -(y + 1)) + 3 * dc + 2) >> 2);
 }
 
 /* 8.4.4.2.6, the thirty-three angles.
@@ -208,36 +208,36 @@ static void continuo(const uint8_t *r, int n, int lg, int c_idx,
  * other edge projected onto its own reference line - which is what
  * invAngle is for. Without it the samples past the corner are whatever was
  * left there, and the error is confined to one triangle of the block. */
-static void angolare(const uint8_t *r, int modo, int n, int c_idx,
-                     uint8_t *dst, int passo)
+static void angular(const uint8_t *r, int mode, int n, int c_idx,
+                     uint8_t *dst, int stride)
 {
-    const int ang = hevcd_intra_angle[modo - 2];
-    const bool verticale = modo >= 18;
+    const int ang = hevcd_intra_angle[mode - 2];
+    const bool vertical = mode >= 18;
 
     /* One reference line, built in the direction the mode walks. */
-    int16_t rif[3 * 64 + 1];
-    int16_t *base = rif + 64;
-    const int segno = verticale ? 1 : -1;
+    int16_t ref_pic[3 * 64 + 1];
+    int16_t *base = ref_pic + 64;
+    const int sign = vertical ? 1 : -1;
 
-    (void)segno;
+    (void)sign;
     /* Index 0 is the corner either way; after that the row above for a
      * vertical mode and the column to the left for a horizontal one. */
     base[0] = RIF(r, 0);
     for (int x = 1; x <= n; x++)
-        base[x] = verticale ? RIF(r, x) : RIF(r, -x);
+        base[x] = vertical ? RIF(r, x) : RIF(r, -x);
 
     if (ang < 0) {
-        const int fino = (n * ang) >> 5;
-        if (fino < -1) {
-            const int inv = hevcd_inv_angle[modo - 11];
-            for (int x = -1; x >= fino; x--) {
+        const int until = (n * ang) >> 5;
+        if (until < -1) {
+            const int inv = hevcd_inv_angle[mode - 11];
+            for (int x = -1; x >= until; x--) {
                 const int k = ((x * inv + 128) >> 8);
-                base[x] = verticale ? RIF(r, -k) : RIF(r, k);
+                base[x] = vertical ? RIF(r, -k) : RIF(r, k);
             }
         }
     } else {
         for (int x = n + 1; x <= 2 * n; x++)
-            base[x] = verticale ? RIF(r, x) : RIF(r, -x);
+            base[x] = vertical ? RIF(r, x) : RIF(r, -x);
     }
 
     for (int y = 0; y < n; y++) {
@@ -250,40 +250,40 @@ static void angolare(const uint8_t *r, int modo, int n, int c_idx,
                      + fatt * base[x + idx + 2] + 16) >> 5;
             else
                 v = base[x + idx + 1];
-            if (verticale) dst[y * passo + x] = (uint8_t)v;
-            else           dst[x * passo + y] = (uint8_t)v;
+            if (vertical) dst[y * stride + x] = (uint8_t)v;
+            else           dst[x * stride + y] = (uint8_t)v;
         }
     }
 
     /* The exactly vertical and exactly horizontal modes smooth their first
      * line against the other edge, on small luma blocks. */
     if (c_idx == 0 && n < 32) {
-        if (modo == HEVCD_INTRA_ANGULAR_26) {
+        if (mode == HEVCD_INTRA_ANGULAR_26) {
             for (int y = 0; y < n; y++)
-                dst[y * passo] = ritaglia8(RIF(r, 1)
+                dst[y * stride] = clip8(RIF(r, 1)
                                            + ((RIF(r, -(y + 1)) - RIF(r, 0)) >> 1));
-        } else if (modo == HEVCD_INTRA_ANGULAR_10) {
+        } else if (mode == HEVCD_INTRA_ANGULAR_10) {
             for (int x = 0; x < n; x++)
-                dst[x] = ritaglia8(RIF(r, -1)
+                dst[x] = clip8(RIF(r, -1)
                                    + ((RIF(r, x + 1) - RIF(r, 0)) >> 1));
         }
     }
 }
 
-void hevcd_predici_intra(hevcd_t *d, int c_idx, int x0, int y0, int log2_size,
-                         int modo)
+void hevcd_predict_intra(hevcd_t *d, int c_idx, int x0, int y0, int log2_size,
+                         int mode)
 {
     const int n = 1 << log2_size;
     uint8_t r[4 * 64 + 1];
     memset(r, 128, sizeof(r));
 
-    riferimenti(d, c_idx, x0, y0, n, r);
-    filtra(d, modo, n, c_idx, r);
+    references(d, c_idx, x0, y0, n, r);
+    filter_edge(d, mode, n, c_idx, r);
 
-    uint8_t *dst = d->piano[c_idx] + (size_t)y0 * d->passo[c_idx] + x0;
-    const int passo = d->passo[c_idx];
+    uint8_t *dst = d->plane[c_idx] + (size_t)y0 * d->stride[c_idx] + x0;
+    const int stride = d->stride[c_idx];
 
-    if (modo == HEVCD_INTRA_PLANAR)      planare(r, n, log2_size, dst, passo);
-    else if (modo == HEVCD_INTRA_DC)     continuo(r, n, log2_size, c_idx, dst, passo);
-    else                                 angolare(r, modo, n, c_idx, dst, passo);
+    if (mode == HEVCD_INTRA_PLANAR)      planare(r, n, log2_size, dst, stride);
+    else if (mode == HEVCD_INTRA_DC)     smoothed(r, n, log2_size, c_idx, dst, stride);
+    else                                 angular(r, mode, n, c_idx, dst, stride);
 }

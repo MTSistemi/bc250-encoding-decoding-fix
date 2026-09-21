@@ -36,68 +36,68 @@
 #include <unistd.h>
 
 /* A worker and which of the per-worker buffers are its own. */
-struct operaio_arg { struct h264d_pool *p; int io; };
-typedef struct operaio_arg operaio_arg_t;
+struct worker_arg { struct h264d_pool *p; int io; };
+typedef struct worker_arg worker_arg_t;
 
 struct h264d_pool {
     pthread_t *thread;
-    struct operaio_arg *arg;
+    struct worker_arg *arg;
     int n;
 
     pthread_mutex_t m;
-    pthread_cond_t via, finito;
+    pthread_cond_t via, finished;
 
     /* The job being run, if any. */
-    int tipo;                   /* 0 reconstruct, 1 deblock, 2 slices */
+    int kind;                   /* 0 reconstruct, 1 deblock, 2 slices */
     h264_decoder_t *d;
     h264d_deblock_pic_t dbl;
-    int primo, quanti, numero;
-    int prima_riga, ultima_riga;
+    int first, count, number;
+    int first_row, last_row;
 
     /* Slice jobs. */
     const h264d_slice_input_t *in;
-    int n_in, primo_numero;
-    atomic_int slice_prossima;
-    atomic_int errore;
+    int n_in, first_number;
+    atomic_int next_slice;
+    atomic_int error;
 
     /* Per worker, for slice jobs only: somewhere to un-escape a NAL into
      * and a residual ring. Allocated the first time they are needed. */
     uint8_t **rbsp;
     size_t *rbsp_cap;
-    h264d_residuo_t **residui;
-    int n_residui;
+    h264d_residual_t **residuals;
+    int n_residuals;
 
-    unsigned generazione;       /* bumped once per job */
-    int attivi;                 /* workers still inside this job */
-    bool chiudi;
+    unsigned generation;       /* bumped once per job */
+    int active;                 /* workers still inside this job */
+    bool close_picture;
 
-    atomic_int riga_prossima;   /* next row to claim */
-    atomic_int *progresso;      /* per row: the first column not yet done */
-    int n_righe;
+    atomic_int next_row;   /* next row to claim */
+    atomic_int *progress_of;      /* per row: the first column not yet done */
+    int n_rows;
 };
 
 /* How far a row has to have got before the row below may touch column x. */
-static inline void attendi(const atomic_int *p, int fino_a)
+static inline void attendi(const atomic_int *p, int up_to)
 {
-    int giri = 0;
-    while (atomic_load_explicit(p, memory_order_acquire) < fino_a) {
+    int rounds = 0;
+    while (atomic_load_explicit(p, memory_order_acquire) < up_to) {
         /* A short spin, because the row above is usually only a macroblock
          * or two ahead and about to move. Then out of the way, because a
          * thread that spins through its slice stops the one it is waiting
          * for from being scheduled at all. */
-        if (++giri < 256) {
+        if (++rounds < 256) {
 #if defined(__x86_64__)
             __builtin_ia32_pause();
 #endif
         } else {
             sched_yield();
-            giri = 0;
+            rounds = 0;
         }
     }
 }
 
 /* A slice job: take slices until there are none left. */
-static void lavora_slice(struct h264d_pool *p, int io)
+static void work_slice(struct h264d_pool *p, int io)
 {
     h264_decoder_t c = *p->d;
     /* âš ï¸ No pool on the cursor: the workers are the slices, so this one
@@ -105,94 +105,94 @@ static void lavora_slice(struct h264d_pool *p, int io)
     c.pool = NULL;
     c.rbsp = p->rbsp[io];
     c.rbsp_cap = p->rbsp_cap[io];
-    c.residui = p->residui[io];
-    c.n_residui = p->n_residui;
-    c.righe_banda = 1;
+    c.residuals = p->residuals[io];
+    c.n_residuals = p->n_residuals;
+    c.band_rows = 1;
 
     for (;;) {
-        const int i = atomic_fetch_add(&p->slice_prossima, 1);
+        const int i = atomic_fetch_add(&p->next_slice, 1);
         if (i >= p->n_in) break;
-        const int r = h264d_decodifica_slice(&c, &p->in[i], p->primo_numero + i);
+        const int r = h264d_decode_slice(&c, &p->in[i], p->first_number + i);
         if (r) {
-            int atteso = 0;
-            atomic_compare_exchange_strong(&p->errore, &atteso, r);
+            int expected = 0;
+            atomic_compare_exchange_strong(&p->error, &expected, r);
         }
     }
 }
 
-static void lavora(struct h264d_pool *p)
+static void work(struct h264d_pool *p)
 {
-    const int mb_w = (p->tipo == 0) ? p->d->mb_w : p->dbl.mb_w;
-    const int ultimo = p->primo + p->quanti - 1;
+    const int mb_w = (p->kind == 0) ? p->d->mb_w : p->dbl.mb_w;
+    const int last = p->first + p->count - 1;
     h264_decoder_t c;
-    if (p->tipo == 0) {
+    if (p->kind == 0) {
         c = *p->d;
-        c.slice = p->d->slices[p->numero];
+        c.slice = p->d->slices[p->number];
     }
 
     for (;;) {
-        const int r = atomic_fetch_add(&p->riga_prossima, 1);
-        if (r > p->ultima_riga) break;
+        const int r = atomic_fetch_add(&p->next_row, 1);
+        if (r > p->last_row) break;
 
-        const int x0 = (r == p->prima_riga) ? p->primo % mb_w : 0;
-        const int x1 = (r == p->ultima_riga) ? ultimo % mb_w : mb_w - 1;
-        const bool aspetta = (r > p->prima_riga);
+        const int x0 = (r == p->first_row) ? p->first % mb_w : 0;
+        const int x1 = (r == p->last_row) ? last % mb_w : mb_w - 1;
+        const bool wait_for = (r > p->first_row);
 
         for (int x = x0; x <= x1; x++) {
-            if (aspetta)
-                attendi(&p->progresso[r - 1], x + 2);
+            if (wait_for)
+                attendi(&p->progress_of[r - 1], x + 2);
 
-            if (p->tipo == 0) {
+            if (p->kind == 0) {
                 c.mb_idx = r * mb_w + x;
                 c.mb_x = x;
                 c.mb_y = r;
-                c.res = &p->d->residui[c.mb_idx % p->d->n_residui];
+                c.res = &p->d->residuals[c.mb_idx % p->d->n_residuals];
                 h264d_reconstruct_mb(&c);
             } else {
                 h264d_deblock_mb(&p->dbl, x, r);
             }
 
-            atomic_store_explicit(&p->progresso[r], x + 1,
+            atomic_store_explicit(&p->progress_of[r], x + 1,
                                   memory_order_release);
         }
         /* The row is finished: let anything still waiting on its tail
          * through, including the columns it never had. */
-        atomic_store_explicit(&p->progresso[r], mb_w + 2,
+        atomic_store_explicit(&p->progress_of[r], mb_w + 2,
                               memory_order_release);
     }
 }
 
-static void *operaio(void *arg)
+static void *worker(void *arg)
 {
-    const operaio_arg_t *a = arg;
+    const worker_arg_t *a = arg;
     struct h264d_pool *p = a->p;
     const int io = a->io;
     unsigned mia = 0;
     for (;;) {
         pthread_mutex_lock(&p->m);
-        while (p->generazione == mia && !p->chiudi)
+        while (p->generation == mia && !p->close_picture)
             pthread_cond_wait(&p->via, &p->m);
-        if (p->chiudi) {
+        if (p->close_picture) {
             pthread_mutex_unlock(&p->m);
             return NULL;
         }
-        mia = p->generazione;
-        const int tipo = p->tipo;
+        mia = p->generation;
+        const int kind = p->kind;
         pthread_mutex_unlock(&p->m);
 
-        if (tipo == 2) lavora_slice(p, io);
-        else           lavora(p);
+        if (kind == 2) work_slice(p, io);
+        else           work(p);
 
         pthread_mutex_lock(&p->m);
-        if (--p->attivi == 0)
-            pthread_cond_signal(&p->finito);
+        if (--p->active == 0)
+            pthread_cond_signal(&p->finished);
         pthread_mutex_unlock(&p->m);
     }
 }
 
 /* How many threads to use. BC250_H264_THREADS overrides; 0 or 1 turns
  * threading off entirely and every picture is reconstructed in place. */
-static int quanti_thread(void)
+static int thread_count(void)
 {
     const char *e = getenv("BC250_H264_THREADS");
     if (e) {
@@ -211,32 +211,32 @@ static int quanti_thread(void)
 int h264d_pool_start(h264_decoder_t *d)
 {
     if (d->pool) return 0;
-    const int n = quanti_thread();
+    const int n = thread_count();
     if (n < 2) return 0;                 /* one thread: no pool at all */
 
     struct h264d_pool *p = calloc(1, sizeof(*p));
     if (!p) return -1;
-    p->n_righe = d->mb_h;
-    p->progresso = calloc((size_t)p->n_righe, sizeof(atomic_int));
+    p->n_rows = d->mb_h;
+    p->progress_of = calloc((size_t)p->n_rows, sizeof(atomic_int));
     p->thread = calloc((size_t)n, sizeof(pthread_t));
-    if (!p->progresso || !p->thread) {
-        free(p->progresso); free(p->thread); free(p);
+    if (!p->progress_of || !p->thread) {
+        free(p->progress_of); free(p->thread); free(p);
         return -1;
     }
     pthread_mutex_init(&p->m, NULL);
     pthread_cond_init(&p->via, NULL);
-    pthread_cond_init(&p->finito, NULL);
-    p->generazione = 0;
+    pthread_cond_init(&p->finished, NULL);
+    p->generation = 0;
 
-    p->arg = calloc((size_t)n, sizeof(operaio_arg_t));
+    p->arg = calloc((size_t)n, sizeof(worker_arg_t));
     if (!p->arg) {
-        free(p->progresso); free(p->thread); free(p);
+        free(p->progress_of); free(p->thread); free(p);
         return -1;
     }
     for (int i = 0; i < n; i++) {
         p->arg[i].p = p;
         p->arg[i].io = i;
-        if (pthread_create(&p->thread[i], NULL, operaio, &p->arg[i]) != 0) {
+        if (pthread_create(&p->thread[i], NULL, worker, &p->arg[i]) != 0) {
             p->n = i;
             break;
         }
@@ -245,14 +245,14 @@ int h264d_pool_start(h264_decoder_t *d)
     if (p->n < 2) {
         /* Not enough threads came up to be worth the synchronisation. */
         pthread_mutex_lock(&p->m);
-        p->chiudi = true;
+        p->close_picture = true;
         pthread_cond_broadcast(&p->via);
         pthread_mutex_unlock(&p->m);
         for (int i = 0; i < p->n; i++) pthread_join(p->thread[i], NULL);
         pthread_mutex_destroy(&p->m);
         pthread_cond_destroy(&p->via);
-        pthread_cond_destroy(&p->finito);
-        free(p->progresso); free(p->thread); free(p);
+        pthread_cond_destroy(&p->finished);
+        free(p->progress_of); free(p->thread); free(p);
         return 0;
     }
     d->pool = p;
@@ -264,80 +264,80 @@ void h264d_pool_stop(h264_decoder_t *d)
     struct h264d_pool *p = d->pool;
     if (!p) return;
     pthread_mutex_lock(&p->m);
-    p->chiudi = true;
+    p->close_picture = true;
     pthread_cond_broadcast(&p->via);
     pthread_mutex_unlock(&p->m);
     for (int i = 0; i < p->n; i++)
         pthread_join(p->thread[i], NULL);
     pthread_mutex_destroy(&p->m);
     pthread_cond_destroy(&p->via);
-    pthread_cond_destroy(&p->finito);
+    pthread_cond_destroy(&p->finished);
     for (int i = 0; i < p->n; i++) {
         if (p->rbsp) free(p->rbsp[i]);
-        if (p->residui) free(p->residui[i]);
+        if (p->residuals) free(p->residuals[i]);
     }
     free(p->rbsp);
     free(p->rbsp_cap);
-    free(p->residui);
+    free(p->residuals);
     free(p->arg);
-    free(p->progresso);
+    free(p->progress_of);
     free(p->thread);
     free(p);
     d->pool = NULL;
 }
 
 /* One macroblock at a time, in order, on this thread. */
-static void in_fila(h264_decoder_t *d, int primo, int quanti, int numero)
+static void enqueue(h264_decoder_t *d, int first, int count, int number)
 {
     h264_decoder_t c = *d;
-    c.slice = d->slices[numero];
-    for (int i = 0; i < quanti; i++) {
-        c.mb_idx = primo + i;
+    c.slice = d->slices[number];
+    for (int i = 0; i < count; i++) {
+        c.mb_idx = first + i;
         if (c.mb_idx >= d->mb_count) break;
         c.mb_x = c.mb_idx % d->mb_w;
         c.mb_y = c.mb_idx / d->mb_w;
-        c.res = &d->residui[c.mb_idx % d->n_residui];
+        c.res = &d->residuals[c.mb_idx % d->n_residuals];
         h264d_reconstruct_mb(&c);
     }
 }
 
-void h264d_reconstruct_range(h264_decoder_t *d, int primo, int quanti,
-                             int numero)
+void h264d_reconstruct_range(h264_decoder_t *d, int first, int count,
+                             int number)
 {
-    if (quanti <= 0) return;
-    if (primo + quanti > d->mb_count)
-        quanti = d->mb_count - primo;
+    if (count <= 0) return;
+    if (first + count > d->mb_count)
+        count = d->mb_count - first;
 
     struct h264d_pool *p = d->pool;
-    const int prima_riga = primo / d->mb_w;
-    const int ultima_riga = (primo + quanti - 1) / d->mb_w;
+    const int first_row = first / d->mb_w;
+    const int last_row = (first + count - 1) / d->mb_w;
 
     /* ⚠️ Below a few rows the threads cost more than they save: waking
      * them, the wavefront's two-macroblock lag and the join at the end all
      * have to be paid before the first sample is any faster. */
-    if (!p || ultima_riga - prima_riga < 3) {
-        in_fila(d, primo, quanti, numero);
+    if (!p || last_row - first_row < 3) {
+        enqueue(d, first, count, number);
         return;
     }
 
     pthread_mutex_lock(&p->m);
-    p->tipo = 0;
+    p->kind = 0;
     p->d = d;
-    p->primo = primo;
-    p->quanti = quanti;
-    p->numero = numero;
-    p->prima_riga = prima_riga;
-    p->ultima_riga = ultima_riga;
-    atomic_store(&p->riga_prossima, prima_riga);
-    for (int r = prima_riga; r <= ultima_riga; r++) {
-        const int x0 = (r == prima_riga) ? primo % d->mb_w : 0;
-        atomic_store(&p->progresso[r], x0);
+    p->first = first;
+    p->count = count;
+    p->number = number;
+    p->first_row = first_row;
+    p->last_row = last_row;
+    atomic_store(&p->next_row, first_row);
+    for (int r = first_row; r <= last_row; r++) {
+        const int x0 = (r == first_row) ? first % d->mb_w : 0;
+        atomic_store(&p->progress_of[r], x0);
     }
-    p->attivi = p->n;
-    p->generazione++;
+    p->active = p->n;
+    p->generation++;
     pthread_cond_broadcast(&p->via);
-    while (p->attivi > 0)
-        pthread_cond_wait(&p->finito, &p->m);
+    while (p->active > 0)
+        pthread_cond_wait(&p->finished, &p->m);
     pthread_mutex_unlock(&p->m);
 }
 
@@ -353,86 +353,86 @@ void h264d_deblock_wavefront(h264_decoder_t *d, const h264d_deblock_pic_t *dp)
     }
 
     pthread_mutex_lock(&p->m);
-    p->tipo = 1;
+    p->kind = 1;
     p->d = d;
     p->dbl = *dp;
-    p->primo = 0;
-    p->quanti = dp->mb_w * dp->mb_h;
-    p->numero = 0;
-    p->prima_riga = 0;
-    p->ultima_riga = dp->mb_h - 1;
-    atomic_store(&p->riga_prossima, 0);
-    for (int r = 0; r <= p->ultima_riga; r++)
-        atomic_store(&p->progresso[r], 0);
-    p->attivi = p->n;
-    p->generazione++;
+    p->first = 0;
+    p->count = dp->mb_w * dp->mb_h;
+    p->number = 0;
+    p->first_row = 0;
+    p->last_row = dp->mb_h - 1;
+    atomic_store(&p->next_row, 0);
+    for (int r = 0; r <= p->last_row; r++)
+        atomic_store(&p->progress_of[r], 0);
+    p->active = p->n;
+    p->generation++;
     pthread_cond_broadcast(&p->via);
-    while (p->attivi > 0)
-        pthread_cond_wait(&p->finito, &p->m);
+    while (p->active > 0)
+        pthread_cond_wait(&p->finished, &p->m);
     pthread_mutex_unlock(&p->m);
 }
 
 /* Make sure every worker has a NAL buffer big enough and a residual ring.
  * Done the first time slice parallelism is used, and then only grown. */
-static bool prepara_buffer(struct h264d_pool *p, h264_decoder_t *d,
+static bool prepare_buffer(struct h264d_pool *p, h264_decoder_t *d,
                            size_t serve)
 {
     if (!p->rbsp) {
         p->rbsp = calloc((size_t)p->n, sizeof(uint8_t *));
         p->rbsp_cap = calloc((size_t)p->n, sizeof(size_t));
-        p->residui = calloc((size_t)p->n, sizeof(h264d_residuo_t *));
-        if (!p->rbsp || !p->rbsp_cap || !p->residui) return false;
+        p->residuals = calloc((size_t)p->n, sizeof(h264d_residual_t *));
+        if (!p->rbsp || !p->rbsp_cap || !p->residuals) return false;
     }
-    if (!p->n_residui) {
-        p->n_residui = 2 * d->mb_w;
+    if (!p->n_residuals) {
+        p->n_residuals = 2 * d->mb_w;
         for (int i = 0; i < p->n; i++) {
-            p->residui[i] = calloc((size_t)p->n_residui,
-                                   sizeof(h264d_residuo_t));
-            if (!p->residui[i]) return false;
+            p->residuals[i] = calloc((size_t)p->n_residuals,
+                                   sizeof(h264d_residual_t));
+            if (!p->residuals[i]) return false;
         }
     }
     for (int i = 0; i < p->n; i++) {
         if (p->rbsp_cap[i] >= serve) continue;
-        uint8_t *nuovo = realloc(p->rbsp[i], serve);
-        if (!nuovo) return false;
-        p->rbsp[i] = nuovo;
+        uint8_t *new_one = realloc(p->rbsp[i], serve);
+        if (!new_one) return false;
+        p->rbsp[i] = new_one;
         p->rbsp_cap[i] = serve;
     }
     return true;
 }
 
 int h264d_slices_pool(h264_decoder_t *d, const h264d_slice_input_t *in,
-                      int n, int primo_numero)
+                      int n, int first_number)
 {
     struct h264d_pool *p = d->pool;
-    size_t piu_grande = 0;
+    size_t bigger = 0;
     for (int i = 0; i < n; i++)
-        if (in[i].size > piu_grande) piu_grande = in[i].size;
+        if (in[i].size > bigger) bigger = in[i].size;
 
     pthread_mutex_lock(&p->m);
-    if (!prepara_buffer(p, d, piu_grande + 64)) {
+    if (!prepare_buffer(p, d, bigger + 64)) {
         pthread_mutex_unlock(&p->m);
         /* Out of memory for the parallel path: the serial one needs none. */
-        int primo_errore = 0;
+        int first_error = 0;
         for (int i = 0; i < n; i++) {
-            const int r = h264d_decodifica_slice(d, &in[i], primo_numero + i);
-            if (r && !primo_errore) primo_errore = r;
+            const int r = h264d_decode_slice(d, &in[i], first_number + i);
+            if (r && !first_error) first_error = r;
         }
-        return primo_errore;
+        return first_error;
     }
 
-    p->tipo = 2;
+    p->kind = 2;
     p->d = d;
     p->in = in;
     p->n_in = n;
-    p->primo_numero = primo_numero;
-    atomic_store(&p->slice_prossima, 0);
-    atomic_store(&p->errore, 0);
-    p->attivi = p->n;
-    p->generazione++;
+    p->first_number = first_number;
+    atomic_store(&p->next_slice, 0);
+    atomic_store(&p->error, 0);
+    p->active = p->n;
+    p->generation++;
     pthread_cond_broadcast(&p->via);
-    while (p->attivi > 0)
-        pthread_cond_wait(&p->finito, &p->m);
+    while (p->active > 0)
+        pthread_cond_wait(&p->finished, &p->m);
     pthread_mutex_unlock(&p->m);
-    return atomic_load(&p->errore);
+    return atomic_load(&p->error);
 }

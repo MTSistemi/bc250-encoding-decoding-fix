@@ -1320,11 +1320,11 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
      * is what lets the loop be handed to OpenMP.
      */
     const int ns = encoder->num_slices;
-    const uint32_t righe_ctu = encoder->height_ctu;
-    uint32_t bit_indirizzo = 0;
+    const uint32_t ctu_rows = encoder->height_ctu;
+    uint32_t bit_address = 0;
     {
         uint32_t n = encoder->width_ctu * encoder->height_ctu;
-        while ((1u << bit_indirizzo) < n) bit_indirizzo++;
+        while ((1u << bit_address) < n) bit_address++;
     }
 
     /* Nothing is shared while a slice is being encoded.
@@ -1340,8 +1340,8 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
 #pragma omp parallel for schedule(static) if (ns > 1)
 #endif
     for (int s = 0; s < ns; s++) {
-        uint32_t r0 = (uint32_t)(((uint64_t)righe_ctu * (uint32_t)s) / (uint32_t)ns);
-        uint32_t r1 = (uint32_t)(((uint64_t)righe_ctu * (uint32_t)(s + 1)) / (uint32_t)ns);
+        uint32_t r0 = (uint32_t)(((uint64_t)ctu_rows * (uint32_t)s) / (uint32_t)ns);
+        uint32_t r1 = (uint32_t)(((uint64_t)ctu_rows * (uint32_t)(s + 1)) / (uint32_t)ns);
         int y_min = (int)(r0 * HEVC_CTU_SIZE);
         uint32_t sad = 0;
 
@@ -1357,7 +1357,7 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
          * dependent_slice_segment_flag here - just the address, in
          * Ceil(Log2(PicSizeInCtbsY)) bits, per Rec. ITU-T H.265 7.3.6.1. */
         if (s != 0) {
-            bs_write_u(&slice_bs, (int)bit_indirizzo, r0 * encoder->width_ctu);
+            bs_write_u(&slice_bs, (int)bit_address, r0 * encoder->width_ctu);
         }
         bs_write_ue(&slice_bs, is_idr ? 2 : 1); /* slice_type: 2 = I, 1 = P */
 

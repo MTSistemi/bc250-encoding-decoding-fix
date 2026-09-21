@@ -65,12 +65,12 @@ const uint8_t *h264d_mc_fetch_luma(uint8_t *dst, int *out_stride,
     for (int j = 0; j < ph; j++) {
         int sy = y - H264D_MC_PAD_BEFORE + j;
         sy = sy < 0 ? 0 : (sy >= plane_h ? plane_h - 1 : sy);
-        const uint8_t *riga = plane + (size_t)sy * stride;
+        const uint8_t *row = plane + (size_t)sy * stride;
         uint8_t *out = dst + (size_t)j * pw;
         for (int i = 0; i < pw; i++) {
             int sx = x - H264D_MC_PAD_BEFORE + i;
             sx = sx < 0 ? 0 : (sx >= plane_w ? plane_w - 1 : sx);
-            out[i] = riga[sx];
+            out[i] = row[sx];
         }
     }
     return dst + H264D_MC_PAD_BEFORE * pw + H264D_MC_PAD_BEFORE;
@@ -91,12 +91,12 @@ const uint8_t *h264d_mc_fetch_chroma(uint8_t *dst, int *out_stride,
     for (int j = 0; j <= h; j++) {
         int sy = y + j;
         sy = sy < 0 ? 0 : (sy >= plane_h ? plane_h - 1 : sy);
-        const uint8_t *riga = plane + (size_t)sy * stride;
+        const uint8_t *row = plane + (size_t)sy * stride;
         uint8_t *out = dst + (size_t)j * pw;
         for (int i = 0; i <= w; i++) {
             int sx = x + i;
             sx = sx < 0 ? 0 : (sx >= plane_w ? plane_w - 1 : sx);
-            out[i] = riga[sx];
+            out[i] = row[sx];
         }
     }
     return dst;
@@ -134,24 +134,24 @@ static inline __m128i otto(const uint8_t *p)
 }
 
 /* The coefficient pair _mm_madd_epi16 applies to interleaved rows. */
-#define COPPIA(lo, hi) _mm_set1_epi32((int)(((uint32_t)(uint16_t)(hi) << 16) \
+#define PAIR(lo, hi) _mm_set1_epi32((int)(((uint32_t)(uint16_t)(hi) << 16) \
                                             | (uint32_t)(uint16_t)(lo)))
 #endif
 
 /* The six-tap filter across a row, unrounded, n samples from r[0]. */
-static void filtro_riga(const uint8_t *r, int16_t *o, int n)
+static void row_filter(const uint8_t *r, int16_t *o, int n)
 {
     int x = 0;
 #if BC250_H264_SSE2
     const __m128i c20 = _mm_set1_epi16(20), c5 = _mm_set1_epi16(5);
     for (; x + 8 <= n; x += 8) {
-        const __m128i estremi = _mm_add_epi16(otto(r + x - 2), otto(r + x + 3));
-        const __m128i centro  = _mm_add_epi16(otto(r + x), otto(r + x + 1));
-        const __m128i mezzo   = _mm_add_epi16(otto(r + x - 1), otto(r + x + 2));
+        const __m128i extremes = _mm_add_epi16(otto(r + x - 2), otto(r + x + 3));
+        const __m128i centre  = _mm_add_epi16(otto(r + x), otto(r + x + 1));
+        const __m128i middle   = _mm_add_epi16(otto(r + x - 1), otto(r + x + 2));
         /* Every term stays inside a signed sixteen-bit lane: 20 x 510 is
          * 10200 and the ends add at most 510 more. */
-        __m128i t = _mm_add_epi16(estremi, _mm_mullo_epi16(centro, c20));
-        t = _mm_sub_epi16(t, _mm_mullo_epi16(mezzo, c5));
+        __m128i t = _mm_add_epi16(extremes, _mm_mullo_epi16(centre, c20));
+        t = _mm_sub_epi16(t, _mm_mullo_epi16(middle, c5));
         _mm_storeu_si128((__m128i *)(o + x), t);
     }
 #endif
@@ -161,20 +161,20 @@ static void filtro_riga(const uint8_t *r, int16_t *o, int n)
 }
 
 /* The six-tap filter down a column of the source, rounded and clipped. */
-static void filtro_colonna(const uint8_t *r, int ss, uint8_t *o, int n)
+static void column_filter(const uint8_t *r, int ss, uint8_t *o, int n)
 {
     int x = 0;
 #if BC250_H264_SSE2
     const __m128i c20 = _mm_set1_epi16(20), c5 = _mm_set1_epi16(5);
     const __m128i c16 = _mm_set1_epi16(16);
     for (; x + 8 <= n; x += 8) {
-        const __m128i estremi = _mm_add_epi16(otto(r + x - 2 * ss),
+        const __m128i extremes = _mm_add_epi16(otto(r + x - 2 * ss),
                                               otto(r + x + 3 * ss));
-        const __m128i centro  = _mm_add_epi16(otto(r + x), otto(r + x + ss));
-        const __m128i mezzo   = _mm_add_epi16(otto(r + x - ss),
+        const __m128i centre  = _mm_add_epi16(otto(r + x), otto(r + x + ss));
+        const __m128i middle   = _mm_add_epi16(otto(r + x - ss),
                                               otto(r + x + 2 * ss));
-        __m128i t = _mm_add_epi16(estremi, _mm_mullo_epi16(centro, c20));
-        t = _mm_sub_epi16(t, _mm_mullo_epi16(mezzo, c5));
+        __m128i t = _mm_add_epi16(extremes, _mm_mullo_epi16(centre, c20));
+        t = _mm_sub_epi16(t, _mm_mullo_epi16(middle, c5));
         t = _mm_srai_epi16(_mm_add_epi16(t, c16), 5);
         _mm_storel_epi64((__m128i *)(o + x), _mm_packus_epi16(t, t));
     }
@@ -201,7 +201,7 @@ static void arrotonda(const int16_t *t, uint8_t *o, int n)
 }
 
 /* The vertical six-tap down the strip of horizontal intermediates: j. */
-static void filtro_strip(const int16_t *t0, const int16_t *t1, const int16_t *t2,
+static void strip_filter(const int16_t *t0, const int16_t *t1, const int16_t *t2,
                          const int16_t *t3, const int16_t *t4, const int16_t *t5,
                          uint8_t *o, int n)
 {
@@ -211,7 +211,7 @@ static void filtro_strip(const int16_t *t0, const int16_t *t1, const int16_t *t2
      * _mm_madd_epi16 multiplies interleaved pairs and accumulates into
      * thirty-two, which turns the six taps into three instructions rather
      * than six widenings. */
-    const __m128i ca = COPPIA(1, -5), cb = COPPIA(20, 20), cc = COPPIA(-5, 1);
+    const __m128i ca = PAIR(1, -5), cb = PAIR(20, 20), cc = PAIR(-5, 1);
     const __m128i c512 = _mm_set1_epi32(512);
     for (; x + 8 <= n; x += 8) {
         const __m128i a0 = _mm_loadu_si128((const __m128i *)(t0 + x));
@@ -243,7 +243,7 @@ static void filtro_strip(const int16_t *t0, const int16_t *t1, const int16_t *t2
 
 /* Which of b, v and j each of the sixteen positions actually reads, as
  * bits 0, 1 and 2. The table is the table below, read backwards. */
-static const uint8_t serve_mezzi[16] = {
+static const uint8_t halves_needed[16] = {
     0,  /* G */  1,  /* a */  1,  /* b */  1,  /* c */
     2,  /* d */  3,  /* e */  5,  /* f */  3,  /* g */
     2,  /* h */  6,  /* i */  4,  /* j */  6,  /* k */
@@ -251,7 +251,7 @@ static const uint8_t serve_mezzi[16] = {
 };
 
 /* Copy one row, or average two of them. */
-static void riga_uscita(uint8_t *o, const uint8_t *s1, const uint8_t *s2, int w)
+static void out_row(uint8_t *o, const uint8_t *s1, const uint8_t *s2, int w)
 {
     if (!s2) {
         memcpy(o, s1, (size_t)w);
@@ -279,39 +279,39 @@ static void riga_uscita(uint8_t *o, const uint8_t *s1, const uint8_t *s2, int w)
 void h264d_mc_luma(uint8_t *dst, int ds, const uint8_t *src, int ss,
                    int w, int h, int xfrac, int yfrac)
 {
-    const int caso = yfrac * 4 + xfrac;
-    if (!caso) {
+    const int frac_case = yfrac * 4 + xfrac;
+    if (!frac_case) {
         for (int y = 0; y < h; y++)
             memcpy(dst + (size_t)y * ds, src + (size_t)y * ss, (size_t)w);
         return;
     }
 
     uint8_t b[MAXH][MAXW], v[MAXH][MAXW], j[MAXH][MAXW];
-    const int quali = serve_mezzi[caso];
+    const int which_halves = halves_needed[frac_case];
     const int n = w + 1;
 
-    if (quali & 4) {
+    if (which_halves & 4) {
         /* One pass over the source for the horizontal intermediates, then
          * one down the strip for j. b is the same strip rounded. */
         int16_t ht[MAXHT][MAXW];
         for (int y = -2; y <= h + 3; y++)
-            filtro_riga(src + (ptrdiff_t)y * ss, ht[y + 2], n);
+            row_filter(src + (ptrdiff_t)y * ss, ht[y + 2], n);
         for (int y = 0; y <= h; y++)
-            filtro_strip(ht[y], ht[y + 1], ht[y + 2], ht[y + 3],
+            strip_filter(ht[y], ht[y + 1], ht[y + 2], ht[y + 3],
                          ht[y + 4], ht[y + 5], j[y], n);
-        if (quali & 1)
+        if (which_halves & 1)
             for (int y = 0; y <= h; y++)
                 arrotonda(ht[y + 2], b[y], n);
-    } else if (quali & 1) {
-        int16_t riga[MAXW];
+    } else if (which_halves & 1) {
+        int16_t row[MAXW];
         for (int y = 0; y <= h; y++) {
-            filtro_riga(src + (size_t)y * ss, riga, n);
-            arrotonda(riga, b[y], n);
+            row_filter(src + (size_t)y * ss, row, n);
+            arrotonda(row, b[y], n);
         }
     }
-    if (quali & 2)
+    if (which_halves & 2)
         for (int y = 0; y <= h; y++)
-            filtro_colonna(src + (size_t)y * ss, ss, v[y], n);
+            column_filter(src + (size_t)y * ss, ss, v[y], n);
 
     /* Every one of the fifteen filtered positions is either one of these
      * arrays, or the average of two of them - which is why the whole switch
@@ -319,7 +319,7 @@ void h264d_mc_luma(uint8_t *dst, int ds, const uint8_t *src, int ss,
     for (int y = 0; y < h; y++) {
         const uint8_t *g = src + (size_t)y * ss;
         const uint8_t *s1, *s2;
-        switch (caso) {
+        switch (frac_case) {
         case  1: s1 = g;          s2 = b[y];     break; /* a */
         case  2: s1 = b[y];       s2 = NULL;     break; /* b */
         case  3: s1 = g + 1;      s2 = b[y];     break; /* c */
@@ -336,7 +336,7 @@ void h264d_mc_luma(uint8_t *dst, int ds, const uint8_t *src, int ss,
         case 14: s1 = j[y];       s2 = b[y + 1]; break; /* q */
         default: s1 = v[y] + 1;   s2 = b[y + 1]; break; /* r */
         }
-        riga_uscita(dst + (size_t)y * ds, s1, s2, w);
+        out_row(dst + (size_t)y * ds, s1, s2, w);
     }
 }
 
@@ -361,7 +361,7 @@ void h264d_mc_chroma(uint8_t *dst, int ds, const uint8_t *src, int ss,
      * this filter. */
 #if BC250_H264_SSE2
     const __m128i zero = _mm_setzero_si128();
-#define CROMA_DUE(pa, pb, ca, cb, tondo, sposta)                              \
+#define CHROMA_TWO(pa, pb, ca, cb, rounding, shift)                              \
     do {                                                                      \
         const __m128i va = _mm_unpacklo_epi8(                                 \
             _mm_loadl_epi64((const __m128i *)(pa)), zero);                    \
@@ -369,7 +369,7 @@ void h264d_mc_chroma(uint8_t *dst, int ds, const uint8_t *src, int ss,
             _mm_loadl_epi64((const __m128i *)(pb)), zero);                    \
         __m128i v = _mm_add_epi16(_mm_mullo_epi16(va, (ca)),                  \
                                   _mm_mullo_epi16(vb, (cb)));                 \
-        v = _mm_srli_epi16(_mm_add_epi16(v, (tondo)), (sposta));              \
+        v = _mm_srli_epi16(_mm_add_epi16(v, (rounding)), (shift));              \
         _mm_storel_epi64((__m128i *)(o + x), _mm_packus_epi16(v, v));         \
     } while (0)
 #endif
@@ -386,7 +386,7 @@ void h264d_mc_chroma(uint8_t *dst, int ds, const uint8_t *src, int ss,
             uint8_t *o = dst + (size_t)y * ds;
             int x = 0;
 #if BC250_H264_SSE2
-            for (; x + 8 <= w; x += 8) CROMA_DUE(r + x, r + x + 1, ca, cb, t4, 3);
+            for (; x + 8 <= w; x += 8) CHROMA_TWO(r + x, r + x + 1, ca, cb, t4, 3);
 #endif
             for (; x < w; x++)
                 o[x] = (uint8_t)((a * r[x] + xfrac * r[x + 1] + 4) >> 3);
@@ -407,7 +407,7 @@ void h264d_mc_chroma(uint8_t *dst, int ds, const uint8_t *src, int ss,
             uint8_t *o = dst + (size_t)y * ds;
             int x = 0;
 #if BC250_H264_SSE2
-            for (; x + 8 <= w; x += 8) CROMA_DUE(r0 + x, r1 + x, ca, cb, t4, 3);
+            for (; x + 8 <= w; x += 8) CHROMA_TWO(r0 + x, r1 + x, ca, cb, t4, 3);
 #endif
             for (; x < w; x++)
                 o[x] = (uint8_t)((a * r0[x] + yfrac * r1[x] + 4) >> 3);
@@ -452,7 +452,7 @@ void h264d_mc_chroma(uint8_t *dst, int ds, const uint8_t *src, int ss,
                             + c * r1[x] + d * r1[x + 1] + 32) >> 6);
     }
 #if BC250_H264_SSE2
-#undef CROMA_DUE
+#undef CHROMA_TWO
 #endif
 }
 
@@ -571,9 +571,9 @@ void h264d_mc_weight_bi(uint8_t *dst, int ds,
     const __m128i zero = _mm_setzero_si128();
     const __m128i vw = _mm_set1_epi32((int)(((uint32_t)(w1 & 0xffff) << 16)
                                             | (uint32_t)(w0 & 0xffff)));
-    const int tondo = (log2_denom >= 1) ? (1 << log2_denom) : 0;
-    const int sposta = (log2_denom >= 1) ? (log2_denom + 1) : 0;
-    const __m128i vt = _mm_set1_epi32(tondo);
+    const int rounding = (log2_denom >= 1) ? (1 << log2_denom) : 0;
+    const int shift = (log2_denom >= 1) ? (log2_denom + 1) : 0;
+    const __m128i vt = _mm_set1_epi32(rounding);
     const __m128i vo = _mm_set1_epi16((short)off);
 #endif
     for (int y = 0; y < h; y++) {
@@ -588,8 +588,8 @@ void h264d_mc_weight_bi(uint8_t *dst, int ds,
             const __m128i mix = _mm_unpacklo_epi8(ia, ib);
             __m128i lo = _mm_madd_epi16(_mm_unpacklo_epi8(mix, zero), vw);
             __m128i hi = _mm_madd_epi16(_mm_unpackhi_epi8(mix, zero), vw);
-            lo = _mm_srai_epi32(_mm_add_epi32(lo, vt), sposta);
-            hi = _mm_srai_epi32(_mm_add_epi32(hi, vt), sposta);
+            lo = _mm_srai_epi32(_mm_add_epi32(lo, vt), shift);
+            hi = _mm_srai_epi32(_mm_add_epi32(hi, vt), shift);
             /* âš ï¸ Saturating, not wrapping. At log2_denom zero nothing is
              * shifted, the sum can reach 64770, and packing it down clamps
              * it at 32767 - where a wrapping add of the offset would turn
@@ -602,7 +602,7 @@ void h264d_mc_weight_bi(uint8_t *dst, int ds,
             const __m128i ib = _mm_cvtsi32_si128(*(const int32_t *)(rb + x));
             const __m128i mix = _mm_unpacklo_epi8(ia, ib);
             __m128i lo = _mm_madd_epi16(_mm_unpacklo_epi8(mix, zero), vw);
-            lo = _mm_srai_epi32(_mm_add_epi32(lo, vt), sposta);
+            lo = _mm_srai_epi32(_mm_add_epi32(lo, vt), shift);
             __m128i v = _mm_adds_epi16(_mm_packs_epi32(lo, lo), vo);
             *(int32_t *)(o + x) = _mm_cvtsi128_si32(_mm_packus_epi16(v, v));
             x += 4;

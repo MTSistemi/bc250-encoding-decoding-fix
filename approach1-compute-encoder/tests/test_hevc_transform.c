@@ -5,7 +5,7 @@
  * test_hevc_transform.c - the inverse transforms against the matrices
  * they are supposed to be.
  *
- * hevcd_trasforma does not multiply by a matrix. The DCT reads one row of
+ * hevcd_transform does not multiply by a matrix. The DCT reads one row of
  * a shared table with a stride, and the 4x4 intra luma DST is factored
  * into four multiplications instead of sixteen. Both are worth doing and
  * both are easy to get wrong in a way that leaves most of the output
@@ -23,7 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int guasti;
+static int faults;
 
 /* Table in 8.6.4.2, transMatrix for the 4x4 luma intra case. */
 static const int dst[4][4] = {
@@ -33,14 +33,14 @@ static const int dst[4][4] = {
     { 55, -84, 74, -29 },
 };
 
-static int ritaglia16(int v)
+static int clip16(int v)
 {
     return v < -32768 ? -32768 : (v > 32767 ? 32767 : v);
 }
 
 /* 8.6.4.2 written the long way: columns, shift by seven, rows, shift by
  * twenty minus the bit depth. Both stages clipped to sixteen bits. */
-static void riferimento(const int16_t *in, int16_t *out, int n, bool usa_dst)
+static void reference(const int16_t *in, int16_t *out, int n, bool usa_dst)
 {
     int16_t tmp[32 * 32];
 
@@ -52,7 +52,7 @@ static void riferimento(const int16_t *in, int16_t *out, int n, bool usa_dst)
                                       : hevcd_dct[k * (32 / n)][y];
                 s += m * in[k * n + x];
             }
-            tmp[y * n + x] = (int16_t)ritaglia16((s + 64) >> 7);
+            tmp[y * n + x] = (int16_t)clip16((s + 64) >> 7);
         }
 
     for (int y = 0; y < n; y++)
@@ -63,34 +63,34 @@ static void riferimento(const int16_t *in, int16_t *out, int n, bool usa_dst)
                                       : hevcd_dct[k * (32 / n)][x];
                 s += m * tmp[y * n + k];
             }
-            out[y * n + x] = (int16_t)ritaglia16((s + 2048) >> 12);
+            out[y * n + x] = (int16_t)clip16((s + 2048) >> 12);
         }
 }
 
 static unsigned semi = 12345;
 
-static int prossimo(int ampiezza)
+static int next_up(int amplitude)
 {
     semi = semi * 1103515245u + 12345u;
-    return (int)((semi >> 16) % (unsigned)(2 * ampiezza + 1)) - ampiezza;
+    return (int)((semi >> 16) % (unsigned)(2 * amplitude + 1)) - amplitude;
 }
 
-static void confronta(const char *cosa, const int16_t *a, const int16_t *b,
-                      int quanti)
+static void compare(const char *what, const int16_t *a, const int16_t *b,
+                      int count)
 {
-    int diversi = 0, peggio = 0;
-    for (int i = 0; i < quanti; i++)
+    int differing = 0, worst = 0;
+    for (int i = 0; i < count; i++)
         if (a[i] != b[i]) {
-            diversi++;
+            differing++;
             const int e = abs(a[i] - b[i]);
-            if (e > peggio) peggio = e;
+            if (e > worst) worst = e;
         }
-    if (diversi) {
-        printf("  %-34s %d su %d diversi, il peggiore di %d\n",
-               cosa, diversi, quanti, peggio);
-        guasti++;
+    if (differing) {
+        printf("  %-34s %d of %d differ, worst by %d\n",
+               what, differing, count, worst);
+        faults++;
     } else {
-        printf("  %-34s uguale\n", cosa);
+        printf("  %-34s equal\n", what);
     }
 }
 
@@ -100,66 +100,66 @@ static void confronta(const char *cosa, const int16_t *a, const int16_t *b,
 static void impulsi(int log2_size, bool usa_dst)
 {
     const int n = 1 << log2_size;
-    int16_t nostro[32 * 32], atteso[32 * 32], ingresso[32 * 32];
-    char cosa[64];
-    int diversi = 0;
+    int16_t ours[32 * 32], expected[32 * 32], input[32 * 32];
+    char what[64];
+    int differing = 0;
 
     for (int k = 0; k < n * n; k++) {
-        memset(ingresso, 0, sizeof(int16_t) * (size_t)n * n);
-        ingresso[k] = 256;
-        memcpy(nostro, ingresso, sizeof(int16_t) * (size_t)n * n);
-        hevcd_trasforma(nostro, log2_size, usa_dst);
-        riferimento(ingresso, atteso, n, usa_dst);
-        if (memcmp(nostro, atteso, sizeof(int16_t) * (size_t)n * n))
-            diversi++;
+        memset(input, 0, sizeof(int16_t) * (size_t)n * n);
+        input[k] = 256;
+        memcpy(ours, input, sizeof(int16_t) * (size_t)n * n);
+        hevcd_transform(ours, log2_size, usa_dst);
+        reference(input, expected, n, usa_dst);
+        if (memcmp(ours, expected, sizeof(int16_t) * (size_t)n * n))
+            differing++;
     }
-    snprintf(cosa, sizeof cosa, "%s %dx%d, un impulso per volta",
+    snprintf(what, sizeof what, "%s %dx%d, one impulse at a time",
              usa_dst ? "DST" : "DCT", n, n);
-    if (diversi) {
-        printf("  %-34s %d basi su %d sbagliate\n", cosa, diversi, n * n);
-        guasti++;
+    if (differing) {
+        printf("  %-34s %d basis vectors of %d wrong\n", what, differing, n * n);
+        faults++;
     } else {
-        printf("  %-34s uguale\n", cosa);
+        printf("  %-34s equal\n", what);
     }
 }
 
-static void a_caso(int log2_size, bool usa_dst)
+static void at_random(int log2_size, bool usa_dst)
 {
     const int n = 1 << log2_size;
-    int16_t nostro[32 * 32], atteso[32 * 32], ingresso[32 * 32];
-    char cosa[64];
+    int16_t ours[32 * 32], expected[32 * 32], input[32 * 32];
+    char what[64];
 
-    snprintf(cosa, sizeof cosa, "%s %dx%d, blocchi a caso",
+    snprintf(what, sizeof what, "%s %dx%d, random blocks",
              usa_dst ? "DST" : "DCT", n, n);
 
-    for (int giro = 0; giro < 64; giro++) {
-        for (int i = 0; i < n * n; i++) ingresso[i] = (int16_t)prossimo(4000);
-        memcpy(nostro, ingresso, sizeof(int16_t) * (size_t)n * n);
-        hevcd_trasforma(nostro, log2_size, usa_dst);
-        riferimento(ingresso, atteso, n, usa_dst);
-        if (memcmp(nostro, atteso, sizeof(int16_t) * (size_t)n * n)) {
-            confronta(cosa, nostro, atteso, n * n);
+    for (int pass_index = 0; pass_index < 64; pass_index++) {
+        for (int i = 0; i < n * n; i++) input[i] = (int16_t)next_up(4000);
+        memcpy(ours, input, sizeof(int16_t) * (size_t)n * n);
+        hevcd_transform(ours, log2_size, usa_dst);
+        reference(input, expected, n, usa_dst);
+        if (memcmp(ours, expected, sizeof(int16_t) * (size_t)n * n)) {
+            compare(what, ours, expected, n * n);
             return;
         }
     }
-    printf("  %-34s uguale\n", cosa);
+    printf("  %-34s equal\n", what);
 }
 
 int main(void)
 {
-    printf("le trasformate inverse contro le loro matrici\n");
+    printf("the inverse transforms against their own matrices\n");
     impulsi(2, true);
-    a_caso(2, true);
+    at_random(2, true);
     for (int l = 2; l <= 5; l++) {
         impulsi(l, false);
-        a_caso(l, false);
+        at_random(l, false);
     }
 
     printf("\n");
-    if (guasti) {
-        printf("%d prove fallite\n", guasti);
+    if (faults) {
+        printf("%d prove fallite\n", faults);
         return 1;
     }
-    printf("tutto a posto\n");
+    printf("all good\n");
     return 0;
 }

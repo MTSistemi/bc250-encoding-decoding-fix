@@ -78,8 +78,8 @@ static inline void h264d_cabac_refill(h264d_cabac_t *c)
  */
 static inline bool h264d_cabac_overrun(const h264d_cabac_t *c)
 {
-    ptrdiff_t letti = (c->ptr - c->start) * 8 - c->cache_bits;
-    return letti > (ptrdiff_t)(c->end - c->start) * 8;
+    ptrdiff_t n_read = (c->ptr - c->start) * 8 - c->cache_bits;
+    return n_read > (ptrdiff_t)(c->end - c->start) * 8;
 }
 
 /* Where the next substream begins: how many bytes this one has actually

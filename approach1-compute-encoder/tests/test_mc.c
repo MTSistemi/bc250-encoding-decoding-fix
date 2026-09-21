@@ -22,19 +22,19 @@
 
 #include "h264_mc.h"
 
-static uint64_t seme = 0xB7E151628AED2A6Bull;
-static uint32_t casuale(void)
+static uint64_t seed = 0xB7E151628AED2A6Bull;
+static uint32_t random_u32(void)
 {
-    seme ^= seme >> 12;
-    seme ^= seme << 25;
-    seme ^= seme >> 27;
-    return (uint32_t)((seme * 0x2545F4914F6CDD1Dull) >> 32);
+    seed ^= seed >> 12;
+    seed ^= seed << 25;
+    seed ^= seed >> 27;
+    return (uint32_t)((seed * 0x2545F4914F6CDD1Dull) >> 32);
 }
 
 #define PW 48
 #define PH 40
 
-static uint8_t piano[PH * PW];
+static uint8_t plane[PH * PW];
 
 static int clip255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
 
@@ -44,7 +44,7 @@ static int S(int x, int y)
 {
     x = x < 0 ? 0 : (x >= PW ? PW - 1 : x);
     y = y < 0 ? 0 : (y >= PH ? PH - 1 : y);
-    return piano[y * PW + x];
+    return plane[y * PW + x];
 }
 
 #define TAP(a, b, c, d, e, f) ((a) - 5 * (b) + 20 * (c) + 20 * (d) - 5 * (e) + (f))
@@ -62,7 +62,7 @@ static int h1_a(int x, int y)
 }
 
 /* Clause 8.4.2.2.1, one sample, literally. */
-static int letterale_luma(int x, int y, int xf, int yf)
+static int literal_luma(int x, int y, int xf, int yf)
 {
     int G = S(x, y), H = S(x + 1, y), M = S(x, y + 1);
     int b = clip255((b1_a(x, y) + 16) >> 5);
@@ -97,7 +97,7 @@ static int letterale_luma(int x, int y, int xf, int yf)
 }
 
 /* Clause 8.4.2.2.2. */
-static int letterale_chroma(int x, int y, int xf, int yf)
+static int literal_chroma(int x, int y, int xf, int yf)
 {
     return ((8 - xf) * (8 - yf) * S(x, y)
           + xf * (8 - yf) * S(x + 1, y)
@@ -106,161 +106,161 @@ static int letterale_chroma(int x, int y, int xf, int yf)
 }
 
 /* Every block size an H.264 partition can be. */
-static const int misure[][2] = {
+static const int measures[][2] = {
     {16,16},{16,8},{8,16},{8,8},{8,4},{4,8},{4,4}
 };
 
-static int prova_luma(void)
+static int test_luma(void)
 {
     uint8_t padded[(16 + 6) * (16 + 6)];
-    uint8_t nostro[16 * 16], suo[16 * 16];
-    int guasti = 0;
+    uint8_t ours[16 * 16], its[16 * 16];
+    int faults = 0;
 
-    for (int giro = 0; giro < 3000; giro++) {
-        for (int i = 0; i < PH * PW; i++) piano[i] = (uint8_t)casuale();
+    for (int pass_index = 0; pass_index < 3000; pass_index++) {
+        for (int i = 0; i < PH * PW; i++) plane[i] = (uint8_t)random_u32();
 
-        for (unsigned mi = 0; mi < sizeof(misure) / sizeof(misure[0]); mi++) {
-            int w = misure[mi][0], h = misure[mi][1];
+        for (unsigned mi = 0; mi < sizeof(measures) / sizeof(measures[0]); mi++) {
+            int w = measures[mi][0], h = measures[mi][1];
             /* Inside the picture, straddling an edge, and entirely outside. */
-            int x = (int)(casuale() % (PW + 32)) - 16;
-            int y = (int)(casuale() % (PH + 32)) - 16;
+            int x = (int)(random_u32() % (PW + 32)) - 16;
+            int y = (int)(random_u32() % (PH + 32)) - 16;
 
             for (int yf = 0; yf < 4; yf++) {
                 for (int xf = 0; xf < 4; xf++) {
                     int pst;
-                    const uint8_t *src = h264d_mc_fetch_luma(padded, &pst, piano, PW,
+                    const uint8_t *src = h264d_mc_fetch_luma(padded, &pst, plane, PW,
                                                              PW, PH, x, y, w, h);
-                    h264d_mc_luma(nostro, w, src, pst, w, h, xf, yf);
+                    h264d_mc_luma(ours, w, src, pst, w, h, xf, yf);
 
                     for (int j = 0; j < h; j++)
                         for (int i = 0; i < w; i++)
-                            suo[j * w + i] = (uint8_t)letterale_luma(x + i, y + j, xf, yf);
+                            its[j * w + i] = (uint8_t)literal_luma(x + i, y + j, xf, yf);
 
-                    if (memcmp(nostro, suo, (size_t)w * h)) {
-                        if (guasti < 5) {
+                    if (memcmp(ours, its, (size_t)w * h)) {
+                        if (faults < 5) {
                             printf("  luma %dx%d a (%d,%d), frac (%d,%d):\n",
                                    w, h, x, y, xf, yf);
                             for (int j = 0; j < (h < 4 ? h : 4); j++) {
                                 printf("    noi ");
                                 for (int i = 0; i < (w < 8 ? w : 8); i++)
-                                    printf("%4d", nostro[j * w + i]);
+                                    printf("%4d", ours[j * w + i]);
                                 printf("   norma ");
                                 for (int i = 0; i < (w < 8 ? w : 8); i++)
-                                    printf("%4d", suo[j * w + i]);
+                                    printf("%4d", its[j * w + i]);
                                 printf("\n");
                             }
                         }
-                        guasti++;
+                        faults++;
                     }
                 }
             }
         }
     }
-    return guasti;
+    return faults;
 }
 
-static int prova_chroma(void)
+static int test_chroma(void)
 {
     uint8_t padded[(8 + 1) * (8 + 1)];
-    uint8_t nostro[8 * 8], suo[8 * 8];
-    int guasti = 0;
+    uint8_t ours[8 * 8], its[8 * 8];
+    int faults = 0;
 
-    for (int giro = 0; giro < 3000; giro++) {
-        for (int i = 0; i < PH * PW; i++) piano[i] = (uint8_t)casuale();
+    for (int pass_index = 0; pass_index < 3000; pass_index++) {
+        for (int i = 0; i < PH * PW; i++) plane[i] = (uint8_t)random_u32();
 
-        for (unsigned mi = 0; mi < sizeof(misure) / sizeof(misure[0]); mi++) {
-            int w = misure[mi][0] / 2, h = misure[mi][1] / 2;
+        for (unsigned mi = 0; mi < sizeof(measures) / sizeof(measures[0]); mi++) {
+            int w = measures[mi][0] / 2, h = measures[mi][1] / 2;
             if (w < 2 || h < 2) continue;
-            int x = (int)(casuale() % (PW + 16)) - 8;
-            int y = (int)(casuale() % (PH + 16)) - 8;
+            int x = (int)(random_u32() % (PW + 16)) - 8;
+            int y = (int)(random_u32() % (PH + 16)) - 8;
 
             for (int yf = 0; yf < 8; yf++) {
                 for (int xf = 0; xf < 8; xf++) {
                     int pst;
-                    const uint8_t *src = h264d_mc_fetch_chroma(padded, &pst, piano, PW,
+                    const uint8_t *src = h264d_mc_fetch_chroma(padded, &pst, plane, PW,
                                                                PW, PH, x, y, w, h);
-                    h264d_mc_chroma(nostro, w, src, pst, w, h, xf, yf);
+                    h264d_mc_chroma(ours, w, src, pst, w, h, xf, yf);
 
                     for (int j = 0; j < h; j++)
                         for (int i = 0; i < w; i++)
-                            suo[j * w + i] = (uint8_t)letterale_chroma(x + i, y + j, xf, yf);
+                            its[j * w + i] = (uint8_t)literal_chroma(x + i, y + j, xf, yf);
 
-                    if (memcmp(nostro, suo, (size_t)w * h)) {
-                        if (guasti < 5)
-                            printf("  croma %dx%d a (%d,%d), frac (%d,%d): diversi\n",
+                    if (memcmp(ours, its, (size_t)w * h)) {
+                        if (faults < 5)
+                            printf("  chroma %dx%d a (%d,%d), frac (%d,%d): differ\n",
                                    w, h, x, y, xf, yf);
-                        guasti++;
+                        faults++;
                     }
                 }
             }
         }
     }
-    return guasti;
+    return faults;
 }
 
 /* Clause 8.4.2.3: the default average and the explicit weights. */
-static int prova_combinazione(void)
+static int test_combination(void)
 {
-    uint8_t a[256], b[256], nostro[256];
-    int guasti = 0;
+    uint8_t a[256], b[256], ours[256];
+    int faults = 0;
 
-    for (int giro = 0; giro < 20000; giro++) {
-        for (int i = 0; i < 256; i++) { a[i] = (uint8_t)casuale(); b[i] = (uint8_t)casuale(); }
+    for (int pass_index = 0; pass_index < 20000; pass_index++) {
+        for (int i = 0; i < 256; i++) { a[i] = (uint8_t)random_u32(); b[i] = (uint8_t)random_u32(); }
 
-        h264d_mc_average(nostro, 16, a, 16, b, 16, 16, 16);
+        h264d_mc_average(ours, 16, a, 16, b, 16, 16, 16);
         for (int i = 0; i < 256; i++) {
             int y = i / 16, x = i % 16;
-            int atteso = (a[y * 16 + x] + b[y * 16 + x] + 1) >> 1;
-            if (nostro[y * 16 + x] != atteso) { guasti++; break; }
+            int expected = (a[y * 16 + x] + b[y * 16 + x] + 1) >> 1;
+            if (ours[y * 16 + x] != expected) { faults++; break; }
         }
 
-        int d = (int)(casuale() % 8);
-        int w0 = (int)(casuale() % 255) - 128;
-        int o0 = (int)(casuale() % 255) - 128;
-        h264d_mc_weight(nostro, 16, a, 16, 16, 16, d, w0, o0);
+        int d = (int)(random_u32() % 8);
+        int w0 = (int)(random_u32() % 255) - 128;
+        int o0 = (int)(random_u32() % 255) - 128;
+        h264d_mc_weight(ours, 16, a, 16, 16, 16, d, w0, o0);
         for (int i = 0; i < 256; i++) {
-            int atteso = d ? clip255(((a[i] * w0 + (1 << (d - 1))) >> d) + o0)
+            int expected = d ? clip255(((a[i] * w0 + (1 << (d - 1))) >> d) + o0)
                            : clip255(a[i] * w0 + o0);
-            if (nostro[i] != atteso) { guasti++; break; }
+            if (ours[i] != expected) { faults++; break; }
         }
 
-        int w1 = (int)(casuale() % 255) - 128;
-        int o1 = (int)(casuale() % 255) - 128;
-        h264d_mc_weight_bi(nostro, 16, a, 16, b, 16, 16, 16, d, w0, o0, w1, o1);
+        int w1 = (int)(random_u32() % 255) - 128;
+        int o1 = (int)(random_u32() % 255) - 128;
+        h264d_mc_weight_bi(ours, 16, a, 16, b, 16, 16, 16, d, w0, o0, w1, o1);
         for (int i = 0; i < 256; i++) {
             /* Clause 8.4.2.3.2, written out in its two cases. The shift
              * happens first and the offset is added to the result; the
              * earlier version of this line folded the offset into the
              * rounding term, which is a different number and, being the same
              * mistake the implementation made, agreed with it perfectly. */
-            int atteso;
+            int expected;
             if (d >= 1)
-                atteso = clip255(((a[i] * w0 + b[i] * w1 + (1 << d)) >> (d + 1))
+                expected = clip255(((a[i] * w0 + b[i] * w1 + (1 << d)) >> (d + 1))
                                  + ((o0 + o1 + 1) >> 1));
             else
-                atteso = clip255(a[i] * w0 + b[i] * w1 + ((o0 + o1 + 1) >> 1));
-            if (nostro[i] != atteso) { guasti++; break; }
+                expected = clip255(a[i] * w0 + b[i] * w1 + ((o0 + o1 + 1) >> 1));
+            if (ours[i] != expected) { faults++; break; }
         }
     }
-    return guasti;
+    return faults;
 }
 
 int main(void)
 {
-    printf("1. luma, sedici posizioni a un quarto di campione\n");
-    int gl = prova_luma();
-    if (gl) { printf("   %d blocchi diversi\n", gl); return 1; }
-    printf("   3000 giri x 7 misure x 16 posizioni: identici\n");
+    printf("1. luma, sixteen quarter-sample positions\n");
+    int gl = test_luma();
+    if (gl) { printf("   %d blocks differ\n", gl); return 1; }
+    printf("   3000 rounds x 7 sizes x 16 positions: identical\n");
 
-    printf("2. croma, sessantaquattro posizioni a un ottavo\n");
-    int gc = prova_chroma();
-    if (gc) { printf("   %d blocchi diversi\n", gc); return 1; }
-    printf("   3000 giri x 5 misure x 64 posizioni: identici\n");
+    printf("2. chroma, sixty-four eighth-sample positions\n");
+    int gc = test_chroma();
+    if (gc) { printf("   %d blocks differ\n", gc); return 1; }
+    printf("   3000 rounds x 5 sizes x 64 positions: identical\n");
 
-    printf("3. media e pesi espliciti\n");
-    int gw = prova_combinazione();
-    if (gw) { printf("   %d blocchi diversi\n", gw); return 1; }
-    printf("   20000 giri: identici\n");
+    printf("3. averaging and explicit weights\n");
+    int gw = test_combination();
+    if (gw) { printf("   %d blocks differ\n", gw); return 1; }
+    printf("   20000 rounds: identical\n");
 
     printf("\nOK\n");
     return 0;

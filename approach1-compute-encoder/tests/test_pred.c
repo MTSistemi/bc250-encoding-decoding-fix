@@ -21,13 +21,13 @@
 
 #include "h264_pred.h"
 
-static uint64_t seme = 0x243F6A8885A308D3ull;
-static uint32_t casuale(void)
+static uint64_t seed = 0x243F6A8885A308D3ull;
+static uint32_t random_u32(void)
 {
-    seme ^= seme >> 12;
-    seme ^= seme << 25;
-    seme ^= seme >> 27;
-    return (uint32_t)((seme * 0x2545F4914F6CDD1Dull) >> 32);
+    seed ^= seed >> 12;
+    seed ^= seed << 25;
+    seed ^= seed >> 27;
+    return (uint32_t)((seed * 0x2545F4914F6CDD1Dull) >> 32);
 }
 
 /* ---- the standard, read literally ------------------------------------ */
@@ -36,9 +36,9 @@ typedef struct {
     const uint8_t *t;      /* p[0,-1] .. */
     const uint8_t *l;      /* p[-1,0] .. */
     uint8_t c;             /* p[-1,-1] */
-} rif_t;
+} ref_t;
 
-static int p(const rif_t *r, int x, int y)
+static int p(const ref_t *r, int x, int y)
 {
     if (x == -1 && y == -1) return r->c;
     if (y == -1) return r->t[x];
@@ -47,7 +47,7 @@ static int p(const rif_t *r, int x, int y)
 }
 
 /* clause 8.3.1.2.1 to 8.3.1.2.9 */
-static void letterale4(uint8_t out[16], int mode, const rif_t *r,
+static void letterale4(uint8_t out[16], int mode, const ref_t *r,
                        int avail_top, int avail_left)
 {
     for (int y = 0; y < 4; y++) {
@@ -131,7 +131,7 @@ static void letterale4(uint8_t out[16], int mode, const rif_t *r,
 }
 
 /* clause 8.3.2.2.1, reference sample filtering */
-static void filtra_letterale(const uint8_t t[16], const uint8_t l[8], uint8_t c,
+static void filter_literal(const uint8_t t[16], const uint8_t l[8], uint8_t c,
                              int avail_top, int avail_left, int avail_corner,
                              uint8_t ft[16], uint8_t fl[8], uint8_t *fc)
 {
@@ -159,7 +159,7 @@ static void filtra_letterale(const uint8_t t[16], const uint8_t l[8], uint8_t c,
 }
 
 /* clause 8.3.2.2.2 to 8.3.2.2.10 */
-static void letterale8(uint8_t out[64], int mode, const rif_t *r,
+static void letterale8(uint8_t out[64], int mode, const ref_t *r,
                        int avail_top, int avail_left)
 {
     for (int y = 0; y < 8; y++) {
@@ -249,7 +249,7 @@ static void letterale8(uint8_t out[64], int mode, const rif_t *r,
 
 
 /* clause 8.3.3, Intra_16x16 */
-static void letterale16(uint8_t out[256], int mode, const rif_t *r,
+static void letterale16(uint8_t out[256], int mode, const ref_t *r,
                         int avail_top, int avail_left)
 {
     int H = 0, V = 0, a = 0, b = 0, cc = 0;
@@ -295,7 +295,7 @@ static void letterale16(uint8_t out[256], int mode, const rif_t *r,
 }
 
 /* clause 8.3.4, chroma. Mode numbering is DC, horizontal, vertical, plane. */
-static void letteraleC(uint8_t out[64], int mode, const rif_t *r,
+static void letteraleC(uint8_t out[64], int mode, const ref_t *r,
                        int avail_top, int avail_left)
 {
     int H = 0, V = 0, a = 0, b = 0, cc = 0;
@@ -348,173 +348,173 @@ static void letteraleC(uint8_t out[64], int mode, const rif_t *r,
 
 static int prova16(void)
 {
-    uint8_t t[16], l[16], c, nostro[256], suo[256];
-    int guasti = 0;
-    for (int giro = 0; giro < 20000; giro++) {
-        for (int i = 0; i < 16; i++) { t[i] = (uint8_t)casuale(); l[i] = (uint8_t)casuale(); }
-        c = (uint8_t)casuale();
-        for (int modo = 0; modo < 4; modo++) {
-            for (int disp = (modo == 2 ? 0 : 3); disp <= 3; disp++) {
+    uint8_t t[16], l[16], c, ours[256], its[256];
+    int faults = 0;
+    for (int pass_index = 0; pass_index < 20000; pass_index++) {
+        for (int i = 0; i < 16; i++) { t[i] = (uint8_t)random_u32(); l[i] = (uint8_t)random_u32(); }
+        c = (uint8_t)random_u32();
+        for (int mode = 0; mode < 4; mode++) {
+            for (int disp = (mode == 2 ? 0 : 3); disp <= 3; disp++) {
                 int at = (disp >> 1) & 1, al = disp & 1;
-                rif_t r = { t, l, c };
-                h264d_pred16x16(nostro, 16, modo, t, l, c, at, al);
-                letterale16(suo, modo, &r, at, al);
-                if (memcmp(nostro, suo, 256)) {
-                    if (guasti < 3)
-                        printf("  16x16 modo %d, top=%d left=%d: diversi\n", modo, at, al);
-                    guasti++;
+                ref_t r = { t, l, c };
+                h264d_pred16x16(ours, 16, mode, t, l, c, at, al);
+                letterale16(its, mode, &r, at, al);
+                if (memcmp(ours, its, 256)) {
+                    if (faults < 3)
+                        printf("  16x16 mode %d, top=%d left=%d: differ\n", mode, at, al);
+                    faults++;
                 }
             }
         }
     }
-    return guasti;
+    return faults;
 }
 
 static int provaC(void)
 {
-    uint8_t t[8], l[8], c, nostro[64], suo[64];
-    int guasti = 0;
-    for (int giro = 0; giro < 20000; giro++) {
-        for (int i = 0; i < 8; i++) { t[i] = (uint8_t)casuale(); l[i] = (uint8_t)casuale(); }
-        c = (uint8_t)casuale();
-        for (int modo = 0; modo < 4; modo++) {
-            for (int disp = (modo == 0 ? 0 : 3); disp <= 3; disp++) {
+    uint8_t t[8], l[8], c, ours[64], its[64];
+    int faults = 0;
+    for (int pass_index = 0; pass_index < 20000; pass_index++) {
+        for (int i = 0; i < 8; i++) { t[i] = (uint8_t)random_u32(); l[i] = (uint8_t)random_u32(); }
+        c = (uint8_t)random_u32();
+        for (int mode = 0; mode < 4; mode++) {
+            for (int disp = (mode == 0 ? 0 : 3); disp <= 3; disp++) {
                 int at = (disp >> 1) & 1, al = disp & 1;
-                rif_t r = { t, l, c };
-                h264d_pred_chroma(nostro, 8, modo, t, l, c, at, al);
-                letteraleC(suo, modo, &r, at, al);
-                if (memcmp(nostro, suo, 64)) {
-                    if (guasti < 3) {
-                        printf("  croma modo %d, top=%d left=%d:\n", modo, at, al);
+                ref_t r = { t, l, c };
+                h264d_pred_chroma(ours, 8, mode, t, l, c, at, al);
+                letteraleC(its, mode, &r, at, al);
+                if (memcmp(ours, its, 64)) {
+                    if (faults < 3) {
+                        printf("  chroma mode %d, top=%d left=%d:\n", mode, at, al);
                         for (int y = 0; y < 8; y++) {
                             printf("    ");
                             for (int x = 0; x < 8; x++)
-                                printf("%4d%c", nostro[y*8+x],
-                                       nostro[y*8+x] == suo[y*8+x] ? ' ' : '*');
+                                printf("%4d%c", ours[y*8+x],
+                                       ours[y*8+x] == its[y*8+x] ? ' ' : '*');
                             printf("\n");
                         }
                     }
-                    guasti++;
+                    faults++;
                 }
             }
         }
     }
-    return guasti;
+    return faults;
 }
 
 /* ---- the comparison --------------------------------------------------- */
 
-static const char *nome_modo[9] = {
+static const char *mode_name[9] = {
     "Vertical", "Horizontal", "DC", "Diagonal Down Left", "Diagonal Down Right",
     "Vertical Right", "Horizontal Down", "Vertical Left", "Horizontal Up"
 };
 
 static int prova4(void)
 {
-    uint8_t t[8], l[4], c, nostro[16], suo[16];
-    int guasti = 0;
+    uint8_t t[8], l[4], c, ours[16], its[16];
+    int faults = 0;
 
-    for (int giro = 0; giro < 20000; giro++) {
-        for (int i = 0; i < 8; i++) t[i] = (uint8_t)casuale();
-        for (int i = 0; i < 4; i++) l[i] = (uint8_t)casuale();
-        c = (uint8_t)casuale();
+    for (int pass_index = 0; pass_index < 20000; pass_index++) {
+        for (int i = 0; i < 8; i++) t[i] = (uint8_t)random_u32();
+        for (int i = 0; i < 4; i++) l[i] = (uint8_t)random_u32();
+        c = (uint8_t)random_u32();
         /* The directional modes are only ever chosen when their references
          * exist, so only DC is exercised with a side missing. */
-        for (int modo = 0; modo < 9; modo++) {
-            for (int disp = (modo == 2 ? 0 : 3); disp <= 3; disp++) {
+        for (int mode = 0; mode < 9; mode++) {
+            for (int disp = (mode == 2 ? 0 : 3); disp <= 3; disp++) {
                 int at = (disp >> 1) & 1, al = disp & 1;
-                rif_t r = { t, l, c };
-                h264d_pred4x4(nostro, 4, modo, t, l, c, at, al);
-                letterale4(suo, modo, &r, at, al);
-                if (memcmp(nostro, suo, 16)) {
-                    if (guasti < 6) {
-                        printf("  4x4 modo %d (%s), top=%d left=%d:\n",
-                               modo, nome_modo[modo], at, al);
+                ref_t r = { t, l, c };
+                h264d_pred4x4(ours, 4, mode, t, l, c, at, al);
+                letterale4(its, mode, &r, at, al);
+                if (memcmp(ours, its, 16)) {
+                    if (faults < 6) {
+                        printf("  4x4 mode %d (%s), top=%d left=%d:\n",
+                               mode, mode_name[mode], at, al);
                         for (int y = 0; y < 4; y++) {
                             printf("    ");
                             for (int x = 0; x < 4; x++)
-                                printf("%4d%c", nostro[y*4+x],
-                                       nostro[y*4+x] == suo[y*4+x] ? ' ' : '*');
+                                printf("%4d%c", ours[y*4+x],
+                                       ours[y*4+x] == its[y*4+x] ? ' ' : '*');
                             printf("   norma: ");
-                            for (int x = 0; x < 4; x++) printf("%4d", suo[y*4+x]);
+                            for (int x = 0; x < 4; x++) printf("%4d", its[y*4+x]);
                             printf("\n");
                         }
                     }
-                    guasti++;
+                    faults++;
                 }
             }
         }
     }
-    return guasti;
+    return faults;
 }
 
 static int prova8(void)
 {
-    uint8_t t[16], l[8], c, nostro[64], suo[64];
-    int guasti = 0;
+    uint8_t t[16], l[8], c, ours[64], its[64];
+    int faults = 0;
 
-    for (int giro = 0; giro < 20000; giro++) {
-        for (int i = 0; i < 16; i++) t[i] = (uint8_t)casuale();
-        for (int i = 0; i < 8; i++) l[i] = (uint8_t)casuale();
-        c = (uint8_t)casuale();
-        int top_right = (int)(casuale() & 1);
+    for (int pass_index = 0; pass_index < 20000; pass_index++) {
+        for (int i = 0; i < 16; i++) t[i] = (uint8_t)random_u32();
+        for (int i = 0; i < 8; i++) l[i] = (uint8_t)random_u32();
+        c = (uint8_t)random_u32();
+        int top_right = (int)(random_u32() & 1);
 
         uint8_t tt[16];
         memcpy(tt, t, 16);
         if (!top_right) memset(tt + 8, tt[7], 8);
 
-        for (int modo = 0; modo < 9; modo++) {
-            for (int disp = (modo == 2 ? 0 : 3); disp <= 3; disp++) {
+        for (int mode = 0; mode < 9; mode++) {
+            for (int disp = (mode == 2 ? 0 : 3); disp <= 3; disp++) {
                 int at = (disp >> 1) & 1, al = disp & 1;
                 int ac = at && al;   /* the corner exists when both do */
 
                 uint8_t ft[16], fl[8], fc;
-                filtra_letterale(tt, l, c, at, al, ac, ft, fl, &fc);
-                rif_t r = { ft, fl, fc };
+                filter_literal(tt, l, c, at, al, ac, ft, fl, &fc);
+                ref_t r = { ft, fl, fc };
 
-                h264d_pred8x8_luma(nostro, 8, modo, t, l, c, at, al, ac, top_right);
-                letterale8(suo, modo, &r, at, al);
-                if (memcmp(nostro, suo, 64)) {
-                    if (guasti < 4) {
-                        printf("  8x8 modo %d (%s), top=%d left=%d top-right=%d:\n",
-                               modo, nome_modo[modo], at, al, top_right);
+                h264d_pred8x8_luma(ours, 8, mode, t, l, c, at, al, ac, top_right);
+                letterale8(its, mode, &r, at, al);
+                if (memcmp(ours, its, 64)) {
+                    if (faults < 4) {
+                        printf("  8x8 mode %d (%s), top=%d left=%d top-right=%d:\n",
+                               mode, mode_name[mode], at, al, top_right);
                         for (int y = 0; y < 8; y++) {
                             printf("    ");
                             for (int x = 0; x < 8; x++)
-                                printf("%4d%c", nostro[y*8+x],
-                                       nostro[y*8+x] == suo[y*8+x] ? ' ' : '*');
+                                printf("%4d%c", ours[y*8+x],
+                                       ours[y*8+x] == its[y*8+x] ? ' ' : '*');
                             printf("\n");
                         }
                     }
-                    guasti++;
+                    faults++;
                 }
             }
         }
     }
-    return guasti;
+    return faults;
 }
 
 int main(void)
 {
-    printf("1. Intra_4x4, nove modi contro la norma letterale\n");
+    printf("1. Intra_4x4, nine modes against the literal standard\n");
     int g4 = prova4();
-    if (g4) { printf("   %d blocchi diversi\n", g4); return 1; }
-    printf("   20000 giri x 9 modi: identici\n");
+    if (g4) { printf("   %d blocks differ\n", g4); return 1; }
+    printf("   20000 rounds x 9 modes: identical\n");
 
-    printf("2. Intra_8x8, nove modi piu' il filtro dei riferimenti\n");
+    printf("2. Intra_8x8, nine modes plus the reference filter\n");
     int g8 = prova8();
-    if (g8) { printf("   %d blocchi diversi\n", g8); return 1; }
-    printf("   20000 giri x 9 modi: identici\n");
+    if (g8) { printf("   %d blocks differ\n", g8); return 1; }
+    printf("   20000 rounds x 9 modes: identical\n");
 
-    printf("3. Intra_16x16, quattro modi\n");
+    printf("3. Intra_16x16, four modes\n");
     int g16 = prova16();
-    if (g16) { printf("   %d blocchi diversi\n", g16); return 1; }
-    printf("   20000 giri x 4 modi: identici\n");
+    if (g16) { printf("   %d blocks differ\n", g16); return 1; }
+    printf("   20000 rounds x 4 modes: identical\n");
 
-    printf("4. croma 8x8, quattro modi\n");
+    printf("4. chroma 8x8, four modes\n");
     int gc = provaC();
-    if (gc) { printf("   %d blocchi diversi\n", gc); return 1; }
-    printf("   20000 giri x 4 modi: identici\n");
+    if (gc) { printf("   %d blocks differ\n", gc); return 1; }
+    printf("   20000 rounds x 4 modes: identical\n");
 
     printf("\nOK\n");
     return 0;

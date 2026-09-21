@@ -225,22 +225,22 @@ void h264d_pred_chroma(uint8_t *dst, int stride, int mode,
          * than averaging both. */
         for (int qy = 0; qy < 2; qy++) {
             for (int qx = 0; qx < 2; qx++) {
-                int sopra = 0, sinistra = 0;
+                int above = 0, left = 0;
                 for (int i = 0; i < 4; i++) {
-                    sopra += t[qx * 4 + i];
-                    sinistra += l[qy * 4 + i];
+                    above += t[qx * 4 + i];
+                    left += l[qy * 4 + i];
                 }
-                bool solo_sopra = (qx == 1 && qy == 0);
-                bool solo_sinistra = (qx == 0 && qy == 1);
+                bool above_only = (qx == 1 && qy == 0);
+                bool left_only = (qx == 0 && qy == 1);
                 int v;
                 if (avail_top && avail_left) {
-                    if (solo_sopra)         v = (sopra + 2) >> 2;
-                    else if (solo_sinistra) v = (sinistra + 2) >> 2;
-                    else                    v = (sopra + sinistra + 4) >> 3;
+                    if (above_only)         v = (above + 2) >> 2;
+                    else if (left_only) v = (left + 2) >> 2;
+                    else                    v = (above + left + 4) >> 3;
                 } else if (avail_top) {
-                    v = (sopra + 2) >> 2;
+                    v = (above + 2) >> 2;
                 } else if (avail_left) {
-                    v = (sinistra + 2) >> 2;
+                    v = (left + 2) >> 2;
                 } else {
                     v = 128;
                 }
@@ -290,7 +290,7 @@ void h264d_pred_chroma(uint8_t *dst, int stride, int mode,
  * and the filtering itself depends on which neighbours exist: the two ends of
  * each run are handled differently from the middle, and the corner is only
  * filtered across both runs when both of them are there. */
-static void filtra(const uint8_t t[16], const uint8_t l[8], uint8_t c,
+static void filter_edge(const uint8_t t[16], const uint8_t l[8], uint8_t c,
                    bool avail_top, bool avail_left, bool avail_corner,
                    uint8_t ft[16], uint8_t fl[8], uint8_t *fc)
 {
@@ -336,7 +336,7 @@ void h264d_pred8x8_luma(uint8_t *dst, int stride, int mode,
     uint8_t ft[16], fl[8], fc = c_in;
     memcpy(ft, t, 16);
     memcpy(fl, l, 8);
-    filtra(t, l, c_in, avail_top, avail_left, avail_corner, ft, fl, &fc);
+    filter_edge(t, l, c_in, avail_top, avail_left, avail_corner, ft, fl, &fc);
 
     uint8_t r[25];
     for (int i = 0; i < 8; i++)

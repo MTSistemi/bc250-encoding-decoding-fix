@@ -35,78 +35,78 @@ import sys
 TAG = "n8.1.2"
 
 
-def spoglia(testo):
+def strip(text):
     """Strip C comments, which otherwise contribute digits to the scan."""
-    testo = re.sub(r"/\*.*?\*/", " ", testo, flags=re.S)
-    testo = re.sub(r"//[^\n]*", " ", testo)
-    return testo
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", " ", text)
+    return text
 
 
-def blocco(testo, nome):
-    """The balanced-brace initialiser of the array called `nome`."""
-    i = testo.find(nome)
+def block(text, nome):
+    """The balanced-brace initialiser of the array called `name`."""
+    i = text.find(nome)
     if i < 0:
-        raise SystemExit("non trovo la tabella %s" % nome)
-    i = testo.find("{", i)
+        raise SystemExit("non found la table %s" % nome)
+    i = text.find("{", i)
     if i < 0:
-        raise SystemExit("%s: non trovo la graffa" % nome)
+        raise SystemExit("%s: non found la graffa" % nome)
     liv = 0
-    for j in range(i, len(testo)):
-        if testo[j] == "{":
+    for j in range(i, len(text)):
+        if text[j] == "{":
             liv += 1
-        elif testo[j] == "}":
+        elif text[j] == "}":
             liv -= 1
             if liv == 0:
-                return testo[i:j + 1]
-    raise SystemExit("%s: graffe non bilanciate" % nome)
+                return text[i:j + 1]
+    raise SystemExit("%s: braces non bilanciate" % nome)
 
 
-def numeri(testo):
+def numbers(text):
     """Every integer in a flat initialiser, in order."""
-    return [int(x) for x in re.findall(r"-?\d+", testo)]
+    return [int(x) for x in re.findall(r"-?\d+", text)]
 
 
-def righe(testo):
+def lines(text):
     """A ragged initialiser, row by row: what is inside each inner brace."""
-    dentro = testo.strip()
-    assert dentro.startswith("{") and dentro.endswith("}")
-    dentro = dentro[1:-1]
-    fuori, liv, pezzo = [], 0, []
-    for ch in dentro:
+    inside = text.strip()
+    assert inside.startswith("{") and inside.endswith("}")
+    inside = inside[1:-1]
+    out_values, liv, chunk = [], 0, []
+    for ch in inside:
         if ch == "{":
             liv += 1
             if liv == 1:
-                pezzo = []
+                chunk = []
                 continue
         elif ch == "}":
             liv -= 1
             if liv == 0:
-                fuori.append(numeri("".join(pezzo)))
+                out_values.append(numbers("".join(chunk)))
                 continue
         if liv >= 1:
-            pezzo.append(ch)
-    return fuori
+            chunk.append(ch)
+    return out_values
 
 
 # ------------------------------------------------------- the context list
 
-def elementi(cabac):
+def elements(cabac):
     """The syntax elements and how many contexts each has, from the
     CABAC_ELEMS macro: the offsets are a running total of those."""
     i = cabac.find("#define CABAC_ELEMS(ELEM)")
     if i < 0:
-        raise SystemExit("non trovo CABAC_ELEMS")
+        raise SystemExit("non found CABAC_ELEMS")
     j = cabac.find("/**", i)
-    corpo = cabac[i:j]
-    fuori = []
-    for nome, quanti in re.findall(r"ELEM\((\w+),\s*(\d+)\)", corpo):
-        fuori.append((nome, int(quanti)))
-    if not fuori:
-        raise SystemExit("CABAC_ELEMS vuoto")
-    return fuori
+    body = cabac[i:j]
+    out_values = []
+    for nome, howmany in re.findall(r"ELEM\((\w+),\s*(\d+)\)", body):
+        out_values.append((nome, int(howmany)))
+    if not out_values:
+        raise SystemExit("CABAC_ELEMS empty")
+    return out_values
 
 
-def stati(init_value, qp):
+def states(init_value, qp):
     """Clause 9.3.2.2, then packed the way the engine reads it."""
     m = (init_value >> 4) * 5 - 45
     n = ((init_value & 15) << 3) - 16
@@ -118,37 +118,37 @@ def stati(init_value, qp):
 
 # ------------------------------------------------------------- emitting
 
-def riempi(mat, larghezza):
-    """Pad every row to `larghezza`.
+def fill(mat, width):
+    """Pad every row to `width`.
 
     C fills the rest of a short initialiser with zeros, and FFmpeg writes
     the unfiltered position of both interpolation filters as a bare
     `{ 0 }`. Reading the rows back without padding them makes the array one
     column wide and shifts everything that follows.
     """
-    return [(r + [0] * larghezza)[:larghezza] for r in mat]
+    return [(r + [0] * width)[:width] for r in mat]
 
 
-def uno(nome, tipo, valori, per_riga=16):
-    fuori = ["const %s %s[%d] = {" % (tipo, nome, len(valori))]
-    for i in range(0, len(valori), per_riga):
-        fuori.append("    " + ", ".join("%d" % v for v in valori[i:i + per_riga]) + ",")
-    fuori.append("};")
-    return "\n".join(fuori)
+def uno(nome, kind, values, per_riga=16):
+    out_values = ["const %s %s[%d] = {" % (kind, nome, len(values))]
+    for i in range(0, len(values), per_riga):
+        out_values.append("    " + ", ".join("%d" % v for v in values[i:i + per_riga]) + ",")
+    out_values.append("};")
+    return "\n".join(out_values)
 
 
-def due(nome, tipo, mat, per_riga=16):
-    fuori = ["const %s %s[%d][%d] = {" % (tipo, nome, len(mat), len(mat[0]))]
+def due(nome, kind, mat, per_riga=16):
+    out_values = ["const %s %s[%d][%d] = {" % (kind, nome, len(mat), len(mat[0]))]
     for r in mat:
         if len(r) <= per_riga:
-            fuori.append("    { " + ", ".join("%d" % v for v in r) + " },")
+            out_values.append("    { " + ", ".join("%d" % v for v in r) + " },")
         else:
-            fuori.append("    {")
+            out_values.append("    {")
             for i in range(0, len(r), per_riga):
-                fuori.append("        " + ", ".join("%d" % v for v in r[i:i + per_riga]) + ",")
-            fuori.append("    },")
-    fuori.append("};")
-    return "\n".join(fuori)
+                out_values.append("        " + ", ".join("%d" % v for v in r[i:i + per_riga]) + ",")
+            out_values.append("    },")
+    out_values.append("};")
+    return "\n".join(out_values)
 
 
 INTESTAZIONE = """/*
@@ -170,82 +170,82 @@ def main():
     rif = pathlib.Path(sys.argv[1])
     out = pathlib.Path(sys.argv[2])
 
-    cabac = spoglia((rif / "cabac.c").read_text(encoding="utf-8", errors="replace"))
+    cabac = strip((rif / "cabac.c").read_text(encoding="utf-8", errors="replace"))
     # ⚠️ The initialisation table writes 154 as CNU, "context not used".
     # It is a number like any other once the macro is gone, and without
     # this a fifth of the table quietly goes missing.
     cnu = re.search(r"#define\s+CNU\s+(\d+)", cabac)
     if not cnu:
-        raise SystemExit("non trovo la definizione di CNU")
+        raise SystemExit("non found la definition di CNU")
     cabac = re.sub(r"\bCNU\b", cnu.group(1), cabac)
     cabac_raw = (rif / "cabac.c").read_text(encoding="utf-8", errors="replace")
-    data = spoglia((rif / "data.c").read_text(encoding="utf-8", errors="replace"))
-    filt = spoglia((rif / "filter.c").read_text(encoding="utf-8", errors="replace"))
-    dsp = spoglia((rif / "dsp.c").read_text(encoding="utf-8", errors="replace"))
-    pred = spoglia((rif / "pred_template.c").read_text(encoding="utf-8", errors="replace"))
+    data = strip((rif / "data.c").read_text(encoding="utf-8", errors="replace"))
+    filt = strip((rif / "filter.c").read_text(encoding="utf-8", errors="replace"))
+    dsp = strip((rif / "dsp.c").read_text(encoding="utf-8", errors="replace"))
+    pred = strip((rif / "pred_template.c").read_text(encoding="utf-8", errors="replace"))
 
     # --- the contexts ------------------------------------------------
-    elenco = elementi(cabac_raw)
+    listing = elements(cabac_raw)
     offset, tot = [], 0
-    for nome, quanti in elenco:
+    for nome, howmany in listing:
         offset.append((nome, tot))
-        tot += quanti
+        tot += howmany
     # ⚠️ An element with no contexts of its own - one that is coded in
     # bypass - does not advance the offset. FFmpeg's enum spells that as
     # END = OFFSET + NUM_BINS - 1, so with NUM_BINS zero the next element
     # starts where this one did, and several of them share an index.
-    init = righe(blocco(cabac, "init_values[3][HEVC_CONTEXTS]"))
+    init = lines(block(cabac, "init_values[3][HEVC_CONTEXTS]"))
     n_ctx = len(init[0])
     if tot != n_ctx:
-        raise SystemExit("offset %d contro %d contesti" % (tot, n_ctx))
+        raise SystemExit("offset %d against %d contexts" % (tot, n_ctx))
     for r in init:
         if len(r) != n_ctx:
-            raise SystemExit("init_values: righe di lunghezza diversa")
+            raise SystemExit("init_values: lines di length different")
 
     # Every state, for every QP: the decoder indexes this directly instead
     # of doing the arithmetic at every slice header.
-    tabella = [[stati(init[t][i], qp) for i in range(n_ctx)]
+    table = [[states(init[t][i], qp) for i in range(n_ctx)]
                for t in range(3) for qp in range(52)]
 
     # --- everything else ---------------------------------------------
-    def piatta(testo, nome):
-        return numeri(blocco(testo, nome))
+    def flat(text, nome):
+        return numbers(block(text, nome))
 
-    diag4_x = piatta(data, "ff_hevc_diag_scan4x4_x")
-    diag4_y = piatta(data, "ff_hevc_diag_scan4x4_y")
-    diag8_x = piatta(data, "ff_hevc_diag_scan8x8_x")
-    diag8_y = piatta(data, "ff_hevc_diag_scan8x8_y")
+    diag4_x = flat(data, "ff_hevc_diag_scan4x4_x")
+    diag4_y = flat(data, "ff_hevc_diag_scan4x4_y")
+    diag8_x = flat(data, "ff_hevc_diag_scan8x8_x")
+    diag8_y = flat(data, "ff_hevc_diag_scan8x8_y")
 
-    diag2_x = piatta(cabac, "diag_scan2x2_x")
-    diag2_y = piatta(cabac, "diag_scan2x2_y")
-    horiz2_x = piatta(cabac, "horiz_scan2x2_x")
-    horiz2_y = piatta(cabac, "horiz_scan2x2_y")
-    horiz4_x = piatta(cabac, "horiz_scan4x4_x")
-    horiz4_y = piatta(cabac, "horiz_scan4x4_y")
+    diag2_x = flat(cabac, "diag_scan2x2_x")
+    diag2_y = flat(cabac, "diag_scan2x2_y")
+    horiz2_x = flat(cabac, "horiz_scan2x2_x")
+    horiz2_y = flat(cabac, "horiz_scan2x2_y")
+    horiz4_x = flat(cabac, "horiz_scan4x4_x")
+    horiz4_y = flat(cabac, "horiz_scan4x4_y")
 
-    diag2_inv = righe(blocco(cabac, "diag_scan2x2_inv[2][2]"))
-    diag4_inv = righe(blocco(cabac, "diag_scan4x4_inv[4][4]"))
-    diag8_inv = righe(blocco(cabac, "diag_scan8x8_inv[8][8]"))
-    horiz8_inv = righe(blocco(cabac, "horiz_scan8x8_inv[8][8]"))
+    diag2_inv = lines(block(cabac, "diag_scan2x2_inv[2][2]"))
+    diag4_inv = lines(block(cabac, "diag_scan4x4_inv[4][4]"))
+    diag8_inv = lines(block(cabac, "diag_scan8x8_inv[8][8]"))
+    horiz8_inv = lines(block(cabac, "horiz_scan8x8_inv[8][8]"))
 
-    level_scale = piatta(cabac, "level_scale[]")
-    ctx_idx_map = piatta(cabac, "ctx_idx_map[]")
+    level_scale = flat(cabac, "level_scale[]")
+    ctx_idx_map = flat(cabac, "ctx_idx_map[]")
 
-    tc = piatta(filt, "tctable[54]")
-    beta = piatta(filt, "betatable[52]")
-    sao_tab = piatta(filt, "sao_tab[8]")
-    qp_c = piatta(filt, "qp_c[]")
+    tc = flat(filt, "tctable[54]")
+    beta = flat(filt, "betatable[52]")
+    sao_tab = flat(filt, "sao_tab[8]")
+    qp_c = flat(filt, "qp_c[]")
 
-    epel = righe(blocco(dsp, "ff_hevc_epel_filters)[8][4]"))
-    qpel = righe(blocco(dsp, "ff_hevc_qpel_filters)[4][16]"))
+    epel = lines(block(dsp, "ff_hevc_epel_filters)[8][4]"))
+    qpel = lines(block(dsp, "ff_hevc_qpel_filters)[4][16]"))
 
-    angolo = piatta(pred, "intra_pred_angle[]")
-    inv_angolo = piatta(pred, "inv_angle[]")
+    angle = flat(pred, "intra_pred_angle[]")
+    inv_angle_values = flat(pred, "inv_angle[]")
 
     # The DCT-II matrix of clause 8.6.4.2. One 32x32 table holds all four
     # sizes: the 16-point transform is its even rows, the 8-point the even
     # rows of those, and so on, which is why the standard writes only one.
-    dct = righe(blocco(dsp, "transform[32][32]"))
+    dct = lines(block(dsp, "transform[32][32]"))
 
     # --- the header ---------------------------------------------------
     h = [INTESTAZIONE % ("hevc_dec_tables.h", TAG),
@@ -281,15 +281,15 @@ def main():
     h.append("extern const int8_t hevcd_epel[%d][%d];" % (len(epel), 4))
     h.append("extern const int8_t hevcd_qpel[%d][%d];" % (len(qpel), 8))
     h.append("extern const int8_t hevcd_dct[%d][%d];" % (len(dct), len(dct[0])))
-    h.append("extern const int16_t hevcd_intra_angle[%d];" % len(angolo))
-    h.append("extern const int16_t hevcd_inv_angle[%d];" % len(inv_angolo))
+    h.append("extern const int16_t hevcd_intra_angle[%d];" % len(angle))
+    h.append("extern const int16_t hevcd_inv_angle[%d];" % len(inv_angle_values))
     h.append("")
     h.append("#endif /* BC250_HEVC_DEC_TABLES_H */")
 
     # --- the source ---------------------------------------------------
     c = [INTESTAZIONE % ("hevc_dec_tables.c", TAG),
          '#include "hevc_dec_tables.h"', ""]
-    c.append(due("hevcd_ctx_init", "uint8_t", tabella, 24))
+    c.append(due("hevcd_ctx_init", "uint8_t", table, 24))
     c.append("")
     for nome, v in (("hevcd_diag4_x", diag4_x), ("hevcd_diag4_y", diag4_y),
                     ("hevcd_diag8_x", diag8_x), ("hevcd_diag8_y", diag8_y),
@@ -309,22 +309,22 @@ def main():
     # ⚠️ FFmpeg keeps the eight-tap filters in rows of sixteen, the taps
     # followed by eight zeros for its own SIMD. Only the taps are the
     # table, and the unfiltered row is written as a bare zero.
-    c.append(due("hevcd_qpel", "int8_t", riempi(qpel, 8), 8))
+    c.append(due("hevcd_qpel", "int8_t", fill(qpel, 8), 8))
     c.append("")
-    c.append(due("hevcd_epel", "int8_t", riempi(epel, 4), 4))
+    c.append(due("hevcd_epel", "int8_t", fill(epel, 4), 4))
     c.append("")
     c.append(due("hevcd_dct", "int8_t", dct, 16))
     c.append("")
-    c.append(uno("hevcd_intra_angle", "int16_t", angolo))
+    c.append(uno("hevcd_intra_angle", "int16_t", angle))
     c.append("")
-    c.append(uno("hevcd_inv_angle", "int16_t", inv_angolo))
+    c.append(uno("hevcd_inv_angle", "int16_t", inv_angle_values))
 
     (out / "hevc_dec_tables.h").write_text("\n".join(h) + "\n",
                                            encoding="utf-8", newline="")
     (out / "hevc_dec_tables.c").write_text("\n".join(c) + "\n",
                                            encoding="utf-8", newline="")
-    print("%d contesti, %d elementi di sintassi" % (n_ctx, len(elenco)))
-    print("scritti hevc_dec_tables.c e .h in %s" % out)
+    print("%d contexts, %d elements di syntax" % (n_ctx, len(listing)))
+    print("written_files hevc_dec_tables.c e .h in %s" % out)
     return 0
 
 

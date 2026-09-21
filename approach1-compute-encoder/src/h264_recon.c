@@ -41,9 +41,9 @@ static inline int classe4(int n)
  * of a raster position depends only on (row mod 4, column mod 4). */
 static inline int classe8(int n)
 {
-    int riga = (n >> 3) & 3;
-    int colonna = n & 3;
-    return h264d_dequant8_init_scan[riga * 4 + colonna];
+    int row = (n >> 3) & 3;
+    int column = n & 3;
+    return h264d_dequant8_init_scan[row * 4 + column];
 }
 
 void h264d_dequant_build(h264d_dequant_t *dq, int qp,
@@ -54,13 +54,13 @@ void h264d_dequant_build(h264d_dequant_t *dq, int qp,
      * is an exact left shift; below that the transform has to round, so the
      * factor is left unshifted and the rounding happens per coefficient. */
     const int q6 = qp % 6;
-    for (int lista = 0; lista < 6; lista++) {
+    for (int list_idx = 0; list_idx < 6; list_idx++) {
         for (int n = 0; n < 16; n++)
-            dq->d4[lista][n] = (int32_t)h264d_dequant4_init[q6][classe4(n)]
-                             * (int32_t)scaling4[lista][n];
+            dq->d4[list_idx][n] = (int32_t)h264d_dequant4_init[q6][classe4(n)]
+                             * (int32_t)scaling4[list_idx][n];
         for (int n = 0; n < 64; n++)
-            dq->d8[lista][n] = (int32_t)h264d_dequant8_init[q6][classe8(n)]
-                             * (int32_t)scaling8[lista][n];
+            dq->d8[list_idx][n] = (int32_t)h264d_dequant8_init[q6][classe8(n)]
+                             * (int32_t)scaling8[list_idx][n];
     }
     dq->qp = qp;
     dq->valid = 1;
@@ -71,31 +71,31 @@ void h264d_dequant_build_all(h264d_dequant_set_t *set,
                              const uint8_t scaling8[6][64])
 {
     for (int r = 0; r < 6; r++)
-        h264d_dequant_build(&set->per_resto[r], r, scaling4, scaling8);
+        h264d_dequant_build(&set->per_rest[r], r, scaling4, scaling8);
     set->valid = 1;
 }
 
 /* 8.5.12.1. Returns the scaled coefficient. */
-static inline int scala4(int c, int32_t fattore, int qp)
+static inline int scale4(int c, int32_t factor, int qp)
 {
     int per = qp / 6;
     if (per >= 4)
-        return (c * fattore) * (1 << (per - 4));
-    return (c * fattore + (1 << (3 - per))) >> (4 - per);
+        return (c * factor) * (1 << (per - 4));
+    return (c * factor + (1 << (3 - per))) >> (4 - per);
 }
 
-static inline int scala8(int c, int32_t fattore, int qp)
+static inline int scale8(int c, int32_t factor, int qp)
 {
     int per = qp / 6;
     if (per >= 6)
-        return (c * fattore) * (1 << (per - 6));
-    return (c * fattore + (1 << (5 - per))) >> (6 - per);
+        return (c * factor) * (1 << (per - 6));
+    return (c * factor + (1 << (5 - per))) >> (6 - per);
 }
 
 /* 8.5.12.2, the 4x4 inverse transform. One dimension at a time; the
  * butterflies are the standard's, written out rather than looped so the
  * shifts stay visible. */
-static inline void idct4_righe(int32_t t[16])
+static inline void idct4_rows(int32_t t[16])
 {
     for (int i = 0; i < 4; i++) {
         int32_t *d = t + i * 4;
@@ -116,11 +116,11 @@ void h264d_idct4_add(uint8_t *dst, int stride, int16_t block[16],
     int32_t t[16];
 
     t[0] = dc_pronto ? block[0]
-                     : (block[0] ? scala4(block[0], dequant[0], qp) : 0);
+                     : (block[0] ? scale4(block[0], dequant[0], qp) : 0);
     for (int n = 1; n < 16; n++)
-        t[n] = block[n] ? scala4(block[n], dequant[n], qp) : 0;
+        t[n] = block[n] ? scale4(block[n], dequant[n], qp) : 0;
 
-    idct4_righe(t);
+    idct4_rows(t);
 
     for (int i = 0; i < 4; i++) {
         int32_t d0 = t[i], d1 = t[i + 4], d2 = t[i + 8], d3 = t[i + 12];
@@ -155,9 +155,9 @@ void h264d_idct4_dc_add(uint8_t *dst, int stride, int dc)
 }
 
 /* 8.5.13.2, the 8x8 inverse transform. */
-static inline void idct8_una_dimensione(int32_t d[8], int passo)
+static inline void idct8_one_dimension(int32_t d[8], int stride)
 {
-#define D(i) d[(i) * passo]
+#define D(i) d[(i) * stride]
     int32_t a0 = D(0) + D(4);
     int32_t a2 = D(0) - D(4);
     int32_t a4 = (D(2) >> 1) - D(6);
@@ -194,12 +194,12 @@ void h264d_idct8_add(uint8_t *dst, int stride, int16_t block[64],
 {
     int32_t t[64];
     for (int n = 0; n < 64; n++)
-        t[n] = block[n] ? scala8(block[n], dequant[n], qp) : 0;
+        t[n] = block[n] ? scale8(block[n], dequant[n], qp) : 0;
 
     for (int i = 0; i < 8; i++)
-        idct8_una_dimensione(t + i * 8, 1);
+        idct8_one_dimension(t + i * 8, 1);
     for (int i = 0; i < 8; i++)
-        idct8_una_dimensione(t + i, 8);
+        idct8_one_dimension(t + i, 8);
 
     for (int y = 0; y < 8; y++) {
         uint8_t *r = dst + y * stride;

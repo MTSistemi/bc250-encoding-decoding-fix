@@ -85,16 +85,16 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
-    const int quanti = decodificabile ? 2 : 1;
+    const int count = decodificabile ? 2 : 1;
 
     if (!entrypoint_list) {
-        *num_entrypoints = quanti;
+        *num_entrypoints = count;
         return VA_STATUS_SUCCESS;
     }
 
     entrypoint_list[0] = VAEntrypointEncSlice;
     if (decodificabile) entrypoint_list[1] = VAEntrypointVLD;
-    *num_entrypoints = quanti;
+    *num_entrypoints = count;
     return VA_STATUS_SUCCESS;
 }
 
@@ -1099,7 +1099,7 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
     bc250_surface *surf = &data->surfaces[c->current_render_target];
 
     if (c->h265_dec) {
-        VASurfaceID bersaglio = c->current_render_target;
+        VASurfaceID target = c->current_render_target;
         gpu_image_t img = surf->image;
         gpu_memory_t memo = surf->memory;
         surf->ref_count++;
@@ -1108,9 +1108,9 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
         VAStatus st = bc250_hevc_dec_decode(c, img, memo);
 
         DRIVER_LOCK(data);
-        bc250_surface_unref(data, bersaglio);
-        if (VALID_ID(bersaglio, MAX_SURFACES) && data->surfaces[bersaglio].allocated)
-            data->surfaces[bersaglio].image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+        bc250_surface_unref(data, target);
+        if (VALID_ID(target, MAX_SURFACES) && data->surfaces[target].allocated)
+            data->surfaces[target].image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
         DRIVER_UNLOCK(data);
         return st;
     }
@@ -1118,7 +1118,7 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
     if (c->h264_dec) {
         /* Same shape as the synchronous encode below: pin the surface, drop
          * the lock for the milliseconds of CPU work, take it back. */
-        VASurfaceID bersaglio = c->current_render_target;
+        VASurfaceID target = c->current_render_target;
         gpu_image_t img = surf->image;
         gpu_memory_t memo = surf->memory;
         surf->ref_count++;
@@ -1127,9 +1127,9 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
         VAStatus st = bc250_dec_decode(c, img, memo);
 
         DRIVER_LOCK(data);
-        bc250_surface_unref(data, bersaglio);
-        if (VALID_ID(bersaglio, MAX_SURFACES) && data->surfaces[bersaglio].allocated)
-            data->surfaces[bersaglio].image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+        bc250_surface_unref(data, target);
+        if (VALID_ID(target, MAX_SURFACES) && data->surfaces[target].allocated)
+            data->surfaces[target].image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
         DRIVER_UNLOCK(data);
         return st;
     }

@@ -30,7 +30,7 @@ typedef struct {
  * the qp they are given. So this is rebuilt when the scaling lists change
  * and at no other time. */
 typedef struct {
-    h264d_dequant_t per_resto[6];
+    h264d_dequant_t per_rest[6];
     int valid;
 } h264d_dequant_set_t;
 

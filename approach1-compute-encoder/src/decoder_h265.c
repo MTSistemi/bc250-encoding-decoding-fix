@@ -16,34 +16,34 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define QUANTE_IMG 20
+#define IMG_SLOTS 20
 
 struct hevc_decoder {
     hevcd_t d;
-    hevcd_img_t buffer[QUANTE_IMG];
-    uintptr_t nome[QUANTE_IMG];      /* what the caller calls each picture */
+    hevcd_img_t buffer[IMG_SLOTS];
+    uintptr_t nome[IMG_SLOTS];      /* what the caller calls each picture */
     void *gpu;
     int width, height;
     hevc_sps_t sps;
     hevc_pps_t pps;
-    hevc_slice_t ultima;
-    bool aperta;
+    hevc_slice_t last_one;
+    bool is_open;
 };
 
-static void libera_img(hevcd_img_t *g)
+static void free_img(hevcd_img_t *g)
 {
-    for (int i = 0; i < 3; i++) { free(g->piano[i]); g->piano[i] = NULL; }
+    for (int i = 0; i < 3; i++) { free(g->plane[i]); g->plane[i] = NULL; }
     free(g->mvf);
     g->mvf = NULL;
     g->n_piano = 0;
     g->n_mvf = 0;
-    g->valida = false;
+    g->is_valid = false;
 }
 
-static hevcd_img_t *trova_img(const hevcd_t *d, int poc)
+static hevcd_img_t *find_img(const hevcd_t *d, int poc)
 {
     for (int i = 0; i < d->n_buf; i++)
-        if (d->buf[i].valida && d->buf[i].poc == poc) return &d->buf[i];
+        if (d->buf[i].is_valid && d->buf[i].poc == poc) return &d->buf[i];
     return NULL;
 }
 
@@ -51,38 +51,38 @@ static hevcd_img_t *trova_img(const hevcd_t *d, int poc)
 static void sfoltisci(hevcd_t *d, const hevc_slice_t *sl)
 {
     if (sl->nal_type == HEVC_NAL_IDR_W_RADL || sl->nal_type == HEVC_NAL_IDR_N_LP) {
-        for (int i = 0; i < d->n_buf; i++) d->buf[i].valida = false;
+        for (int i = 0; i < d->n_buf; i++) d->buf[i].is_valid = false;
         return;
     }
     const hevc_st_rps_t *r = &sl->st_rps;
-    const int quanti = r->num_negative + r->num_positive;
+    const int count = r->num_negative + r->num_positive;
     for (int i = 0; i < d->n_buf; i++) {
-        if (!d->buf[i].valida) continue;
+        if (!d->buf[i].is_valid) continue;
         bool serve = false;
-        for (int k = 0; k < quanti && !serve; k++)
+        for (int k = 0; k < count && !serve; k++)
             if (d->buf[i].poc == sl->poc + r->delta_poc[k]) serve = true;
-        if (!serve) d->buf[i].valida = false;
+        if (!serve) d->buf[i].is_valid = false;
     }
 }
 
 /* The three planes of one picture at the coded size, and the motion field
  * a later picture will read for its temporal candidate. The visible size
  * is smaller and is applied when writing out. */
-static int apri_immagine(hevcd_t *d, const hevc_sps_t *sps, int poc)
+static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
 {
     const int w = sps->width, h = sps->height;
     const size_t n_mvf = (size_t)(w >> 2) * (h >> 2);
 
     hevcd_img_t *g = NULL;
     for (int i = 0; i < d->n_buf && !g; i++)
-        if (!d->buf[i].valida) g = &d->buf[i];
+        if (!d->buf[i].is_valid) g = &d->buf[i];
     if (!g) return -1;
 
     if (g->n_piano != (size_t)w * h) {
-        libera_img(g);
-        g->piano[0] = malloc((size_t)w * h);
-        g->piano[1] = malloc((size_t)(w / 2) * (h / 2));
-        g->piano[2] = malloc((size_t)(w / 2) * (h / 2));
+        free_img(g);
+        g->plane[0] = malloc((size_t)w * h);
+        g->plane[1] = malloc((size_t)(w / 2) * (h / 2));
+        g->plane[2] = malloc((size_t)(w / 2) * (h / 2));
         g->n_piano = (size_t)w * h;
     }
     if (g->n_mvf != n_mvf) {
@@ -90,18 +90,18 @@ static int apri_immagine(hevcd_t *d, const hevc_sps_t *sps, int poc)
         g->mvf = malloc(n_mvf * sizeof *g->mvf);
         g->n_mvf = n_mvf;
     }
-    if (!g->piano[0] || !g->piano[1] || !g->piano[2] || !g->mvf) return -1;
+    if (!g->plane[0] || !g->plane[1] || !g->plane[2] || !g->mvf) return -1;
 
     memset(g->mvf, 0, n_mvf * sizeof *g->mvf);
-    g->passo[0] = w;
-    g->passo[1] = g->passo[2] = w / 2;
+    g->stride[0] = w;
+    g->stride[1] = g->stride[2] = w / 2;
     g->poc = poc;
-    g->valida = true;
-    g->n_lista[0] = g->n_lista[1] = 0;
+    g->is_valid = true;
+    g->n_list[0] = g->n_list[1] = 0;
 
-    d->corrente = g;
+    d->current = g;
     d->mvf = g->mvf;
-    for (int i = 0; i < 3; i++) { d->piano[i] = g->piano[i]; d->passo[i] = g->passo[i]; }
+    for (int i = 0; i < 3; i++) { d->plane[i] = g->plane[i]; d->stride[i] = g->stride[i]; }
     d->n_piano = g->n_piano;
     return 0;
 }
@@ -112,36 +112,36 @@ static int apri_immagine(hevcd_t *d, const hevc_sps_t *sps, int poc)
  * ⚠️ List one starts from the other end. That is the whole point of having
  * two: a B picture with one reference each way sends the shorter index
  * for whichever direction it meant. */
-static void costruisci_liste(hevcd_t *d, const hevc_slice_t *sl)
+static void build_lists(hevcd_t *d, const hevc_slice_t *sl)
 {
     const hevc_st_rps_t *r = &sl->st_rps;
-    const hevcd_img_t *prima[16], *dopo[16];
+    const hevcd_img_t *before[16], *after[16];
     int np = 0, nd = 0;
 
     for (int i = 0; i < r->num_negative && np < 16; i++) {
         if (!r->used[i]) continue;
-        const hevcd_img_t *g = trova_img(d, sl->poc + r->delta_poc[i]);
-        if (g) prima[np++] = g;
+        const hevcd_img_t *g = find_img(d, sl->poc + r->delta_poc[i]);
+        if (g) before[np++] = g;
     }
     for (int i = r->num_negative; i < r->num_negative + r->num_positive
              && nd < 16; i++) {
         if (!r->used[i]) continue;
-        const hevcd_img_t *g = trova_img(d, sl->poc + r->delta_poc[i]);
-        if (g) dopo[nd++] = g;
+        const hevcd_img_t *g = find_img(d, sl->poc + r->delta_poc[i]);
+        if (g) after[nd++] = g;
     }
 
     for (int l = 0; l < 2; l++) {
-        d->n_rif[l] = 0;
-        const int quante = sl->num_ref_idx[l];
-        const hevcd_img_t **a = l ? dopo : prima;
-        const hevcd_img_t **b = l ? prima : dopo;
+        d->n_refs[l] = 0;
+        const int how_many = sl->num_ref_idx[l];
+        const hevcd_img_t **a = l ? after : before;
+        const hevcd_img_t **b = l ? before : after;
         const int na = l ? nd : np, nb = l ? np : nd;
         if (!na && !nb) continue;
-        while (d->n_rif[l] < quante) {
-            for (int i = 0; i < na && d->n_rif[l] < quante; i++)
-                d->rif[l][d->n_rif[l]++] = a[i];
-            for (int i = 0; i < nb && d->n_rif[l] < quante; i++)
-                d->rif[l][d->n_rif[l]++] = b[i];
+        while (d->n_refs[l] < how_many) {
+            for (int i = 0; i < na && d->n_refs[l] < how_many; i++)
+                d->ref_pic[l][d->n_refs[l]++] = a[i];
+            for (int i = 0; i < nb && d->n_refs[l] < how_many; i++)
+                d->ref_pic[l][d->n_refs[l]++] = b[i];
         }
     }
 
@@ -149,16 +149,16 @@ static void costruisci_liste(hevcd_t *d, const hevc_slice_t *sl)
      * this as its collocated picture asks what it pointed at, and an index
      * means nothing outside the slice that wrote it. */
     for (int l = 0; l < 2; l++) {
-        d->corrente->n_lista[l] = d->n_rif[l];
-        for (int i = 0; i < d->n_rif[l]; i++)
-            d->corrente->poc_lista[l][i] = d->rif[l][i]->poc;
+        d->current->n_list[l] = d->n_refs[l];
+        for (int i = 0; i < d->n_refs[l]; i++)
+            d->current->poc_list[l][i] = d->ref_pic[l][i]->poc;
     }
 
     d->col = NULL;
     if (sl->temporal_mvp_enabled) {
         const int l = sl->collocated_from_l0 ? 0 : 1;
-        if (sl->collocated_ref_idx < d->n_rif[l])
-            d->col = d->rif[l][sl->collocated_ref_idx];
+        if (sl->collocated_ref_idx < d->n_refs[l])
+            d->col = d->ref_pic[l][sl->collocated_ref_idx];
     }
 }
 
@@ -173,32 +173,32 @@ static void costruisci_liste(hevcd_t *d, const hevc_slice_t *sl)
  * other way moves the offsets by the wrong amount on exactly the streams
  * where it matters.
  */
-static void sposta_entry_point(hevc_slice_t *s, const uint8_t *grezzo,
-                               size_t n_grezzo, size_t primo)
+static void shift_entry_points(hevc_slice_t *s, const uint8_t *grezzo,
+                               size_t n_grezzo, size_t first)
 {
     if (s->num_entry_point_offsets <= 0) return;
 
-    size_t i = 0, r = 0, zeri = 0, i0 = 0, r0 = 0;
-    bool partito = false;
+    size_t i = 0, r = 0, zeros = 0, i0 = 0, r0 = 0;
+    bool started = false;
     int k = 0;
 
     while (i < n_grezzo && k < s->num_entry_point_offsets) {
-        if (!partito && r == primo) {
-            i0 = i; r0 = r; partito = true;
+        if (!started && r == first) {
+            i0 = i; r0 = r; started = true;
         }
-        if (partito && (size_t)(i - i0) == (size_t)s->entry_point[k]) {
+        if (started && (size_t)(i - i0) == (size_t)s->entry_point[k]) {
             s->entry_point[k] = (uint32_t)(r - r0);
             k++;
             continue;
         }
         const uint8_t c = grezzo[i];
-        if (zeri >= 2 && c == 0x03
+        if (zeros >= 2 && c == 0x03
             && !(i + 1 < n_grezzo && grezzo[i + 1] > 0x03)) {
-            zeri = 0;
+            zeros = 0;
             i++;
             continue;                 /* removed, so the payload stands still */
         }
-        zeri = (c == 0x00) ? zeri + 1 : 0;
+        zeros = (c == 0x00) ? zeros + 1 : 0;
         i++;
         r++;
     }
@@ -211,16 +211,16 @@ static void sposta_entry_point(hevc_slice_t *s, const uint8_t *grezzo,
 }
 
 /* Why a slice could not be walked through. */
-static const char *motivo_slice(int e)
+static const char *slice_reason(int e)
 {
     switch (e) {
-    case 1: return "finita prima dell'ultimo CTU";
-    case 2: return "non e' finita dove doveva";
-    case 3: return "ha letto oltre la fine del NAL";
-    case 4: return "tipo di slice non ancora percorribile";
-    case 5: return "memoria";
-    case 6: return "fine sottoinsieme non a uno";
-    case 7: return "una riga non e' lunga come dice l'intestazione";
+    case 1: return "ended before the last CTU";
+    case 2: return "did not end where it should";
+    case 3: return "read past the end of the NAL";
+    case 4: return "slice type not walkable yet";
+    case 5: return "out of memory";
+    case 6: return "end of subset was not one";
+    case 7: return "a row is not as long as the header says";
     default: return "?";
     }
 }
@@ -232,7 +232,7 @@ static const char *motivo_slice(int e)
  * read correctly ends with end_of_slice_segment_flag set exactly after the
  * last coding tree unit, and with the arithmetic decoder at the end of the
  * NAL. One bin read against the wrong context almost never lands there. */
-static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
+static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
                           const hevc_pps_t *pps, const hevc_slice_t *sl,
                           const uint8_t *rbsp, size_t n)
 {
@@ -253,17 +253,17 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
         d->intra_mode = calloc(serve_pu, 1);
         d->n_intra_mode = serve_pu;
     }
-    const size_t serve_bordi = (size_t)((sps->width + 7) >> 3)
+    const size_t edges_needed = (size_t)((sps->width + 7) >> 3)
                             * (size_t)((sps->height + 7) >> 3);
-    if (!d->bordi || d->n_bordi < serve_bordi) {
-        free(d->bordi);
-        d->bordi = calloc(serve_bordi, 1);
-        d->n_bordi = serve_bordi;
+    if (!d->edges || d->n_edges < edges_needed) {
+        free(d->edges);
+        d->edges = calloc(edges_needed, 1);
+        d->n_edges = edges_needed;
     }
-    if (!d->no_filtro || d->n_no_filtro < serve_cb) {
-        free(d->no_filtro);
-        d->no_filtro = calloc(serve_cb, 1);
-        d->n_no_filtro = serve_cb;
+    if (!d->no_filter || d->n_no_filter < serve_cb) {
+        free(d->no_filter);
+        d->no_filter = calloc(serve_cb, 1);
+        d->n_no_filter = serve_cb;
     }
     if (!d->sao || d->n_sao < (size_t)sps->ctb_count) {
         free(d->sao);
@@ -282,8 +282,8 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
         d->skip = calloc(serve_cb, 1);
         d->n_skip = serve_cb;
     }
-    if (!d->bordi || !d->no_filtro || !d->sao || !d->skip) return 5;
-    d->bordi_passo = (sps->width + 7) >> 3;
+    if (!d->edges || !d->no_filter || !d->sao || !d->skip) return 5;
+    d->edges_stride = (sps->width + 7) >> 3;
     if (!d->qp_y_map || d->n_qp < serve_cb) {
         free(d->qp_y_map);
         d->qp_y_map = calloc(serve_cb, 1);
@@ -291,14 +291,14 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
     }
     if (!d->ct_depth || !d->intra_mode || !d->qp_y_map) return 5;
     memset(d->ct_depth, 0, serve_cb);
-    memset(d->bordi, 0, serve_bordi);
-    memset(d->no_filtro, 0, serve_cb);
+    memset(d->edges, 0, edges_needed);
+    memset(d->no_filter, 0, serve_cb);
     memset(d->skip, 0, serve_cb);
     memset(d->intra_mode, HEVCD_INTRA_DC, serve_pu);
 
     d->sps = sps;
-    if (!d->corrente) return 5;
-    if (hevcd_prepara_zscan(d)) return 5;
+    if (!d->current) return 5;
+    if (hevcd_prepare_zscan(d)) return 5;
     d->pps = pps;
     d->slice = sl;
     d->min_pu_width = sps->width >> 2;
@@ -306,20 +306,20 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
     d->qp_y = sl->qp;
     d->qp_y_pred = sl->qp;
     d->qp_y_prev = sl->qp;
-    d->qg_riparte = true;
-    d->fine_slice = false;
+    d->qg_restarts = true;
+    d->slice_end = false;
 
-    const size_t primo = sl->data_bit_offset >> 3;
-    if (primo >= n) return 3;
-    const uint8_t *base = rbsp + primo;
-    size_t resto = n - primo;
-    hevcd_cabac_init(&d->cabac, base, resto,
+    const size_t first = sl->data_bit_offset >> 3;
+    if (first >= n) return 3;
+    const uint8_t *base = rbsp + first;
+    size_t rest = n - first;
+    hevcd_cabac_init(&d->cabac, base, rest,
                      sl->type, sl->cabac_init_flag, sl->qp);
 
     const bool wpp = pps->entropy_coding_sync_enabled;
     const int init_type = hevcd_init_type(sl->type, sl->cabac_init_flag);
-    uint8_t istantanea[HEVCD_CTX];
-    bool ho_istantanea = false;
+    uint8_t snapshot[HEVCD_CTX];
+    bool have_snapshot = false;
 
     /* ⚠️ Only a slice that starts at the first unit and carries one entry
      * point per row: anything else - a slice segment starting mid picture,
@@ -327,83 +327,83 @@ static int percorri_slice(hevcd_t *d, const hevc_sps_t *sps,
      * unit at a time rather than guessed at. */
     if (wpp && sl->segment_address == 0 && sps->ctb_height >= 2
         && sl->num_entry_point_offsets == sps->ctb_height - 1) {
-        const int e = hevcd_wavefront(d, sps, pps, sl, base, resto, init_type);
+        const int e = hevcd_wavefront(d, sps, pps, sl, base, rest, init_type);
         if (e >= 0) return e;
     }
 
-    const int quanti = sps->ctb_count;
-    int fatti = 0;
-    for (int addr = sl->segment_address; addr < quanti; addr++) {
+    const int count = sps->ctb_count;
+    int progress = 0;
+    for (int addr = sl->segment_address; addr < count; addr++) {
         const int cx = addr % sps->ctb_width;
         const int x = cx << sps->log2_ctb;
         const int y = (addr / sps->ctb_width) << sps->log2_ctb;
-        if (hevcd_leggi_ctu(d, x, y)) return 4;   /* refused inside */
-        fatti++;
+        if (hevcd_read_ctu(d, x, y)) return 4;   /* refused inside */
+        progress++;
 
         /* 9.3.2.3: after the second unit of a row, so the row below can
          * start from here. */
         if (wpp && cx == 1) {
-            memcpy(istantanea, d->cabac.state, HEVCD_CTX);
-            ho_istantanea = true;
+            memcpy(snapshot, d->cabac.state, HEVCD_CTX);
+            have_snapshot = true;
         }
         /* HEVC_TRACE: how far into the NAL each coding tree unit got.
          * When a slice does not land, this says where it stopped being
          * right - a unit that consumed implausibly little is where to
          * look, not the one that ran out of data. */
         if (getenv("HEVC_TRACE")) {
-            const long letti = (long)((d->cabac.ptr - d->cabac.start) * 8
+            const long n_read = (long)((d->cabac.ptr - d->cabac.start) * 8
                                       - d->cabac.cache_bits);
             fprintf(stderr, "ctu %d (%d,%d): %ld bit su %ld" "\n",
-                    addr, x, y, letti, (long)(n - primo) * 8);
+                    addr, x, y, n_read, (long)(n - first) * 8);
         }
         if (hevcd_overrun(&d->cabac)) return 3;
 
         const int fine = hevcd_terminate(&d->cabac);
         if (fine) {
             /* ⚠️ It has to end after the LAST one, not merely end. */
-            return (addr == quanti - 1) ? 0 : 1;
+            return (addr == count - 1) ? 0 : 1;
         }
 
         /* 7.3.8.1: when the next unit starts a row, this substream ends. */
-        if (wpp && addr + 1 < quanti
+        if (wpp && addr + 1 < count
             && (addr + 1) % sps->ctb_width == 0) {
             if (!hevcd_terminate(&d->cabac))
                 return 6;                  /* the bit is defined to be one */
 
-            const size_t usati = h264d_cabac_byte_pos(&d->cabac);
+            const size_t n_used = h264d_cabac_byte_pos(&d->cabac);
 
             /* Where the header says this row ends. */
-            size_t salto = usati;
+            size_t step = n_used;
             if (sl->num_entry_point_offsets > 0) {
-                const int riga = addr / sps->ctb_width;
-                if (riga < sl->num_entry_point_offsets) {
-                    const uint32_t fin = sl->entry_point[riga];
-                    const uint32_t ini = riga > 0 ? sl->entry_point[riga - 1] : 0;
-                    salto = (size_t)(fin - ini);
+                const int row = addr / sps->ctb_width;
+                if (row < sl->num_entry_point_offsets) {
+                    const uint32_t fin = sl->entry_point[row];
+                    const uint32_t ini = row > 0 ? sl->entry_point[row - 1] : 0;
+                    step = (size_t)(fin - ini);
                     /* A row may stop short of what the header allows - the
                      * bytes left over are the engine's own look-ahead. It
                      * may not run past it: that is a row read wrongly. */
-                    if (usati > salto) return 7;
+                    if (n_used > step) return 7;
                 }
             }
-            if (salto >= resto) return 3;
-            base += salto;
-            resto -= salto;
-            h264d_cabac_init_engine(&d->cabac, base, resto);
+            if (step >= rest) return 3;
+            base += step;
+            rest -= step;
+            h264d_cabac_init_engine(&d->cabac, base, rest);
             /* 8.6.1: a row under WPP predicts its first group from the
              * slice's parameter and not from the end of the row above. */
-            d->qg_riparte = true;
+            d->qg_restarts = true;
 
             /* 9.3.1: from the snapshot of the row above when the unit
              * above right exists, and from nothing when it does not -
              * which is what a picture one unit wide always is. */
-            if (ho_istantanea && sps->ctb_width >= 2)
-                memcpy(d->cabac.state, istantanea, HEVCD_CTX);
+            if (have_snapshot && sps->ctb_width >= 2)
+                memcpy(d->cabac.state, snapshot, HEVCD_CTX);
             else
                 hevcd_cabac_ctx_init(d->cabac.state, init_type, sl->qp);
         }
     }
-    (void)fatti;
+    (void)progress;
     return 2;                                 /* ran out of CTUs first */
 }
 
@@ -417,31 +417,31 @@ hevc_decoder_t *hevc_decoder_create(void *gpu, int width, int height)
     h->width = width;
     h->height = height;
     h->d.buf = h->buffer;
-    h->d.n_buf = QUANTE_IMG;
+    h->d.n_buf = IMG_SLOTS;
     return h;
 }
 
 void hevc_decoder_destroy(hevc_decoder_t *h)
 {
     if (!h) return;
-    for (int i = 0; i < QUANTE_IMG; i++) libera_img(&h->buffer[i]);
+    for (int i = 0; i < IMG_SLOTS; i++) free_img(&h->buffer[i]);
     hevcd_t *d = &h->d;
     free(d->ct_depth); free(d->intra_mode); free(d->min_tb_addr_zs);
-    free(d->qp_y_map); free(d->bordi); free(d->no_filtro);
+    free(d->qp_y_map); free(d->edges); free(d->no_filter);
     free(d->skip); free(d->cbf_map);
-    hevcd_libera_filtri(d);
+    hevcd_free_filters(d);
     free(h);
 }
 
 void hevc_decoder_set_references(hevc_decoder_t *h, const uintptr_t *id,
                                  const int *poc, int n)
 {
-    for (int i = 0; i < QUANTE_IMG; i++) {
-        if (!h->buffer[i].valida) continue;
+    for (int i = 0; i < IMG_SLOTS; i++) {
+        if (!h->buffer[i].is_valid) continue;
         bool serve = false;
         for (int k = 0; k < n && !serve; k++)
             if (h->nome[i] == id[k] && h->buffer[i].poc == poc[k]) serve = true;
-        if (!serve) h->buffer[i].valida = false;
+        if (!serve) h->buffer[i].is_valid = false;
     }
 }
 
@@ -450,76 +450,76 @@ int hevc_decoder_begin_picture(hevc_decoder_t *h, const hevc_sps_t *sps,
 {
     h->sps = *sps;
     h->pps = *pps;
-    if (apri_immagine(&h->d, &h->sps, poc)) return -1;
-    for (int i = 0; i < QUANTE_IMG; i++)
-        if (&h->buffer[i] == h->d.corrente) h->nome[i] = id;
-    h->aperta = true;
+    if (open_picture(&h->d, &h->sps, poc)) return -1;
+    for (int i = 0; i < IMG_SLOTS; i++)
+        if (&h->buffer[i] == h->d.current) h->nome[i] = id;
+    h->is_open = true;
     return 0;
 }
 
 int hevc_decoder_slice(hevc_decoder_t *h, const hevc_slice_t *sl,
                        const uint8_t *rbsp, size_t n)
 {
-    if (!h->aperta || !h->d.corrente) return 5;
-    h->ultima = *sl;
-    h->d.slice = &h->ultima;
-    costruisci_liste(&h->d, &h->ultima);
-    return percorri_slice(&h->d, &h->sps, &h->pps, &h->ultima, rbsp, n);
+    if (!h->is_open || !h->d.current) return 5;
+    h->last_one = *sl;
+    h->d.slice = &h->last_one;
+    build_lists(&h->d, &h->last_one);
+    return walk_slice(&h->d, &h->sps, &h->pps, &h->last_one, rbsp, n);
 }
 
 void hevc_decoder_end_picture(hevc_decoder_t *h)
 {
-    if (!h->aperta || !h->d.corrente) return;
-    if (h->d.slice) { hevcd_deblocca(&h->d); hevcd_sao(&h->d); }
-    h->aperta = false;
+    if (!h->is_open || !h->d.current) return;
+    if (h->d.slice) { hevcd_deblock(&h->d); hevcd_sao(&h->d); }
+    h->is_open = false;
 }
 
-const uint8_t *hevc_decoder_piano(const hevc_decoder_t *h, int piano,
-                                  int *passo)
+const uint8_t *hevc_decoder_plane(const hevc_decoder_t *h, int plane,
+                                  int *stride)
 {
-    if (!h->d.corrente || piano < 0 || piano > 2) return NULL;
-    if (passo) *passo = h->d.corrente->passo[piano];
-    return h->d.corrente->piano[piano];
+    if (!h->d.current || plane < 0 || plane > 2) return NULL;
+    if (stride) *stride = h->d.current->stride[plane];
+    return h->d.current->plane[plane];
 }
 
-void hevc_decoder_sfoltisci(hevc_decoder_t *h, const hevc_slice_t *sl)
+void hevc_decoder_unescape(hevc_decoder_t *h, const hevc_slice_t *sl)
 {
     sfoltisci(&h->d, sl);
 }
 
-void hevc_decoder_sposta_entry_point(hevc_slice_t *s, const uint8_t *grezzo,
-                                     size_t n_grezzo, size_t primo)
+void hevc_decoder_shift_entry_points(hevc_slice_t *s, const uint8_t *grezzo,
+                                     size_t n_grezzo, size_t first)
 {
-    sposta_entry_point(s, grezzo, n_grezzo, primo);
+    shift_entry_points(s, grezzo, n_grezzo, first);
 }
 
 /* ⚠️ The surface wants the two chroma planes interleaved, and it is
  * written once, here, rather than plane by plane as the picture is
  * decoded: surface memory is write-combining, which is fast to write
  * straight through and very slow to read back or revisit. */
-int hevc_decoder_carica(hevc_decoder_t *h, gpu_image_t out, gpu_memory_t mem)
+int hevc_decoder_load(hevc_decoder_t *h, gpu_image_t out, gpu_memory_t mem)
 {
     if (!h->gpu) return 0;                 /* the harness keeps the planes */
-    const hevcd_img_t *g = h->d.corrente;
-    if (!g || !g->piano[0]) return -1;
+    const hevcd_img_t *g = h->d.current;
+    if (!g || !g->plane[0]) return -1;
 
     const int cw = h->width / 2, ch = h->height / 2;
     uint8_t *uv = malloc((size_t)cw * 2 * ch);
     if (!uv) return -1;
     for (int r = 0; r < ch; r++) {
-        const uint8_t *a = g->piano[1] + (size_t)r * g->passo[1];
-        const uint8_t *b = g->piano[2] + (size_t)r * g->passo[2];
+        const uint8_t *a = g->plane[1] + (size_t)r * g->stride[1];
+        const uint8_t *b = g->plane[2] + (size_t)r * g->stride[2];
         uint8_t *o = uv + (size_t)r * cw * 2;
         for (int x = 0; x < cw; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
     }
     const int r = gpu_compute_upload_nv12(h->gpu, &out, mem,
-                                          g->piano[0], g->passo[0],
+                                          g->plane[0], g->stride[0],
                                           uv, cw * 2, h->width, h->height);
     free(uv);
     return r;
 }
 
-const char *hevc_decoder_motivo(int e)
+const char *hevc_decoder_reason(int e)
 {
-    return motivo_slice(e);
+    return slice_reason(e);
 }

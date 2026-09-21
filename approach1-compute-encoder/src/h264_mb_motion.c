@@ -37,34 +37,34 @@ static const uint8_t zscan[16] = {
 /* One neighbouring 4x4 block: which macroblock it is in, and where. */
 typedef struct {
     const h264d_mb_t *mb;
-    int blocco;             /* raster index inside that macroblock */
+    int block;             /* raster index inside that macroblock */
     bool c_e;               /* whether it exists at all */
-} vicino_t;
+} neighbour_t;
 
 /* Clause 6.4.11.4 and 6.4.11.7. (x4, y4) may run from -1 to 4. */
-static vicino_t vicino(const h264_decoder_t *d, int x4, int y4, int raster_cur)
+static neighbour_t neighbour(const h264_decoder_t *d, int x4, int y4, int raster_cur)
 {
-    vicino_t v = { NULL, 0, false };
+    neighbour_t v = { NULL, 0, false };
     const h264d_mb_t *m;
 
     if (x4 < 0 && y4 < 0) {
         m = h264d_mb_top_left(d);
         if (!m) return v;
-        v.mb = m; v.blocco = 15;
+        v.mb = m; v.block = 15;
     } else if (x4 < 0) {
         if (y4 > 3) return v;
         m = h264d_mb_left(d);
         if (!m) return v;
-        v.mb = m; v.blocco = y4 * 4 + 3;
+        v.mb = m; v.block = y4 * 4 + 3;
     } else if (y4 < 0) {
         if (x4 > 3) {
             m = h264d_mb_top_right(d);
             if (!m) return v;
-            v.mb = m; v.blocco = 12;
+            v.mb = m; v.block = 12;
         } else {
             m = h264d_mb_top(d);
             if (!m) return v;
-            v.mb = m; v.blocco = 12 + x4;
+            v.mb = m; v.block = 12 + x4;
         }
     } else {
         if (x4 > 3 || y4 > 3) return v;
@@ -72,7 +72,7 @@ static vicino_t vicino(const h264_decoder_t *d, int x4, int y4, int raster_cur)
         /* Inside the current macroblock: only if already decoded. */
         if (zscan[r] >= zscan[raster_cur]) return v;
         v.mb = &d->mbs[d->mb_idx];
-        v.blocco = r;
+        v.block = r;
     }
     v.c_e = true;
     return v;
@@ -81,44 +81,44 @@ static vicino_t vicino(const h264_decoder_t *d, int x4, int y4, int raster_cur)
 /* The reference and vector a neighbour contributes. An intra neighbour, or
  * one that does not use this list, contributes reference -1 and a zero
  * vector, which is what makes it lose every comparison below. */
-static void da_vicino(const vicino_t *v, int lista, int *ref, int16_t mv[2])
+static void from_neighbour(const neighbour_t *v, int list_idx, int *ref, int16_t mv[2])
 {
     if (!v->c_e || !v->mb || v->mb->intra) {
         *ref = -1;
         mv[0] = mv[1] = 0;
         return;
     }
-    const int p = ((v->blocco >> 2) & 2) | ((v->blocco >> 1) & 1);
-    *ref = v->mb->ref_idx[lista][p];   /* the index, per 8.4.1.3 */
-    mv[0] = v->mb->mv[lista][v->blocco][0];
-    mv[1] = v->mb->mv[lista][v->blocco][1];
+    const int p = ((v->block >> 2) & 2) | ((v->block >> 1) & 1);
+    *ref = v->mb->ref_idx[list_idx][p];   /* the index, per 8.4.1.3 */
+    mv[0] = v->mb->mv[list_idx][v->block][0];
+    mv[1] = v->mb->mv[list_idx][v->block][1];
 }
 
-static inline int16_t mediana(int a, int b, int c)
+static inline int16_t median(int a, int b, int c)
 {
-    const int massimo = a > b ? (a > c ? a : c) : (b > c ? b : c);
-    const int minimo = a < b ? (a < c ? a : c) : (b < c ? b : c);
-    return (int16_t)(a + b + c - massimo - minimo);
+    const int maximum = a > b ? (a > c ? a : c) : (b > c ? b : c);
+    const int minimum = a < b ? (a < c ? a : c) : (b < c ? b : c);
+    return (int16_t)(a + b + c - maximum - minimum);
 }
 
 /* Clause 8.4.1.3. `blk` is the raster index of the partition's top-left 4x4
  * block, `w4` and `h4` its size in 4x4 units. */
-void h264d_predict_mv(h264_decoder_t *d, int lista, int blk, int w4, int h4,
+void h264d_predict_mv(h264_decoder_t *d, int list_idx, int blk, int w4, int h4,
                       int ref_idx, int16_t out[2])
 {
     const int x4 = blk & 3, y4 = blk >> 2;
 
-    vicino_t va = vicino(d, x4 - 1, y4, blk);
-    vicino_t vb = vicino(d, x4, y4 - 1, blk);
-    vicino_t vc = vicino(d, x4 + w4, y4 - 1, blk);
+    neighbour_t va = neighbour(d, x4 - 1, y4, blk);
+    neighbour_t vb = neighbour(d, x4, y4 - 1, blk);
+    neighbour_t vc = neighbour(d, x4 + w4, y4 - 1, blk);
     if (!vc.c_e)
-        vc = vicino(d, x4 - 1, y4 - 1, blk);      /* D stands in for C */
+        vc = neighbour(d, x4 - 1, y4 - 1, blk);      /* D stands in for C */
 
     int ra, rb, rc;
     int16_t ma[2], mb[2], mc[2];
-    da_vicino(&va, lista, &ra, ma);
-    da_vicino(&vb, lista, &rb, mb);
-    da_vicino(&vc, lista, &rc, mc);
+    from_neighbour(&va, list_idx, &ra, ma);
+    from_neighbour(&vb, list_idx, &rb, mb);
+    from_neighbour(&vc, list_idx, &rc, mc);
 
     /* Clause 8.4.1.3.1: when neither B nor C exists but A does, all three
      * take A's values. Without this the median of (A, 0, 0) would win and
@@ -140,16 +140,16 @@ void h264d_predict_mv(h264_decoder_t *d, int lista, int blk, int w4, int h4,
     }
 
     /* Exactly one neighbour on the same reference picture wins outright. */
-    const int quanti = (ra == ref_idx) + (rb == ref_idx) + (rc == ref_idx);
-    if (quanti == 1) {
+    const int count = (ra == ref_idx) + (rb == ref_idx) + (rc == ref_idx);
+    if (count == 1) {
         if (ra == ref_idx)      { out[0] = ma[0]; out[1] = ma[1]; }
         else if (rb == ref_idx) { out[0] = mb[0]; out[1] = mb[1]; }
         else                    { out[0] = mc[0]; out[1] = mc[1]; }
         return;
     }
 
-    out[0] = mediana(ma[0], mb[0], mc[0]);
-    out[1] = mediana(ma[1], mb[1], mc[1]);
+    out[0] = median(ma[0], mb[0], mc[0]);
+    out[1] = median(ma[1], mb[1], mc[1]);
 }
 
 /* Clause 8.4.1.1: the vector of a skipped P macroblock. It is the ordinary
@@ -158,13 +158,13 @@ void h264d_predict_mv(h264_decoder_t *d, int lista, int blk, int w4, int h4,
  * on reference 0 with a zero vector. */
 void h264d_skip_mv_p(h264_decoder_t *d, int16_t out[2])
 {
-    vicino_t va = vicino(d, -1, 0, 0);
-    vicino_t vb = vicino(d, 0, -1, 0);
+    neighbour_t va = neighbour(d, -1, 0, 0);
+    neighbour_t vb = neighbour(d, 0, -1, 0);
 
     int ra, rb;
     int16_t ma[2], mb[2];
-    da_vicino(&va, 0, &ra, ma);
-    da_vicino(&vb, 0, &rb, mb);
+    from_neighbour(&va, 0, &ra, ma);
+    from_neighbour(&vb, 0, &rb, mb);
 
     if (!va.c_e || !vb.c_e
         || (ra == 0 && ma[0] == 0 && ma[1] == 0)
@@ -177,7 +177,7 @@ void h264d_skip_mv_p(h264_decoder_t *d, int16_t out[2])
 
 /* ------------------------------------------------------ spatial direct */
 
-static inline int min_positivo(int a, int b)
+static inline int min_positive(int a, int b)
 {
     if (a >= 0 && b >= 0) return a < b ? a : b;
     return a > b ? a : b;
@@ -185,35 +185,35 @@ static inline int min_positivo(int a, int b)
 
 /* Clause 8.4.1.2.2. Fills in both lists for the whole macroblock. Returns
  * non-zero when the derivation cannot be done. */
-int h264d_direct_spatial(h264_decoder_t *d, h264d_mb_t *m, int maschera)
+int h264d_direct_spatial(h264_decoder_t *d, h264d_mb_t *m, int mask)
 {
     /* The three neighbours of the macroblock as a whole. */
-    vicino_t va = vicino(d, -1, 0, 0);
-    vicino_t vb = vicino(d, 0, -1, 0);
-    vicino_t vc = vicino(d, 4, -1, 0);
+    neighbour_t va = neighbour(d, -1, 0, 0);
+    neighbour_t vb = neighbour(d, 0, -1, 0);
+    neighbour_t vc = neighbour(d, 4, -1, 0);
     if (!vc.c_e)
-        vc = vicino(d, -1, -1, 0);
+        vc = neighbour(d, -1, -1, 0);
 
     int ref[2];
     int16_t mvp[2][2];
     for (int l = 0; l < 2; l++) {
         int ra, rb, rc;
         int16_t ma[2], mb[2], mc[2];
-        da_vicino(&va, l, &ra, ma);
-        da_vicino(&vb, l, &rb, mb);
-        da_vicino(&vc, l, &rc, mc);
-        ref[l] = min_positivo(ra, min_positivo(rb, rc));
+        from_neighbour(&va, l, &ra, ma);
+        from_neighbour(&vb, l, &rb, mb);
+        from_neighbour(&vc, l, &rc, mc);
+        ref[l] = min_positive(ra, min_positive(rb, rc));
         (void)ma; (void)mb; (void)mc;
     }
 
-    bool zero_forzato = false;
+    bool zero_forced = false;
     if (ref[0] < 0 && ref[1] < 0) {
         ref[0] = ref[1] = 0;
-        zero_forzato = true;
+        zero_forced = true;
     }
 
     for (int l = 0; l < 2; l++) {
-        if (ref[l] < 0 || zero_forzato) {
+        if (ref[l] < 0 || zero_forced) {
             mvp[l][0] = mvp[l][1] = 0;
         } else {
             /* The ordinary 16x16 prediction, for the reference just chosen.
@@ -237,7 +237,7 @@ int h264d_direct_spatial(h264_decoder_t *d, h264d_mb_t *m, int maschera)
     /* With direct_8x8_inference_flag the co-located block of each 8x8 is its
      * outer corner, and the answer covers the whole 8x8. Without it, every
      * 4x4 asks about itself. */
-    static const uint8_t angolo[4] = { 0, 3, 12, 15 };
+    static const uint8_t angle[4] = { 0, 3, 12, 15 };
 
     for (int p8 = 0; p8 < 4; p8++) {
         /* A B_8x8 can be direct in some of its four 8x8s and explicit in the
@@ -245,12 +245,12 @@ int h264d_direct_spatial(h264_decoder_t *d, h264d_mb_t *m, int maschera)
          * derivation itself is per macroblock - it only ever looks at
          * neighbours outside it - so it is worked out once and written only
          * where it belongs. */
-        if (!((maschera >> p8) & 1))
+        if (!((mask >> p8) & 1))
             continue;
         const int base = (p8 >> 1) * 8 + (p8 & 1) * 2;
         for (int k = 0; k < 4; k++) {
             const int b = base + (k >> 1) * 4 + (k & 1);
-            const int bcol = d->pic.direct_8x8_inference ? angolo[p8] : b;
+            const int bcol = d->pic.direct_8x8_inference ? angle[p8] : b;
 
             /* 8.4.1.2.1: the co-located block speaks through list 0 when it
              * used it, otherwise through list 1; an intra one says nothing. */
@@ -265,13 +265,13 @@ int h264d_direct_spatial(h264_decoder_t *d, h264d_mb_t *m, int maschera)
              * so every picture here is short-term; a decoder that accepts
              * them has to check, because a long-term co-located picture
              * never sets this flag however still it is. */
-            const bool col_fermo = (ref_col == 0)
+            const bool col_is_still = (ref_col == 0)
                                 && mv_col[0] >= -1 && mv_col[0] <= 1
                                 && mv_col[1] >= -1 && mv_col[1] <= 1;
 
             for (int l = 0; l < 2; l++) {
                 int16_t mx = 0, my = 0;
-                if (!zero_forzato && ref[l] >= 0 && !(ref[l] == 0 && col_fermo)) {
+                if (!zero_forced && ref[l] >= 0 && !(ref[l] == 0 && col_is_still)) {
                     mx = mvp[l][0];
                     my = mvp[l][1];
                 }
@@ -292,7 +292,7 @@ int h264d_direct_spatial(h264_decoder_t *d, h264d_mb_t *m, int maschera)
 
 /* MapColToList0, clause 8.4.1.2.3: the lowest index of the current list 0
  * that names the picture with this POC. */
-static int mappa_su_lista0(const h264_decoder_t *d, int32_t poc)
+static int map_to_list0(const h264_decoder_t *d, int32_t poc)
 {
     for (int i = 0; i < d->slice.num_ref_idx[0]; i++) {
         const int slot = d->slice.ref_list[0][i];
@@ -302,7 +302,7 @@ static int mappa_su_lista0(const h264_decoder_t *d, int32_t poc)
     return -1;
 }
 
-static int ritaglia(int v, int lo, int hi)
+static int clip(int v, int lo, int hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
 }
@@ -314,7 +314,7 @@ static int ritaglia(int v, int lo, int hi)
  * partitions of the result point at the same physical motion, measured from
  * two different ends.
  */
-int h264d_direct_temporal(h264_decoder_t *d, h264d_mb_t *m, int maschera)
+int h264d_direct_temporal(h264_decoder_t *d, h264d_mb_t *m, int mask)
 {
     const int slot_col = d->slice.ref_list[1][0];
     if (slot_col < 0 || slot_col >= H264D_DPB_SIZE)
@@ -330,17 +330,17 @@ int h264d_direct_temporal(h264_decoder_t *d, h264d_mb_t *m, int maschera)
     const int poc_ora = d->dpb[d->cur].poc;
     const int poc_col = col->poc;
 
-    static const uint8_t angolo[4] = { 0, 3, 12, 15 };
+    static const uint8_t angle[4] = { 0, 3, 12, 15 };
 
     for (int p8 = 0; p8 < 4; p8++) {
-        if (!((maschera >> p8) & 1))
+        if (!((mask >> p8) & 1))
             continue;
         const int base = (p8 >> 1) * 8 + (p8 & 1) * 2;
         int rif_otto = -1;
 
         for (int k = 0; k < 4; k++) {
             const int b = base + (k >> 1) * 4 + (k & 1);
-            const int bcol = d->pic.direct_8x8_inference ? angolo[p8] : b;
+            const int bcol = d->pic.direct_8x8_inference ? angle[p8] : b;
             const int pcol = h264d_part8(bcol);
 
             /* 8.4.1.2.1 again: list 0 of the co-located block when it used
@@ -358,7 +358,7 @@ int h264d_direct_temporal(h264_decoder_t *d, h264d_mb_t *m, int maschera)
             if (rif_col >= 0) {
                 mvx = mv_col[0];
                 mvy = mv_col[1];
-                rif0 = mappa_su_lista0(d, poc_rif);
+                rif0 = map_to_list0(d, poc_rif);
                 if (rif0 < 0)
                     return 1;     /* the stream names a picture we don't have */
             }
@@ -376,10 +376,10 @@ int h264d_direct_temporal(h264_decoder_t *d, h264d_mb_t *m, int maschera)
                 l0x = mvx; l0y = mvy;
                 l1x = 0;   l1y = 0;
             } else {
-                const int tb = ritaglia(poc_ora - poc0, -128, 127);
-                const int td = ritaglia(poc_col - poc0, -128, 127);
+                const int tb = clip(poc_ora - poc0, -128, 127);
+                const int td = clip(poc_col - poc0, -128, 127);
                 const int tx = (16384 + abs(td / 2)) / td;
-                const int f = ritaglia((tb * tx + 32) >> 6, -1024, 1023);
+                const int f = clip((tb * tx + 32) >> 6, -1024, 1023);
                 l0x = (f * mvx + 128) >> 8;
                 l0y = (f * mvy + 128) >> 8;
                 l1x = l0x - mvx;
@@ -413,9 +413,9 @@ int h264d_direct_temporal(h264_decoder_t *d, h264d_mb_t *m, int maschera)
 }
 
 /* Which of the two a slice asked for. */
-int h264d_direct(h264_decoder_t *d, h264d_mb_t *m, int maschera)
+int h264d_direct(h264_decoder_t *d, h264d_mb_t *m, int mask)
 {
     return d->slice.direct_spatial_mv_pred
-         ? h264d_direct_spatial(d, m, maschera)
-         : h264d_direct_temporal(d, m, maschera);
+         ? h264d_direct_spatial(d, m, mask)
+         : h264d_direct_temporal(d, m, mask);
 }

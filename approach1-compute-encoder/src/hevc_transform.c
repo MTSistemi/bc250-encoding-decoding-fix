@@ -22,12 +22,12 @@
 #include <immintrin.h>
 #endif
 
-static inline int ritaglia16(int v)
+static inline int clip16(int v)
 {
     return v < -32768 ? -32768 : (v > 32767 ? 32767 : v);
 }
 
-static inline uint8_t ritaglia8(int v)
+static inline uint8_t clip8(int v)
 {
     return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
 }
@@ -38,13 +38,13 @@ void hevcd_dequantizza(int16_t *coeff, int log2_size, int qp)
 {
     const int shift = 8 + log2_size - 5;       /* BitDepth + Log2(nTbS) - 5 */
     const int add = 1 << (shift - 1);
-    const int64_t scala = (int64_t)hevcd_level_scale[qp % 6] << (qp / 6);
-    const int quanti = 1 << (2 * log2_size);
+    const int64_t scale_of = (int64_t)hevcd_level_scale[qp % 6] << (qp / 6);
+    const int count = 1 << (2 * log2_size);
 
-    for (int i = 0; i < quanti; i++) {
+    for (int i = 0; i < count; i++) {
         if (!coeff[i]) continue;
-        const int64_t v = ((int64_t)coeff[i] * scala * 16 + add) >> shift;
-        coeff[i] = (int16_t)ritaglia16((int)(v < -32768 ? -32768
+        const int64_t v = ((int64_t)coeff[i] * scale_of * 16 + add) >> shift;
+        coeff[i] = (int16_t)clip16((int)(v < -32768 ? -32768
                                              : (v > 32767 ? 32767 : v)));
     }
 }
@@ -54,24 +54,24 @@ void hevcd_dequantizza(int16_t *coeff, int log2_size, int qp)
  * ⚠️ The matrix row used is k * (32 / n), which is what "the even rows of
  * the even rows" means in practice. Reading hevcd_dct[k] instead would be
  * a 32-point transform truncated, which is a different function. */
-static void linea(const int16_t *src, int passo, int32_t *fuori, int n)
+static void line_transform(const int16_t *src, int stride, int32_t *out, int n)
 {
-    const int salto = 32 / n;
+    const int step = 32 / n;
 
     /* Which inputs are not zero, and which matrix row each one reaches
      * for. Everything else contributes nothing to any output. */
-    const int8_t *riga_m[32];
+    const int8_t *row_m[32];
     int val[32];
-    int quanti = 0;
+    int count = 0;
     for (int k = 0; k < n; k++) {
-        const int c = src[k * passo];
+        const int c = src[k * stride];
         if (!c) continue;
-        val[quanti] = c;
-        riga_m[quanti] = hevcd_dct[k * salto];
-        quanti++;
+        val[count] = c;
+        row_m[count] = hevcd_dct[k * step];
+        count++;
     }
-    if (!quanti) {
-        memset(fuori, 0, (size_t)n * sizeof *fuori);
+    if (!count) {
+        memset(out, 0, (size_t)n * sizeof *out);
         return;
     }
 
@@ -84,11 +84,11 @@ static void linea(const int16_t *src, int passo, int32_t *fuori, int n)
         const __m128i zero = _mm_setzero_si128();
         for (int i = 0; i < n; i += 8) {
             __m128i lo = zero, alto = zero;
-            for (int j = 0; j < quanti; j++) {
+            for (int j = 0; j < count; j++) {
                 const __m128i cv =
                     _mm_set1_epi32((int32_t)(uint32_t)(uint16_t)val[j]);
                 const __m128i m8 =
-                    _mm_loadl_epi64((const __m128i *)(riga_m[j] + i));
+                    _mm_loadl_epi64((const __m128i *)(row_m[j] + i));
                 const __m128i m16 =
                     _mm_srai_epi16(_mm_unpacklo_epi8(m8, m8), 8);
                 lo = _mm_add_epi32(lo, _mm_madd_epi16(
@@ -96,8 +96,8 @@ static void linea(const int16_t *src, int passo, int32_t *fuori, int n)
                 alto = _mm_add_epi32(alto, _mm_madd_epi16(
                         _mm_unpackhi_epi16(m16, zero), cv));
             }
-            _mm_storeu_si128((__m128i *)(fuori + i), lo);
-            _mm_storeu_si128((__m128i *)(fuori + i + 4), alto);
+            _mm_storeu_si128((__m128i *)(out + i), lo);
+            _mm_storeu_si128((__m128i *)(out + i + 4), alto);
         }
         return;
     }
@@ -105,75 +105,75 @@ static void linea(const int16_t *src, int passo, int32_t *fuori, int n)
 
     for (int i = 0; i < n; i++) {
         int32_t s = 0;
-        for (int j = 0; j < quanti; j++)
-            s += (int32_t)riga_m[j][i] * val[j];
-        fuori[i] = s;
+        for (int j = 0; j < count; j++)
+            s += (int32_t)row_m[j][i] * val[j];
+        out[i] = s;
     }
 }
 
 /* The DST of 8.6.4.2, for a 4x4 intra luma block. Written as the standard
  * factors it rather than as a matrix product: four multiplications instead
  * of sixteen, and the same numbers. */
-static void dst4(const int16_t *src, int passo, int32_t *fuori)
+static void dst4(const int16_t *src, int stride, int32_t *out)
 {
-    const int c0 = src[0] + src[2 * passo];
-    const int c1 = src[2 * passo] + src[3 * passo];
-    const int c2 = src[0] - src[3 * passo];
-    const int c3 = 74 * src[passo];
+    const int c0 = src[0] + src[2 * stride];
+    const int c1 = src[2 * stride] + src[3 * stride];
+    const int c2 = src[0] - src[3 * stride];
+    const int c3 = 74 * src[stride];
 
-    fuori[0] = 29 * c0 + 55 * c1 + c3;
-    fuori[1] = 55 * c2 - 29 * c1 + c3;
+    out[0] = 29 * c0 + 55 * c1 + c3;
+    out[1] = 55 * c2 - 29 * c1 + c3;
     /* ⚠️ x0 - x2 + x3, and none of x1. The factored form makes it easy to
      * write x1 in here by mistake, and the result is right in three of the
      * four outputs - which is exactly wrong enough to look like something
      * else's fault. */
-    fuori[2] = 74 * (src[0] - src[2 * passo] + src[3 * passo]);
-    fuori[3] = 55 * c0 + 29 * c2 - c3;
+    out[2] = 74 * (src[0] - src[2 * stride] + src[3 * stride]);
+    out[3] = 55 * c0 + 29 * c2 - c3;
 }
 
 /* 8.6.4.2: columns first with a shift of seven, then rows with what is
  * left. Both stages clip to sixteen bits, which the standard says and
  * which matters: the intermediate really can leave the range. */
-void hevcd_trasforma(int16_t *coeff, int log2_size, bool dst)
+void hevcd_transform(int16_t *coeff, int log2_size, bool dst)
 {
     const int n = 1 << log2_size;
     int16_t tmp[32 * 32];
-    int32_t riga[32];
+    int32_t row[32];
 
     for (int x = 0; x < n; x++) {
-        if (dst) dst4(coeff + x, n, riga);
-        else     linea(coeff + x, n, riga, n);
+        if (dst) dst4(coeff + x, n, row);
+        else     line_transform(coeff + x, n, row, n);
         for (int y = 0; y < n; y++)
-            tmp[y * n + x] = (int16_t)ritaglia16((riga[y] + 64) >> 7);
+            tmp[y * n + x] = (int16_t)clip16((row[y] + 64) >> 7);
     }
 
     const int shift = 20 - 8;
     const int add = 1 << (shift - 1);
     for (int y = 0; y < n; y++) {
-        if (dst) dst4(tmp + y * n, 1, riga);
-        else     linea(tmp + y * n, 1, riga, n);
+        if (dst) dst4(tmp + y * n, 1, row);
+        else     line_transform(tmp + y * n, 1, row, n);
         for (int x = 0; x < n; x++)
-            coeff[y * n + x] = (int16_t)ritaglia16((riga[x] + add) >> shift);
+            coeff[y * n + x] = (int16_t)clip16((row[x] + add) >> shift);
     }
 }
 
 /* 8.6.2: a block whose transform was skipped is scaled and nothing else.
  * The seven and the final shift are the two stages the transform would
  * have done, with the transform taken out from between them. */
-void hevcd_salta_trasformata(int16_t *coeff, int log2_size)
+void hevcd_skip_transform(int16_t *coeff, int log2_size)
 {
-    const int quanti = 1 << (2 * log2_size);
+    const int count = 1 << (2 * log2_size);
     const int shift = 20 - 8;
     const int add = 1 << (shift - 1);
-    for (int i = 0; i < quanti; i++)
-        coeff[i] = (int16_t)ritaglia16((((int)coeff[i] << 7) + add) >> shift);
+    for (int i = 0; i < count; i++)
+        coeff[i] = (int16_t)clip16((((int)coeff[i] << 7) + add) >> shift);
 }
 
 /* The residual onto the prediction, clipped back into eight bits. */
-void hevcd_aggiungi(uint8_t *dst, int passo, const int16_t *res, int log2_size)
+void hevcd_add(uint8_t *dst, int stride, const int16_t *res, int log2_size)
 {
     const int n = 1 << log2_size;
     for (int y = 0; y < n; y++)
         for (int x = 0; x < n; x++)
-            dst[y * passo + x] = ritaglia8(dst[y * passo + x] + res[y * n + x]);
+            dst[y * stride + x] = clip8(dst[y * stride + x] + res[y * n + x]);
 }

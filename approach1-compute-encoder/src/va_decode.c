@@ -32,7 +32,7 @@ static int poc_di(const VAPictureH264 *p)
          ? p->TopFieldOrderCnt : p->BottomFieldOrderCnt;
 }
 
-static bool valida(const VAPictureH264 *p)
+static bool is_valid(const VAPictureH264 *p)
 {
     return !(p->flags & VA_PICTURE_H264_INVALID)
         && p->picture_id != VA_INVALID_SURFACE;
@@ -57,26 +57,26 @@ void bc250_dec_free(bc250_context *c)
     bc250_dec_reset(c);
 }
 
-static bool cresci_slices(bc250_context *c)
+static bool grow_slices(bc250_context *c)
 {
     if (c->dec_state.n_slices < c->dec_state.cap_slices) return true;
-    const int nuova = c->dec_state.cap_slices ? c->dec_state.cap_slices * 2 : 16;
-    void *p = realloc(c->dec_state.slices, (size_t)nuova * sizeof(*c->dec_state.slices));
+    const int fresh = c->dec_state.cap_slices ? c->dec_state.cap_slices * 2 : 16;
+    void *p = realloc(c->dec_state.slices, (size_t)fresh * sizeof(*c->dec_state.slices));
     if (!p) return false;
     c->dec_state.slices = p;
-    c->dec_state.cap_slices = nuova;
+    c->dec_state.cap_slices = fresh;
     return true;
 }
 
-static bool cresci_dati(bc250_context *c, size_t quanti)
+static bool grow_data(bc250_context *c, size_t count)
 {
-    if (c->dec_state.n_data + quanti <= c->dec_state.cap_data) return true;
-    size_t nuova = c->dec_state.cap_data ? c->dec_state.cap_data : 65536;
-    while (nuova < c->dec_state.n_data + quanti) nuova *= 2;
-    void *p = realloc(c->dec_state.data, nuova);
+    if (c->dec_state.n_data + count <= c->dec_state.cap_data) return true;
+    size_t fresh = c->dec_state.cap_data ? c->dec_state.cap_data : 65536;
+    while (fresh < c->dec_state.n_data + count) fresh *= 2;
+    void *p = realloc(c->dec_state.data, fresh);
     if (!p) return false;
     c->dec_state.data = p;
-    c->dec_state.cap_data = nuova;
+    c->dec_state.cap_data = fresh;
     return true;
 }
 
@@ -107,7 +107,7 @@ VAStatus bc250_dec_render(bc250_context *c, bc250_buffer *b)
         if (b->size < sizeof(VASliceParameterBufferH264))
             return VA_STATUS_ERROR_INVALID_PARAMETER;
         for (unsigned k = 0; k < n; k++) {
-            if (!cresci_slices(c)) return VA_STATUS_ERROR_ALLOCATION_FAILED;
+            if (!grow_slices(c)) return VA_STATUS_ERROR_ALLOCATION_FAILED;
             const VASliceParameterBufferH264 *src =
                 (const VASliceParameterBufferH264 *)((const uint8_t *)b->data
                                                      + (size_t)k * b->size);
@@ -125,15 +125,15 @@ VAStatus bc250_dec_render(bc250_context *c, bc250_buffer *b)
          * bytes. ffmpeg sends parameters and data alternately, but the API
          * does not promise that, so the pairing is by "not yet filled in"
          * rather than by position. */
-        const size_t totale = (size_t)b->size * (b->num_elements ? b->num_elements : 1);
+        const size_t total = (size_t)b->size * (b->num_elements ? b->num_elements : 1);
         for (int i = 0; i < c->dec_state.n_slices; i++) {
             if (c->dec_state.slices[i].off != (size_t)-1) continue;
             const VASliceParameterBufferH264 *p = &c->dec_state.slices[i].p;
             if (p->slice_data_flag != VA_SLICE_DATA_FLAG_ALL)
                 return VA_STATUS_ERROR_UNIMPLEMENTED;
-            if ((size_t)p->slice_data_offset + p->slice_data_size > totale)
+            if ((size_t)p->slice_data_offset + p->slice_data_size > total)
                 return VA_STATUS_ERROR_INVALID_PARAMETER;
-            if (!cresci_dati(c, p->slice_data_size))
+            if (!grow_data(c, p->slice_data_size))
                 return VA_STATUS_ERROR_ALLOCATION_FAILED;
             memcpy(c->dec_state.data + c->dec_state.n_data,
                    (const uint8_t *)b->data + p->slice_data_offset,
@@ -152,7 +152,7 @@ VAStatus bc250_dec_render(bc250_context *c, bc250_buffer *b)
 
 /* --------------------------------------------------------- translation */
 
-static void riempi_pic(const bc250_context *c, h264d_pic_t *out)
+static void fill_pic(const bc250_context *c, h264d_pic_t *out)
 {
     const VAPictureParameterBufferH264 *p = &c->dec_state.pic;
     memset(out, 0, sizeof(*out));
@@ -203,11 +203,11 @@ static void riempi_pic(const bc250_context *c, h264d_pic_t *out)
 /* One reference list, VA's surfaces turned into frame store slots. Returns
  * false when the stream names a picture this decoder has never produced,
  * which happens after a seek and means the slice cannot be decoded. */
-static bool riempi_lista(h264_decoder_t *dec, const VAPictureH264 *va,
-                         int quanti, int8_t *slot)
+static bool fill_list(h264_decoder_t *dec, const VAPictureH264 *va,
+                         int count, int8_t *slot)
 {
-    for (int i = 0; i < quanti && i < 32; i++) {
-        if (!valida(&va[i])) { slot[i] = 0; continue; }
+    for (int i = 0; i < count && i < 32; i++) {
+        if (!is_valid(&va[i])) { slot[i] = 0; continue; }
         h264d_frame_t *f = h264_decoder_frame_for(dec, va[i].picture_id);
         if (!f) return false;
         slot[i] = (int8_t)h264_decoder_slot_of(dec, f);
@@ -215,29 +215,29 @@ static bool riempi_lista(h264_decoder_t *dec, const VAPictureH264 *va,
     return true;
 }
 
-static void pesi_di(const VASliceParameterBufferH264 *p, h264d_slice_t *s)
+static void weights_of(const VASliceParameterBufferH264 *p, h264d_slice_t *s)
 {
     s->luma_log2_weight_denom = p->luma_log2_weight_denom;
     s->chroma_log2_weight_denom = p->chroma_log2_weight_denom;
 
-    const int16_t uno_l = (int16_t)(1 << p->luma_log2_weight_denom);
-    const int16_t uno_c = (int16_t)(1 << p->chroma_log2_weight_denom);
+    const int16_t one_l = (int16_t)(1 << p->luma_log2_weight_denom);
+    const int16_t one_c = (int16_t)(1 << p->chroma_log2_weight_denom);
 
     for (int i = 0; i < 32; i++) {
         /* âš ï¸ A list whose flag is clear has no values in the buffer at all,
          * so the neutral weight has to be put there by hand: the decoder
          * multiplies unconditionally. */
-        s->luma_weight[0][i] = p->luma_weight_l0_flag ? p->luma_weight_l0[i] : uno_l;
+        s->luma_weight[0][i] = p->luma_weight_l0_flag ? p->luma_weight_l0[i] : one_l;
         s->luma_offset[0][i] = p->luma_weight_l0_flag ? p->luma_offset_l0[i] : 0;
-        s->luma_weight[1][i] = p->luma_weight_l1_flag ? p->luma_weight_l1[i] : uno_l;
+        s->luma_weight[1][i] = p->luma_weight_l1_flag ? p->luma_weight_l1[i] : one_l;
         s->luma_offset[1][i] = p->luma_weight_l1_flag ? p->luma_offset_l1[i] : 0;
         for (int k = 0; k < 2; k++) {
             s->chroma_weight[0][i][k] =
-                p->chroma_weight_l0_flag ? p->chroma_weight_l0[i][k] : uno_c;
+                p->chroma_weight_l0_flag ? p->chroma_weight_l0[i][k] : one_c;
             s->chroma_offset[0][i][k] =
                 p->chroma_weight_l0_flag ? p->chroma_offset_l0[i][k] : 0;
             s->chroma_weight[1][i][k] =
-                p->chroma_weight_l1_flag ? p->chroma_weight_l1[i][k] : uno_c;
+                p->chroma_weight_l1_flag ? p->chroma_weight_l1[i][k] : one_c;
             s->chroma_offset[1][i][k] =
                 p->chroma_weight_l1_flag ? p->chroma_offset_l1[i][k] : 0;
         }
@@ -270,35 +270,35 @@ VAStatus bc250_dec_decode(bc250_context *c, gpu_image_t out, gpu_memory_t mem)
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
 
     h264d_pic_t pic;
-    riempi_pic(c, &pic);
+    fill_pic(c, &pic);
     if (pic.width != c->width || pic.height != c->height)
         return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
 
     /* Which surfaces are still references, so the frame store can let the
      * others go. This runs before begin_picture, which is what keeps the
      * current picture's own slot from being handed to someone else. */
-    uint32_t rif[16];
+    uint32_t ref_pic[16];
     int poc[16];
-    bool lungo[16];
-    int n_rif = 0;
+    bool length[16];
+    int n_refs = 0;
     for (int i = 0; i < 16; i++) {
-        if (!valida(&pp->ReferenceFrames[i])) continue;
-        rif[n_rif] = pp->ReferenceFrames[i].picture_id;
-        poc[n_rif] = poc_di(&pp->ReferenceFrames[i]);
-        lungo[n_rif] = (pp->ReferenceFrames[i].flags
+        if (!is_valid(&pp->ReferenceFrames[i])) continue;
+        ref_pic[n_refs] = pp->ReferenceFrames[i].picture_id;
+        poc[n_refs] = poc_di(&pp->ReferenceFrames[i]);
+        length[n_refs] = (pp->ReferenceFrames[i].flags
                         & VA_PICTURE_H264_LONG_TERM_REFERENCE) != 0;
-        n_rif++;
+        n_refs++;
     }
-    h264_decoder_set_references(dec, rif, poc, lungo, n_rif);
+    h264_decoder_set_references(dec, ref_pic, poc, length, n_refs);
 
     if (h264_decoder_begin_picture(dec, &pic, c->current_render_target,
                                    poc_di(&pp->CurrPic), pp->frame_num) != 0)
         return VA_STATUS_ERROR_OPERATION_FAILED;
 
-    h264d_slice_input_t *pronte =
-        calloc((size_t)c->dec_state.n_slices, sizeof(*pronte));
-    if (!pronte) return VA_STATUS_ERROR_ALLOCATION_FAILED;
-    int n_pronte = 0;
+    h264d_slice_input_t *ready =
+        calloc((size_t)c->dec_state.n_slices, sizeof(*ready));
+    if (!ready) return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    int n_ready = 0;
 
     for (int i = 0; i < c->dec_state.n_slices; i++) {
         const VASliceParameterBufferH264 *sp = &c->dec_state.slices[i].p;
@@ -318,26 +318,26 @@ VAStatus bc250_dec_decode(bc250_context *c, gpu_image_t out, gpu_memory_t mem)
         sl.num_ref_idx[0] = (sl.type == 2) ? 0 : sp->num_ref_idx_l0_active_minus1 + 1;
         sl.num_ref_idx[1] = (sl.type == 1) ? sp->num_ref_idx_l1_active_minus1 + 1 : 0;
 
-        if (!riempi_lista(dec, sp->RefPicList0, sl.num_ref_idx[0], sl.ref_list[0])
-            || !riempi_lista(dec, sp->RefPicList1, sl.num_ref_idx[1], sl.ref_list[1]))
+        if (!fill_list(dec, sp->RefPicList0, sl.num_ref_idx[0], sl.ref_list[0])
+            || !fill_list(dec, sp->RefPicList1, sl.num_ref_idx[1], sl.ref_list[1]))
             continue;   /* a reference we never decoded: skip, do not guess */
 
-        pesi_di(sp, &sl);
+        weights_of(sp, &sl);
 
-        if (n_pronte < c->dec_state.n_slices) {
-            pronte[n_pronte].slice = sl;
-            pronte[n_pronte].data = c->dec_state.data + c->dec_state.slices[i].off;
-            pronte[n_pronte].size = c->dec_state.slices[i].len;
-            pronte[n_pronte].bit_offset = sp->slice_data_bit_offset;
-            n_pronte++;
+        if (n_ready < c->dec_state.n_slices) {
+            ready[n_ready].slice = sl;
+            ready[n_ready].data = c->dec_state.data + c->dec_state.slices[i].off;
+            ready[n_ready].size = c->dec_state.slices[i].len;
+            ready[n_ready].bit_offset = sp->slice_data_bit_offset;
+            n_ready++;
         }
     }
 
     /* All of them at once: they are independent, so the decoder can read
      * several at the same time. */
-    if (n_pronte > 0)
-        h264_decoder_slices(dec, pronte, n_pronte);
-    free(pronte);
+    if (n_ready > 0)
+        h264_decoder_slices(dec, ready, n_ready);
+    free(ready);
 
     /* âš ï¸ Always finished, even when every slice was refused. A picture that
      * is never ended leaves the frame store holding a slot that no later

@@ -24,7 +24,7 @@ bool h264_decoder_supports(int profile_idc, int chroma_format_idc,
     return true;
 }
 
-static void libera_frame(h264d_frame_t *f)
+static void free_frame(h264d_frame_t *f)
 {
     free(f->y);
     free(f->col_ref);
@@ -38,7 +38,7 @@ static void libera_frame(h264d_frame_t *f)
     f->surface = ~0u;
 }
 
-static int alloca_frame(h264d_frame_t *f, int w, int h)
+static int alloc_frame(h264d_frame_t *f, int w, int h)
 {
     const int sy = (w + 31) & ~31;
     const int sc = (w / 2 + 31) & ~31;
@@ -72,30 +72,30 @@ h264_decoder_t *h264_decoder_create(bc250_gpu_context_t *gpu_ctx,
     /* A band of about a megabyte and a half: inside L3 on this part, and
      * tall enough for the wavefront to have something to spread across. */
     {
-        const size_t riga = (size_t)d->mb_w * sizeof(h264d_residuo_t);
-        int b = (int)((size_t)1536 * 1024 / (riga ? riga : 1));
+        const size_t row = (size_t)d->mb_w * sizeof(h264d_residual_t);
+        int b = (int)((size_t)1536 * 1024 / (row ? row : 1));
         const char *e = getenv("BC250_H264_BAND");
         if (e) b = atoi(e);
         if (b < 4) b = 4;
         if (b > d->mb_h) b = d->mb_h;
-        d->righe_banda = b;
+        d->band_rows = b;
     }
     d->slices = calloc(H264D_MAX_SLICES, sizeof(h264d_slice_t));
     d->dequant = calloc(1, sizeof(h264d_dequant_set_t));
-    d->n_residui = (d->righe_banda + 1) * d->mb_w;
-    if (d->n_residui > d->mb_count) d->n_residui = d->mb_count;
-    d->residui = calloc((size_t)d->n_residui, sizeof(h264d_residuo_t));
-    d->res = d->residui;
+    d->n_residuals = (d->band_rows + 1) * d->mb_w;
+    if (d->n_residuals > d->mb_count) d->n_residuals = d->mb_count;
+    d->residuals = calloc((size_t)d->n_residuals, sizeof(h264d_residual_t));
+    d->res = d->residuals;
     d->rbsp_cap = (size_t)d->mb_count * 512 + 65536;
     d->rbsp = malloc(d->rbsp_cap);
-    if (!d->mbs || !d->slice_of_mb || !d->residui || !d->rbsp
+    if (!d->mbs || !d->slice_of_mb || !d->residuals || !d->rbsp
         || !d->slices || !d->dequant) {
         h264_decoder_destroy(d);
         return NULL;
     }
 
     for (int i = 0; i < H264D_DPB_SIZE; i++) {
-        if (alloca_frame(&d->dpb[i], d->mb_w * 16, d->mb_h * 16) != 0) {
+        if (alloc_frame(&d->dpb[i], d->mb_w * 16, d->mb_h * 16) != 0) {
             h264_decoder_destroy(d);
             return NULL;
         }
@@ -115,11 +115,11 @@ void h264_decoder_destroy(h264_decoder_t *d)
 {
     if (!d) return;
     for (int i = 0; i < H264D_DPB_SIZE; i++)
-        libera_frame(&d->dpb[i]);
+        free_frame(&d->dpb[i]);
     h264d_pool_stop(d);
     free(d->mbs);
     free(d->slice_of_mb);
-    free(d->residui);
+    free(d->residuals);
     free(d->slices);
     free(d->dequant);
     free(d->rbsp);
@@ -151,29 +151,29 @@ static int slot_per(h264_decoder_t *d, uint32_t surface)
             return i;
     /* Everything is claimed: take the one the application has not listed as
      * a reference for the longest, which is the smallest POC. */
-    int peggiore = 0;
+    int worst_one = 0;
     for (int i = 1; i < H264D_DPB_SIZE; i++)
-        if (d->dpb[i].poc < d->dpb[peggiore].poc)
-            peggiore = i;
-    return peggiore;
+        if (d->dpb[i].poc < d->dpb[worst_one].poc)
+            worst_one = i;
+    return worst_one;
 }
 
 void h264_decoder_set_references(h264_decoder_t *d, const uint32_t *refs,
                                  const int *pocs, const bool *long_term, int n)
 {
-    bool tenere[H264D_DPB_SIZE] = { false };
+    bool keep[H264D_DPB_SIZE] = { false };
     for (int k = 0; k < n; k++) {
         for (int i = 0; i < H264D_DPB_SIZE; i++) {
             if (d->dpb[i].used && d->dpb[i].surface == refs[k]) {
-                tenere[i] = true;
+                keep[i] = true;
                 d->dpb[i].poc = pocs[k];
                 d->dpb[i].is_long_term = long_term[k];
             }
         }
     }
-    if (d->cur >= 0) tenere[d->cur] = true;
+    if (d->cur >= 0) keep[d->cur] = true;
     for (int i = 0; i < H264D_DPB_SIZE; i++)
-        if (d->dpb[i].used && !tenere[i])
+        if (d->dpb[i].used && !keep[i])
             d->dpb[i].used = false;
 }
 
@@ -209,22 +209,22 @@ int h264_decoder_begin_picture(h264_decoder_t *d, const h264d_pic_t *pic,
  * useful debugging tool this decoder has: a diff against the same line out
  * of a reference decoder says which syntax element went wrong, and usually
  * which macroblock it went wrong at. */
-static void traccia_mb(const h264_decoder_t *d)
+static void trace_mb(const h264_decoder_t *d)
 {
     const h264d_mb_t *m = &d->mbs[d->mb_idx];
-    fprintf(stderr, "mb %4d (%2d,%2d) tipo %d intra %d t8 %d cbp %02x qp %2d",
+    fprintf(stderr, "mb %4d (%2d,%2d) type %d intra %d t8 %d cbp %02x qp %2d",
             d->mb_idx, d->mb_x, d->mb_y, m->type, m->intra,
             m->transform8x8, m->cbp, m->qpy);
     if (m->intra) {
-        fprintf(stderr, " croma %d modi", m->chroma_pred_mode);
+        fprintf(stderr, " chroma %d modes", m->chroma_pred_mode);
         for (int k = 0; k < 16; k++) fprintf(stderr, " %d", m->ipred[k]);
     } else {
-        fprintf(stderr, " sub %d %d %d %d", m->sub_tipo[0],
-                m->sub_tipo[1], m->sub_tipo[2], m->sub_tipo[3]);
+        fprintf(stderr, " sub %d %d %d %d", m->sub_type[0],
+                m->sub_type[1], m->sub_type[2], m->sub_type[3]);
         fprintf(stderr, " r1");
         for (int p8 = 0; p8 < 4; p8++)
             fprintf(stderr, " %d", m->ref_idx[1][p8]);
-        fprintf(stderr, " rif");
+        fprintf(stderr, " ref");
         for (int p8 = 0; p8 < 4; p8++)
             fprintf(stderr, " %d/%d", m->ref_idx[0][p8], m->ref[0][p8]);
         fprintf(stderr, " mv");
@@ -240,20 +240,20 @@ static void traccia_mb(const h264_decoder_t *d)
  * âš ï¸ This is what keeps the residual ring small enough to stay in cache,
  * and it is also what bounds how far apart the wavefront's threads can
  * get. The two pull in opposite directions. */
-static inline void scarica(h264_decoder_t *d, int numero)
+static inline void flush(h264_decoder_t *d, int number)
 {
-    const int banda = d->righe_banda * d->mb_w;
-    if (d->mb_idx - d->da_ricostruire < banda) return;
-    h264d_reconstruct_range(d, d->da_ricostruire,
-                            d->mb_idx - d->da_ricostruire, numero);
-    d->da_ricostruire = d->mb_idx;
+    const int band = d->band_rows * d->mb_w;
+    if (d->mb_idx - d->to_reconstruct < band) return;
+    h264d_reconstruct_range(d, d->to_reconstruct,
+                            d->mb_idx - d->to_reconstruct, number);
+    d->to_reconstruct = d->mb_idx;
 }
 
-/* One slice, on whatever cursor it is handed. `numero` is the slice's
+/* One slice, on whatever cursor it is handed. `number` is the slice's
  * number within the picture, assigned by the caller before any of them
  * start so that the per-slice tables can be filled in serially. */
-int h264d_decodifica_slice(h264_decoder_t *d, const h264d_slice_input_t *in,
-                           int numero)
+int h264d_decode_slice(h264_decoder_t *d, const h264d_slice_input_t *in,
+                           int number)
 {
     const h264d_slice_t *slice = &in->slice;
     const uint8_t *data = in->data;
@@ -263,7 +263,7 @@ int h264d_decodifica_slice(h264_decoder_t *d, const h264d_slice_input_t *in,
     d->slice = *slice;
     if (getenv("BC250_H264_TRACE"))
         fprintf(stderr, "slice %d: deblk idc %d alpha %d beta %d, qp %d, "
-                        "cabac_idc %d, tipo %d\n", numero,
+                        "cabac_idc %d, type %d\n", number,
                 slice->disable_deblocking_filter_idc, slice->alpha_c0_offset,
                 slice->beta_offset, slice->qpy, slice->cabac_init_idc,
                 slice->type);
@@ -279,14 +279,14 @@ int h264d_decodifica_slice(h264_decoder_t *d, const h264d_slice_input_t *in,
      * first macroblock in the wrong place as soon as a slice header
      * contains an escaped byte. */
     if (bit_offset < 0 || (size_t)bit_offset >= size * 8) return -1;
-    size_t primo_bit = (size_t)bit_offset;
+    size_t first_bit = (size_t)bit_offset;
     const size_t n = br_extract_rbsp_map(d->rbsp, d->rbsp_cap, data, size,
-                                         &primo_bit);
-    if (primo_bit >= n * 8) return -1;
+                                         &first_bit);
+    if (first_bit >= n * 8) return -1;
 
     d->qpy = slice->qpy;
     d->last_qp_delta_nonzero = 0;
-    d->da_ricostruire = slice->first_mb;
+    d->to_reconstruct = slice->first_mb;
     d->mb_idx = slice->first_mb;
     if (d->mb_idx >= d->mb_count) return -1;
     d->mb_x = d->mb_idx % d->mb_w;
@@ -295,41 +295,41 @@ int h264d_decodifica_slice(h264_decoder_t *d, const h264d_slice_input_t *in,
     if (d->cabac_mode) {
         /* cabac_alignment_one_bit: the arithmetic decoder loads bytes, so
          * it starts on one. */
-        const size_t primo_byte = (primo_bit + 7) / 8;
-        if (primo_byte >= n) return -1;
-        h264d_cabac_init(&d->cabac, d->rbsp + primo_byte, n - primo_byte,
+        const size_t first_byte = (first_bit + 7) / 8;
+        if (first_byte >= n) return -1;
+        h264d_cabac_init(&d->cabac, d->rbsp + first_byte, n - first_byte,
                          slice->type == 2, slice->cabac_init_idc, slice->qpy);
     } else {
         /* CAVLC has no alignment element: slice_data() begins at the very
          * next bit. */
         br_init(&d->br, d->rbsp, n);
-        br_skip(&d->br, (int)primo_bit);
+        br_skip(&d->br, (int)first_bit);
     }
 
-    const char *traccia = getenv("BC250_H264_TRACE");
-    int quanti = 0;
+    const char *trace = getenv("BC250_H264_TRACE");
+    int count = 0;
 
-#define AVANZA() do {                              \
+#define ADVANCE() do {                              \
         d->mb_idx++;                                   \
         d->mb_x = d->mb_idx % d->mb_w;                 \
         d->mb_y = d->mb_idx / d->mb_w;                 \
-        if (d->mb_x == 0) scarica(d, numero);          \
+        if (d->mb_x == 0) flush(d, number);          \
     } while (0)
 
     if (d->cabac_mode) {
         for (;;) {
-            d->slice_of_mb[d->mb_idx] = (uint8_t)numero;
+            d->slice_of_mb[d->mb_idx] = (uint8_t)number;
             const int r = h264d_decode_mb_cabac(d);
             if (r) return r;
-            quanti++;
-            if (traccia) traccia_mb(d);
+            count++;
+            if (trace) trace_mb(d);
 
             if (h264d_cabac_terminate(&d->cabac))
                 break;
             if (h264d_cabac_overrun(&d->cabac))
                 return -4;
 
-            AVANZA();
+            ADVANCE();
             if (d->mb_idx >= d->mb_count)
                 break;
         }
@@ -344,48 +344,48 @@ int h264d_decodifica_slice(h264_decoder_t *d, const h264d_slice_input_t *in,
          * principle, so it is not done. */
         for (;;) {
             if (slice->type != 2) {
-                int salti = (int)br_read_ue(&d->br);
-                const int quanti_salti = salti;
-                while (salti-- > 0) {
+                int skips = (int)br_read_ue(&d->br);
+                const int n_skips = skips;
+                while (skips-- > 0) {
                     if (d->mb_idx >= d->mb_count) return -1;
-                    d->slice_of_mb[d->mb_idx] = (uint8_t)numero;
+                    d->slice_of_mb[d->mb_idx] = (uint8_t)number;
                     if (h264d_cavlc_skip(d)) return -5;
-                    quanti++;
-                    if (traccia) traccia_mb(d);
-                    AVANZA();
+                    count++;
+                    if (trace) trace_mb(d);
+                    ADVANCE();
                 }
-                if (quanti_salti > 0 && !br_more_rbsp_data(&d->br))
+                if (n_skips > 0 && !br_more_rbsp_data(&d->br))
                     break;
             }
             if (d->mb_idx >= d->mb_count) break;
             if (br_overrun(&d->br)) return -4;
 
-            d->slice_of_mb[d->mb_idx] = (uint8_t)numero;
+            d->slice_of_mb[d->mb_idx] = (uint8_t)number;
             const int r = h264d_decode_mb_cavlc(d);
             if (r) return r;
-            quanti++;
-            if (traccia) traccia_mb(d);
+            count++;
+            if (trace) trace_mb(d);
 
-            AVANZA();
+            ADVANCE();
             if (d->mb_idx >= d->mb_count) break;
             if (!br_more_rbsp_data(&d->br)) break;
         }
         if (br_overrun(&d->br)) return -4;
     }
-#undef AVANZA
+#undef ADVANCE
 
-    if (traccia)
-        fprintf(stderr, "slice finita: %d macroblocchi, sforamento %d\n",
-                quanti, d->cabac_mode
+    if (trace)
+        fprintf(stderr, "slice done: %d macroblocks, overrun %d\n",
+                count, d->cabac_mode
                         ? (int)h264d_cabac_overrun(&d->cabac)
                         : (int)br_overrun(&d->br));
 
     /* Whatever is left of the last band. */
     {
-        const int fine = slice->first_mb + quanti;
-        if (fine > d->da_ricostruire)
-            h264d_reconstruct_range(d, d->da_ricostruire,
-                                    fine - d->da_ricostruire, numero);
+        const int fine = slice->first_mb + count;
+        if (fine > d->to_reconstruct)
+            h264d_reconstruct_range(d, d->to_reconstruct,
+                                    fine - d->to_reconstruct, number);
     }
     return 0;
 }
@@ -400,33 +400,33 @@ int h264_decoder_slices(h264_decoder_t *d, const h264d_slice_input_t *in, int n)
     /* The numbers and the per-slice tables are filled in here, before
      * anything starts: a worker writes only its own entries, and nothing
      * has to be locked. */
-    const int primo = d->n_slices;
+    const int first = d->n_slices;
     for (int i = 0; i < n; i++) {
         const h264d_slice_t *s = &in[i].slice;
-        d->slices[primo + i] = *s;
-        d->deblock[primo + i].disable_idc =
+        d->slices[first + i] = *s;
+        d->deblock[first + i].disable_idc =
             (int8_t)s->disable_deblocking_filter_idc;
-        d->deblock[primo + i].alpha_offset = (int8_t)s->alpha_c0_offset;
-        d->deblock[primo + i].beta_offset = (int8_t)s->beta_offset;
+        d->deblock[first + i].alpha_offset = (int8_t)s->alpha_c0_offset;
+        d->deblock[first + i].beta_offset = (int8_t)s->beta_offset;
     }
     d->n_slices += n;
 
     if (n >= 2 && d->pool)
-        return h264d_slices_pool(d, in, n, primo);
+        return h264d_slices_pool(d, in, n, first);
 
-    int primo_errore = 0;
+    int first_error = 0;
     for (int i = 0; i < n; i++) {
-        const int r = h264d_decodifica_slice(d, &in[i], primo + i);
-        if (r && !primo_errore) primo_errore = r;
+        const int r = h264d_decode_slice(d, &in[i], first + i);
+        if (r && !first_error) first_error = r;
     }
-    return primo_errore;
+    return first_error;
 }
 
 int h264_decoder_slice(h264_decoder_t *d, const h264d_slice_t *slice,
                        const uint8_t *data, size_t size, int bit_offset)
 {
-    const h264d_slice_input_t uno = { *slice, data, size, bit_offset, 0 };
-    return h264_decoder_slices(d, &uno, 1);
+    const h264d_slice_input_t one_pred = { *slice, data, size, bit_offset, 0 };
+    return h264_decoder_slices(d, &one_pred, 1);
 }
 
 int h264_decoder_end_picture(h264_decoder_t *d, gpu_image_t out,
@@ -470,7 +470,7 @@ int h264_decoder_end_picture(h264_decoder_t *d, gpu_image_t out,
      * them as belonging to no slice keeps the deblocking filter from
      * treating them as part of their neighbour's. */
     if (getenv("BC250_H264_TRACE"))
-        fprintf(stderr, "fine immagine slot %d poc %d: riga 0 prima "
+        fprintf(stderr, "picture done, slot %d poc %d: row 0 before "
                         "%d %d %d %d\n", d->cur, f->poc,
                 f->y[0], f->y[1], f->y[2], f->y[3]);
 
@@ -485,7 +485,7 @@ int h264_decoder_end_picture(h264_decoder_t *d, gpu_image_t out,
     }
 
     if (getenv("BC250_H264_TRACE"))
-        fprintf(stderr, "                          riga 0 dopo  "
+        fprintf(stderr, "                          row 0 after  "
                         "%d %d %d %d\n", f->y[0], f->y[1], f->y[2], f->y[3]);
 
     if (!d->gpu)

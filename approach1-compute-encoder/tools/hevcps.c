@@ -62,29 +62,29 @@ static const char *nome_nal(int t)
 static const char *perche(int r)
 {
     switch (r) {
-    case -1: return "NAL troncato";
-    case -2: return "non supportato";
-    case -3: return "fuori dallo standard";
+    case -1: return "NAL truncated";
+    case -2: return "not supported";
+    case -3: return "outside the standard";
     default: return "?";
     }
 }
 
-static const char tipo_slice[3] = { 'B', 'P', 'I' };
+static const char slice_type_of[3] = { 'B', 'P', 'I' };
 
 /* Between one IDR and the next, the picture order counts must be exactly
  * 0..k-1: every one of them present, and none of them twice. They arrive
  * in decode order, which with B pictures is not display order, so the
  * question is about the SET and not about the sequence. */
-static bool verifica_gruppo(const int *poc, int quanti)
+static bool check_group(const int *poc, int count)
 {
-    if (quanti <= 0) return true;
-    for (int atteso = 0; atteso < quanti; atteso++) {
-        int trovati = 0;
-        for (int i = 0; i < quanti; i++)
-            if (poc[i] == atteso) trovati++;
-        if (trovati != 1) {
-            fprintf(stderr, "poc %d visto %d volte su %d immagini\n",
-                    atteso, trovati, quanti);
+    if (count <= 0) return true;
+    for (int expected = 0; expected < count; expected++) {
+        int n_found = 0;
+        for (int i = 0; i < count; i++)
+            if (poc[i] == expected) n_found++;
+        if (n_found != 1) {
+            fprintf(stderr, "poc %d seen %d times across %d pictures\n",
+                    expected, n_found, count);
             return false;
         }
     }
@@ -110,84 +110,84 @@ static bool verifica_gruppo(const int *poc, int quanti)
 /* Pictures wait here until the stream ends, because the order they come
  * out in is not the order they were decoded in. */
 typedef struct {
-    long ordine;
-    uint8_t *dati;
+    long order;
+    uint8_t *data;
     size_t n;
-} fotogramma_t;
+} frame_t;
 
-static fotogramma_t *ordine_uscita;
-static int n_uscita, cap_uscita;
+static frame_t *output_order;
+static int n_output, cap_output;
 
-static int confronta_ordine(const void *a, const void *b)
+static int compare_order(const void *a, const void *b)
 {
-    const long x = ((const fotogramma_t *)a)->ordine;
-    const long y = ((const fotogramma_t *)b)->ordine;
+    const long x = ((const frame_t *)a)->order;
+    const long y = ((const frame_t *)b)->order;
     return x < y ? -1 : (x > y ? 1 : 0);
 }
 
 /* Cropped on the way out: the coded picture is a whole number of smallest
  * coding blocks and the visible one is not. */
-static void scrivi_immagine(FILE *f, hevc_decoder_t *dc,
-                            const hevc_sps_t *sps, long ordine)
+static void write_picture(FILE *f, hevc_decoder_t *dc,
+                            const hevc_sps_t *sps, long order)
 {
-    int passo[3];
-    const uint8_t *piano[3];
+    int stride[3];
+    const uint8_t *plane[3];
     /* ⚠️ The loop filters run here and not at the end of each slice: 8.7.2
      * is defined over the whole picture, and an edge between two coding
      * tree units cannot be filtered until both of them exist. */
     hevc_decoder_end_picture(dc);
-    for (int i = 0; i < 3; i++) piano[i] = hevc_decoder_piano(dc, i, &passo[i]);
-    if (!f || !piano[0]) return;
+    for (int i = 0; i < 3; i++) plane[i] = hevc_decoder_plane(dc, i, &stride[i]);
+    if (!f || !plane[0]) return;
 
     const int x0 = sps->crop_left, y0 = sps->crop_top;
     const int w = sps->width - sps->crop_left - sps->crop_right;
     const int h = sps->height - sps->crop_top - sps->crop_bottom;
     const size_t n = (size_t)w * h + 2 * (size_t)(w / 2) * (h / 2);
 
-    if (n_uscita == cap_uscita) {
-        const int nuovo = cap_uscita ? cap_uscita * 2 : 32;
-        fotogramma_t *p = realloc(ordine_uscita, (size_t)nuovo * sizeof *p);
+    if (n_output == cap_output) {
+        const int new_one = cap_output ? cap_output * 2 : 32;
+        frame_t *p = realloc(output_order, (size_t)new_one * sizeof *p);
         if (!p) return;
-        ordine_uscita = p;
-        cap_uscita = nuovo;
+        output_order = p;
+        cap_output = new_one;
     }
-    uint8_t *dati = malloc(n);
-    if (!dati) return;
+    uint8_t *data = malloc(n);
+    if (!data) return;
 
     size_t o = 0;
     for (int y = 0; y < h; y++) {
-        memcpy(dati + o, piano[0] + (size_t)(y0 + y) * passo[0] + x0,
+        memcpy(data + o, plane[0] + (size_t)(y0 + y) * stride[0] + x0,
                (size_t)w);
         o += (size_t)w;
     }
     for (int p = 1; p < 3; p++)
         for (int y = 0; y < h / 2; y++) {
-            memcpy(dati + o,
-                   piano[p] + (size_t)(y0 / 2 + y) * passo[p] + x0 / 2,
+            memcpy(data + o,
+                   plane[p] + (size_t)(y0 / 2 + y) * stride[p] + x0 / 2,
                    (size_t)(w / 2));
             o += (size_t)(w / 2);
         }
 
-    ordine_uscita[n_uscita].ordine = ordine;
-    ordine_uscita[n_uscita].dati = dati;
-    ordine_uscita[n_uscita].n = n;
-    n_uscita++;
+    output_order[n_output].order = order;
+    output_order[n_output].data = data;
+    output_order[n_output].n = n;
+    n_output++;
 }
 
 /* Display order at last: sorted by picture order count, and by which
  * instantaneous refresh they belong to, since the count restarts at every
  * one of those. */
-static void svuota_uscita(FILE *f)
+static void drain_output(FILE *f)
 {
-    if (ordine_uscita) qsort(ordine_uscita, (size_t)n_uscita,
-                             sizeof *ordine_uscita, confronta_ordine);
-    for (int i = 0; i < n_uscita; i++) {
-        if (f) fwrite(ordine_uscita[i].dati, 1, ordine_uscita[i].n, f);
-        free(ordine_uscita[i].dati);
+    if (output_order) qsort(output_order, (size_t)n_output,
+                             sizeof *output_order, compare_order);
+    for (int i = 0; i < n_output; i++) {
+        if (f) fwrite(output_order[i].data, 1, output_order[i].n, f);
+        free(output_order[i].data);
     }
-    free(ordine_uscita);
-    ordine_uscita = NULL;
-    n_uscita = cap_uscita = 0;
+    free(output_order);
+    output_order = NULL;
+    n_output = cap_output = 0;
 }
 
 
@@ -208,22 +208,22 @@ int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image,
 {
     (void)ctx; (void)image; (void)memory;
     (void)y; (void)ys; (void)uv; (void)uvs; (void)w; (void)h;
-    fprintf(stderr, "l'harness non ha una GPU a cui dare l'immagine\n");
+    fprintf(stderr, "the harness has no GPU to hand the picture to\n");
     abort();
 }
 
 int main(int argc, char **argv)
 {
-    bool zitto = false, solo_intestazioni = false;
-    const char *nome = NULL, *uscita = NULL;
+    bool quiet = false, headers_only = false;
+    const char *nome = NULL, *output = NULL;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-q") == 0) zitto = true;
-        else if (strcmp(argv[i], "-h") == 0) solo_intestazioni = true;
+        if (strcmp(argv[i], "-q") == 0) quiet = true;
+        else if (strcmp(argv[i], "-h") == 0) headers_only = true;
         else if (!nome) nome = argv[i];
-        else uscita = argv[i];
+        else output = argv[i];
     }
     if (!nome) {
-        fprintf(stderr, "uso: hevcps [-q] [-h] <file.265> [uscita.yuv]\n");
+        fprintf(stderr, "usage: hevcps [-q] [-h] <file.265> [output.yuv]\n");
         return 2;
     }
 
@@ -235,7 +235,7 @@ int main(int argc, char **argv)
     uint8_t *buf = malloc((size_t)len);
     uint8_t *rbsp = malloc((size_t)len);
     if (!buf || !rbsp || fread(buf, 1, (size_t)len, f) != (size_t)len) {
-        fprintf(stderr, "%s: non riesco a leggerlo\n", nome);
+        fprintf(stderr, "%s: cannot read it\n", nome);
         return 2;
     }
     fclose(f);
@@ -246,23 +246,23 @@ int main(int argc, char **argv)
 
     /* Clause 8.3.1, the picture order count: only its low bits are sent. */
     int prev_poc_lsb = 0, prev_poc_msb = 0;
-    int immagini = 0, slice_totali = 0, rifiutate = 0;
-    int slice_di_questa = 0;
+    int pictures = 0, total_slices = 0, refused = 0;
+    int slices_of_this = 0;
 
     /* The picture order counts seen since the last IDR. They must come out
      * as exactly 0..k-1: every one present, none twice. An IDR restarts
      * the count, so the check is per group and not over the whole file. */
-    int *poc_visti = calloc(4096, sizeof(int));
-    int n_visti = 0, gruppi_rotti = 0;
-    if (!poc_visti) return 2;
+    int *poc_seen = calloc(4096, sizeof(int));
+    int n_seen = 0, broken_groups = 0;
+    if (!poc_seen) return 2;
 
     hevc_decoder_t *dec = hevc_decoder_create(NULL, 0, 0);
     if (!dec) return 2;
-    int slice_lette = 0, slice_perse = 0, slice_saltate = 0;
-    FILE *fo = uscita ? fopen(uscita, "wb") : NULL;
-    if (uscita && !fo) { perror(uscita); return 2; }
-    bool immagine_aperta = false;
-    long base_ordine = 0, prossimo_ordine = 0, ordine_corrente = 0;
+    int slices_read = 0, slices_lost = 0, slices_skipped = 0;
+    FILE *fo = output ? fopen(output, "wb") : NULL;
+    if (output && !fo) { perror(output); return 2; }
+    bool picture_open = false;
+    long base_order = 0, next_order = 0, current_order = 0;
 
     for (long i = 0; i + 3 < len; ) {
         /* Find the start code, then the next one. */
@@ -271,8 +271,8 @@ int main(int argc, char **argv)
             i++;
             continue;
         }
-        long inizio = i + ((buf[i + 2] == 1) ? 3 : 4);
-        long fine = inizio;
+        long start = i + ((buf[i + 2] == 1) ? 3 : 4);
+        long fine = start;
         while (fine + 3 < len
                && !(buf[fine] == 0 && buf[fine + 1] == 0
                     && (buf[fine + 2] == 1
@@ -280,26 +280,26 @@ int main(int argc, char **argv)
             fine++;
         if (fine + 3 >= len) fine = len;
         i = fine;
-        if (inizio >= fine) continue;
+        if (start >= fine) continue;
 
-        const int tipo = (buf[inizio] >> 1) & 0x3f;
-        const size_t n = br_extract_rbsp(rbsp, (size_t)len, buf + inizio,
-                                         (size_t)(fine - inizio));
+        const int kind = (buf[start] >> 1) & 0x3f;
+        const size_t n = br_extract_rbsp(rbsp, (size_t)len, buf + start,
+                                         (size_t)(fine - start));
 
-        if (tipo == HEVC_NAL_SPS) {
+        if (kind == HEVC_NAL_SPS) {
             hevc_sps_t s;
-            const int r = hevc_ps_leggi_sps(&s, rbsp, n);
+            const int r = hevc_ps_read_sps(&s, rbsp, n);
             if (r) {
-                fprintf(stderr, "SPS rifiutato: %s\n", perche(r));
-                rifiutate++;
+                fprintf(stderr, "SPS refused: %s\n", perche(r));
+                refused++;
                 continue;
             }
             sps[s.sps_id] = s;
-            if (!zitto)
-                printf("SPS %d: %dx%d, ritaglio %d/%d/%d/%d, CTB %d, "
+            if (!quiet)
+                printf("SPS %d: %dx%d, crop %d/%d/%d/%d, CTB %d, "
                        "CB %d..%d, TB %d..%d, poc_lsb %d bit, "
-                       "sao %d amp %d smi %d tmvp %d, %d insiemi di "
-                       "riferimento\n",
+                       "sao %d amp %d smi %d tmvp %d, %d sets of "
+                       "references\n",
                        s.sps_id, s.width, s.height,
                        s.crop_left, s.crop_right, s.crop_top, s.crop_bottom,
                        s.ctb_size, 1 << s.log2_min_cb, 1 << s.log2_ctb,
@@ -307,19 +307,19 @@ int main(int argc, char **argv)
                        s.log2_max_poc_lsb, s.sao_enabled, s.amp_enabled,
                        s.strong_intra_smoothing, s.temporal_mvp_enabled,
                        s.num_st_rps);
-        } else if (tipo == HEVC_NAL_PPS) {
+        } else if (kind == HEVC_NAL_PPS) {
             hevc_pps_t p;
-            const int r = hevc_ps_leggi_pps(&p, rbsp, n);
+            const int r = hevc_ps_read_pps(&p, rbsp, n);
             if (r) {
-                fprintf(stderr, "PPS rifiutato: %s\n", perche(r));
-                rifiutate++;
+                fprintf(stderr, "PPS refused: %s\n", perche(r));
+                refused++;
                 continue;
             }
             pps[p.pps_id] = p;
-            if (!zitto)
+            if (!quiet)
                 printf("PPS %d (SPS %d): qp %d, cu_qp_delta %d/%d, "
-                       "croma %+d%+d, pesi %d/%d, tile %dx%d, wpp %d, "
-                       "deblk %s, liste %d/%d, merge %d\n",
+                       "chroma %+d%+d, weights %d/%d, tile %dx%d, wpp %d, "
+                       "deblk %s, lists %d/%d, merge %d\n",
                        p.pps_id, p.sps_id, p.init_qp,
                        p.cu_qp_delta_enabled, p.diff_cu_qp_delta_depth,
                        p.cb_qp_offset, p.cr_qp_offset,
@@ -329,31 +329,31 @@ int main(int argc, char **argv)
                        p.deblocking_filter_disabled ? "no" : "si",
                        p.num_ref_idx_default[0], p.num_ref_idx_default[1],
                        p.log2_parallel_merge_level);
-        } else if (hevc_nal_e_slice(tipo)) {
+        } else if (hevc_nal_e_slice(kind)) {
             hevc_slice_t s;
-            const int r = hevc_ps_leggi_slice(&s, rbsp, n, tipo, sps, pps);
+            const int r = hevc_ps_read_slice(&s, rbsp, n, kind, sps, pps);
             if (r) {
-                fprintf(stderr, "slice rifiutata: %s\n", perche(r));
-                rifiutate++;
+                fprintf(stderr, "slice refused: %s\n", perche(r));
+                refused++;
                 continue;
             }
             if (s.dependent_slice_segment) {
-                fprintf(stderr, "segmenti dipendenti: non supportati\n");
-                rifiutate++;
+                fprintf(stderr, "dependent slice segments: not supported\n");
+                refused++;
                 continue;
             }
 
             if (s.first_slice_in_pic) {
-                if (immagini && !zitto)
-                    printf("     (%d slice)\n", slice_di_questa);
-                slice_di_questa = 0;
-                immagini++;
+                if (pictures && !quiet)
+                    printf("     (%d slice)\n", slices_of_this);
+                slices_of_this = 0;
+                pictures++;
 
                 /* 8.3.1. An IRAP that starts the sequence resets it. */
-                if (hevc_nal_e_idr(tipo)) {
+                if (hevc_nal_e_idr(kind)) {
                     /* An IDR ends one group and starts the next. */
-                    if (!verifica_gruppo(poc_visti, n_visti)) gruppi_rotti++;
-                    n_visti = 0;
+                    if (!check_group(poc_seen, n_seen)) broken_groups++;
+                    n_seen = 0;
                     s.poc = 0;
                     prev_poc_lsb = 0;
                     prev_poc_msb = 0;
@@ -374,85 +374,85 @@ int main(int argc, char **argv)
                     prev_poc_msb = msb;
                 }
 
-                if (n_visti < 4096) poc_visti[n_visti++] = s.poc;
+                if (n_seen < 4096) poc_seen[n_seen++] = s.poc;
 
-                if (!zitto)
+                if (!quiet)
                     printf("  %-10s %c poc %3d qp %2d rif %d/%d sao %d%d "
                            "merge %d",
-                           nome_nal(tipo), tipo_slice[s.type], s.poc, s.qp,
+                           nome_nal(kind), slice_type_of[s.type], s.poc, s.qp,
                            s.num_ref_idx[0], s.num_ref_idx[1],
                            s.sao_luma, s.sao_chroma,
                            5 - s.five_minus_max_num_merge_cand);
-                if (!zitto && s.type != 2) {
+                if (!quiet && s.type != 2) {
                     printf(" rps");
                     for (int k = 0; k < s.st_rps.num_negative
                                         + s.st_rps.num_positive; k++)
                         printf(" %+d%s", s.st_rps.delta_poc[k],
                                s.st_rps.used[k] ? "" : "-");
                 }
-                if (!zitto) printf("\n");
+                if (!quiet) printf("\n");
             }
-            slice_di_questa++;
-            slice_totali++;
+            slices_of_this++;
+            total_slices++;
 
-            if (!solo_intestazioni) {
+            if (!headers_only) {
                 const hevc_sps_t *sp = &sps[pps[s.pps_id].sps_id];
-                hevc_decoder_sposta_entry_point(
-                    &s, buf + inizio, (size_t)(fine - inizio),
+                hevc_decoder_shift_entry_points(
+                    &s, buf + start, (size_t)(fine - start),
                     s.data_bit_offset >> 3);
                 if (s.first_slice_in_pic) {
-                    if (immagine_aperta) {
-                        scrivi_immagine(fo, dec, sp, ordine_corrente);
-                        immagine_aperta = false;
+                    if (picture_open) {
+                        write_picture(fo, dec, sp, current_order);
+                        picture_open = false;
                     }
                     if (s.nal_type == HEVC_NAL_IDR_W_RADL
                         || s.nal_type == HEVC_NAL_IDR_N_LP)
-                        base_ordine = prossimo_ordine;
-                    hevc_decoder_sfoltisci(dec, &s);
+                        base_order = next_order;
+                    hevc_decoder_unescape(dec, &s);
                     if (hevc_decoder_begin_picture(dec, sp, &pps[s.pps_id],
-                                                   (uintptr_t)immagini, s.poc)) {
-                        slice_perse++;
+                                                   (uintptr_t)pictures, s.poc)) {
+                        slices_lost++;
                         continue;
                     }
-                    ordine_corrente = base_ordine + s.poc;
-                    if (ordine_corrente >= prossimo_ordine)
-                        prossimo_ordine = ordine_corrente + 1;
+                    current_order = base_order + s.poc;
+                    if (current_order >= next_order)
+                        next_order = current_order + 1;
                 }
                 const int e = hevc_decoder_slice(dec, &s, rbsp, n);
                 if (e == 4) {
-                    slice_saltate++;
-                    if (immagine_aperta)
-                        scrivi_immagine(fo, dec, sp, ordine_corrente);
-                    immagine_aperta = false;
+                    slices_skipped++;
+                    if (picture_open)
+                        write_picture(fo, dec, sp, current_order);
+                    picture_open = false;
                     if (fo) { fclose(fo); fo = NULL; }
                 } else if (e) {
-                    slice_perse++;
-                    if (!zitto)
-                        printf("     ^ %s\n", hevc_decoder_motivo(e));
+                    slices_lost++;
+                    if (!quiet)
+                        printf("     ^ %s\n", hevc_decoder_reason(e));
                 } else {
-                    slice_lette++;
-                    immagine_aperta = true;
+                    slices_read++;
+                    picture_open = true;
                 }
             }
         }
     }
-    if (immagini && !zitto)
-        printf("     (%d slice)\n", slice_di_questa);
+    if (pictures && !quiet)
+        printf("     (%d slice)\n", slices_of_this);
 
-    if (immagine_aperta) {
+    if (picture_open) {
         const hevc_sps_t *sp = NULL;
         for (int k = 0; k < 16; k++) if (sps[k].valid) { sp = &sps[k]; break; }
-        if (sp) scrivi_immagine(fo, dec, sp, ordine_corrente);
+        if (sp) write_picture(fo, dec, sp, current_order);
     }
-    svuota_uscita(fo);
+    drain_output(fo);
     if (fo) fclose(fo);
-    if (!verifica_gruppo(poc_visti, n_visti)) gruppi_rotti++;
+    if (!check_group(poc_seen, n_seen)) broken_groups++;
 
-    printf("%d immagini, %d slice, %d rifiutate, %d gruppi con poc rotti, "
-           "%d percorse, %d saltate, %d perse\n",
-           immagini, slice_totali, rifiutate, gruppi_rotti,
-           slice_lette, slice_saltate, slice_perse);
-    free(buf); free(rbsp); free(sps); free(pps); free(poc_visti);
+    printf("%d pictures, %d slices, %d refused, %d groups with broken poc, "
+           "%d walked, %d skipped, %d lost\n",
+           pictures, total_slices, refused, broken_groups,
+           slices_read, slices_skipped, slices_lost);
+    free(buf); free(rbsp); free(sps); free(pps); free(poc_seen);
     hevc_decoder_destroy(dec);
-    return (rifiutate || gruppi_rotti || slice_perse) ? 1 : 0;
+    return (refused || broken_groups || slices_lost) ? 1 : 0;
 }

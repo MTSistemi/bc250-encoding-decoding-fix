@@ -62,11 +62,11 @@ enum {
  * macroblock did not use and a union would make that undefined. */
 typedef struct {
     int16_t luma[16][16];         /* [block][coefficient], raster inside */
-    int16_t croma[2][4][16];      /* âš ï¸ four blocks a plane at 4:2:0 */
+    int16_t chroma[2][4][16];      /* âš ï¸ four blocks a plane at 4:2:0 */
     int16_t coeff8[4][64];        /* the 8x8 transform's luma blocks */
     int16_t dc_luma[16];
     int16_t dc_chroma[2][4];
-} h264d_residuo_t;
+} h264d_residual_t;
 
 /* One decoded picture's worth of working state. */
 struct h264_decoder {
@@ -117,11 +117,11 @@ struct h264_decoder {
     /* One residual per macroblock. The entropy decoder fills them in and
      * reconstruction reads them; keeping them apart is what lets the
      * second run behind the first. */
-    h264d_residuo_t *residui;
-    int n_residui;                /* a ring of righe_banda + 1 rows */
-    int righe_banda;
-    int da_ricostruire;           /* first macroblock not yet reconstructed */
-    h264d_residuo_t *res;         /* the one being filled in right now */
+    h264d_residual_t *residuals;
+    int n_residuals;                /* a ring of band_rows + 1 rows */
+    int band_rows;
+    int to_reconstruct;           /* first macroblock not yet reconstructed */
+    h264d_residual_t *res;         /* the one being filled in right now */
 };
 
 /* ---- neighbours ------------------------------------------------------- */
@@ -160,9 +160,9 @@ static inline const h264d_mb_t *h264d_mb_top_right(const h264_decoder_t *d)
 }
 
 /* The residual slot this macroblock fills in. */
-static inline void h264d_punta_residuo(h264_decoder_t *d)
+static inline void h264d_residual_at(h264_decoder_t *d)
 {
-    d->res = &d->residui[d->mb_idx % d->n_residui];
+    d->res = &d->residuals[d->mb_idx % d->n_residuals];
 }
 
 /* ---- the macroblock layer --------------------------------------------- */
@@ -186,8 +186,8 @@ void h264d_reconstruct_mb(h264_decoder_t *d);
  * the thread pool when there is one and the run is long enough to pay for
  * it, in order on this thread otherwise. Either way the picture is the
  * same to the byte. */
-void h264d_reconstruct_range(h264_decoder_t *d, int primo, int quanti,
-                             int numero_slice);
+void h264d_reconstruct_range(h264_decoder_t *d, int first, int count,
+                             int slice_number);
 
 /* The reconstruction threads. Started on the first picture and kept until
  * the decoder is destroyed; BC250_H264_THREADS sets how many, and 1 turns
@@ -202,12 +202,12 @@ void h264d_deblock_wavefront(h264_decoder_t *d, const h264d_deblock_pic_t *dp);
 
 /* One slice on the cursor it is handed. The pool calls this on a copy of
  * the decoder with buffers of its own. */
-int h264d_decodifica_slice(h264_decoder_t *d, const h264d_slice_input_t *in,
-                           int numero);
+int h264d_decode_slice(h264_decoder_t *d, const h264d_slice_input_t *in,
+                           int number);
 
 /* Several slices at once, one per worker. Returns the first failure. */
 int h264d_slices_pool(h264_decoder_t *d, const h264d_slice_input_t *in,
-                      int n, int primo_numero);
+                      int n, int first_number);
 
 /* Motion vector prediction, 8.4.1.3. */
 void h264d_predict_mv(h264_decoder_t *d, int list, int blk, int w4, int h4,
@@ -216,17 +216,17 @@ void h264d_predict_mv(h264_decoder_t *d, int list, int blk, int w4, int h4,
 /* The vector of a skipped P macroblock, 8.4.1.1. */
 void h264d_skip_mv_p(h264_decoder_t *d, int16_t out[2]);
 
-/* Spatial direct prediction for a B macroblock, 8.4.1.2.2. `maschera` says
+/* Spatial direct prediction for a B macroblock, 8.4.1.2.2. `mask` says
  * which of the four 8x8 partitions to fill in, because a B_8x8 can be
  * direct in some of them and explicit in the rest. */
-int h264d_direct_spatial(h264_decoder_t *d, h264d_mb_t *m, int maschera);
+int h264d_direct_spatial(h264_decoder_t *d, h264d_mb_t *m, int mask);
 
 /* Temporal direct prediction, 8.4.1.2.2's other half: 8.4.1.2.3. Same
  * arguments, and the co-located block's vector rescaled by picture
  * distance instead of the neighbours' consensus. */
-int h264d_direct_temporal(h264_decoder_t *d, h264d_mb_t *m, int maschera);
+int h264d_direct_temporal(h264_decoder_t *d, h264d_mb_t *m, int mask);
 
 /* Whichever one direct_spatial_mv_pred_flag asked for. */
-int h264d_direct(h264_decoder_t *d, h264d_mb_t *m, int maschera);
+int h264d_direct(h264_decoder_t *d, h264d_mb_t *m, int mask);
 
 #endif /* BC250_H264_DEC_INTERNAL_H */

@@ -26,4 +26,4 @@ gcc -O2 -g -Wall -Wextra -std=gnu11 \
     "$D/src/h264_dec_tables.c" \
     "$D/src/cabac.c" \
     -pthread -lm
-echo "fatto: $OUT"
+echo "done: $OUT"

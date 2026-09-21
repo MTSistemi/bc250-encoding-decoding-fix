@@ -172,9 +172,9 @@ typedef struct {
 } hevc_slice_t;
 
 /* Returns 0, or a negative code naming what was refused. */
-int hevc_ps_leggi_sps(hevc_sps_t *out, const uint8_t *rbsp, size_t n);
-int hevc_ps_leggi_pps(hevc_pps_t *out, const uint8_t *rbsp, size_t n);
-int hevc_ps_leggi_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
+int hevc_ps_read_sps(hevc_sps_t *out, const uint8_t *rbsp, size_t n);
+int hevc_ps_read_pps(hevc_pps_t *out, const uint8_t *rbsp, size_t n);
+int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
                         int nal_type, const hevc_sps_t *sps_store,
                         const hevc_pps_t *pps_store);
 

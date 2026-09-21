@@ -18,4 +18,4 @@ for f in cabac.c data.c filter.c dsp.c pred_template.c; do
     curl -fsS -o "$DIR/$f" "$BASE/$f"
     printf '  %-20s %s\n' "$f" "$(wc -c < "$DIR/$f") byte"
 done
-echo "pronti in $DIR, da FFmpeg $TAG"
+echo "ready in $DIR, from FFmpeg $TAG"

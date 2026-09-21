@@ -47,29 +47,29 @@ void bc250_hevc_dec_free(bc250_context *c)
     bc250_hevc_dec_reset(c);
 }
 
-static bool cresci_slices(bc250_context *c)
+static bool grow_slices(bc250_context *c)
 {
     if (c->hevc_dec_state.n_slices < c->hevc_dec_state.cap_slices) return true;
-    const int nuovo = c->hevc_dec_state.cap_slices
+    const int new_one = c->hevc_dec_state.cap_slices
         ? c->hevc_dec_state.cap_slices * 2 : 16;
     void *p = realloc(c->hevc_dec_state.slices,
-                      (size_t)nuovo * sizeof(*c->hevc_dec_state.slices));
+                      (size_t)new_one * sizeof(*c->hevc_dec_state.slices));
     if (!p) return false;
     c->hevc_dec_state.slices = p;
-    c->hevc_dec_state.cap_slices = nuovo;
+    c->hevc_dec_state.cap_slices = new_one;
     return true;
 }
 
-static bool cresci_dati(bc250_context *c, size_t quanti)
+static bool grow_data(bc250_context *c, size_t count)
 {
-    const size_t serve = c->hevc_dec_state.n_data + quanti;
+    const size_t serve = c->hevc_dec_state.n_data + count;
     if (serve <= c->hevc_dec_state.cap_data) return true;
-    size_t nuovo = c->hevc_dec_state.cap_data ? c->hevc_dec_state.cap_data : 65536;
-    while (nuovo < serve) nuovo *= 2;
-    uint8_t *p = realloc(c->hevc_dec_state.data, nuovo);
+    size_t new_one = c->hevc_dec_state.cap_data ? c->hevc_dec_state.cap_data : 65536;
+    while (new_one < serve) new_one *= 2;
+    uint8_t *p = realloc(c->hevc_dec_state.data, new_one);
     if (!p) return false;
     c->hevc_dec_state.data = p;
-    c->hevc_dec_state.cap_data = nuovo;
+    c->hevc_dec_state.cap_data = new_one;
     return true;
 }
 
@@ -97,7 +97,7 @@ VAStatus bc250_hevc_dec_render(bc250_context *c, bc250_buffer *b)
         if (b->size < sizeof(VASliceParameterBufferHEVC))
             return VA_STATUS_ERROR_INVALID_PARAMETER;
         for (unsigned k = 0; k < n; k++) {
-            if (!cresci_slices(c)) return VA_STATUS_ERROR_ALLOCATION_FAILED;
+            if (!grow_slices(c)) return VA_STATUS_ERROR_ALLOCATION_FAILED;
             const VASliceParameterBufferHEVC *src =
                 (const VASliceParameterBufferHEVC *)
                 ((const uint8_t *)b->data + (size_t)k * b->size);
@@ -111,16 +111,16 @@ VAStatus bc250_hevc_dec_render(bc250_context *c, bc250_buffer *b)
     }
 
     case VASliceDataBufferType: {
-        const size_t totale = (size_t)b->size
+        const size_t total = (size_t)b->size
             * (b->num_elements ? b->num_elements : 1);
         for (int i = 0; i < c->hevc_dec_state.n_slices; i++) {
             if (c->hevc_dec_state.slices[i].off != (size_t)-1) continue;
             const VASliceParameterBufferHEVC *p = &c->hevc_dec_state.slices[i].p;
             if (p->slice_data_flag != VA_SLICE_DATA_FLAG_ALL)
                 return VA_STATUS_ERROR_UNIMPLEMENTED;
-            if ((size_t)p->slice_data_offset + p->slice_data_size > totale)
+            if ((size_t)p->slice_data_offset + p->slice_data_size > total)
                 return VA_STATUS_ERROR_INVALID_PARAMETER;
-            if (!cresci_dati(c, p->slice_data_size))
+            if (!grow_data(c, p->slice_data_size))
                 return VA_STATUS_ERROR_ALLOCATION_FAILED;
             memcpy(c->hevc_dec_state.data + c->hevc_dec_state.n_data,
                    (const uint8_t *)b->data + p->slice_data_offset,
@@ -139,7 +139,7 @@ VAStatus bc250_hevc_dec_render(bc250_context *c, bc250_buffer *b)
 
 /* --------------------------------------------------------- translation */
 
-static void riempi_sps(const VAPictureParameterBufferHEVC *p, hevc_sps_t *s)
+static void fill_sps(const VAPictureParameterBufferHEVC *p, hevc_sps_t *s)
 {
     memset(s, 0, sizeof *s);
     s->valid = true;
@@ -191,7 +191,7 @@ static void riempi_sps(const VAPictureParameterBufferHEVC *p, hevc_sps_t *s)
     s->num_st_rps = 0;
 }
 
-static void riempi_pps(const VAPictureParameterBufferHEVC *p, hevc_pps_t *q)
+static void fill_pps(const VAPictureParameterBufferHEVC *p, hevc_pps_t *q)
 {
     memset(q, 0, sizeof *q);
     q->valid = true;
@@ -239,7 +239,7 @@ static void riempi_pps(const VAPictureParameterBufferHEVC *p, hevc_pps_t *q)
         p->slice_parsing_fields.bits.slice_segment_header_extension_present_flag;
 }
 
-static bool valida(const VAPictureHEVC *p)
+static bool is_valid(const VAPictureHEVC *p)
 {
     return !(p->flags & VA_PICTURE_HEVC_INVALID)
         && p->picture_id != VA_INVALID_SURFACE;
@@ -272,24 +272,24 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
 
     hevc_sps_t sps;
     hevc_pps_t pps;
-    riempi_sps(pp, &sps);
-    riempi_pps(pp, &pps);
+    fill_sps(pp, &sps);
+    fill_pps(pp, &pps);
     if (sps.width != c->width || sps.height != c->height)
         return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
 
     /* Which surfaces are still references. This runs before the picture is
      * opened, so that the one about to be decoded cannot be handed a slot
      * it is about to read from. */
-    uintptr_t rif[16];
+    uintptr_t ref_pic[16];
     int poc[16];
-    int n_rif = 0;
-    for (int i = 0; i < 15 && n_rif < 16; i++) {
-        if (!valida(&pp->ReferenceFrames[i])) continue;
-        rif[n_rif] = (uintptr_t)pp->ReferenceFrames[i].picture_id;
-        poc[n_rif] = pp->ReferenceFrames[i].pic_order_cnt;
-        n_rif++;
+    int n_refs = 0;
+    for (int i = 0; i < 15 && n_refs < 16; i++) {
+        if (!is_valid(&pp->ReferenceFrames[i])) continue;
+        ref_pic[n_refs] = (uintptr_t)pp->ReferenceFrames[i].picture_id;
+        poc[n_refs] = pp->ReferenceFrames[i].pic_order_cnt;
+        n_refs++;
     }
-    hevc_decoder_set_references(dec, rif, poc, n_rif);
+    hevc_decoder_set_references(dec, ref_pic, poc, n_refs);
 
     if (hevc_decoder_begin_picture(dec, &sps, &pps,
                                    (uintptr_t)c->current_render_target,
@@ -318,8 +318,8 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
         const size_t n = br_extract_rbsp(c->hevc_dec_state.rbsp, len, nal, len);
 
         hevc_slice_t sl;
-        const int tipo = (nal[0] >> 1) & 0x3f;
-        if (hevc_ps_leggi_slice(&sl, c->hevc_dec_state.rbsp, n, tipo,
+        const int kind = (nal[0] >> 1) & 0x3f;
+        if (hevc_ps_read_slice(&sl, c->hevc_dec_state.rbsp, n, kind,
                                 sps_store, pps_store) != 0)
             continue;              /* a slice we cannot read, not a guess */
 
@@ -328,7 +328,7 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
          * the count's low bits would need the previous picture's, and a
          * decoder that has just been seeked to has no previous picture. */
         sl.poc = pp->CurrPic.pic_order_cnt;
-        hevc_decoder_sposta_entry_point(&sl, nal, len, sl.data_bit_offset >> 3);
+        hevc_decoder_shift_entry_points(&sl, nal, len, sl.data_bit_offset >> 3);
 
         hevc_decoder_slice(dec, &sl, c->hevc_dec_state.rbsp, n);
     }
@@ -337,7 +337,7 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
      * that is never ended leaves the buffer holding a slot no later one
      * can reuse, and the application still gets its surface back. */
     hevc_decoder_end_picture(dec);
-    if (hevc_decoder_carica(dec, out, mem) != 0)
+    if (hevc_decoder_load(dec, out, mem) != 0)
         return VA_STATUS_ERROR_OPERATION_FAILED;
     return VA_STATUS_SUCCESS;
 }

@@ -69,15 +69,15 @@ typedef struct {
  * pointed at, and the index it used means nothing outside the slice that
  * wrote it. */
 typedef struct {
-    uint8_t *piano[3];
-    int passo[3];
+    uint8_t *plane[3];
+    int stride[3];
     size_t n_piano;
     int poc;
-    bool valida;
+    bool is_valid;
     hevcd_mvf_t *mvf;
     size_t n_mvf;
-    int poc_lista[2][16];
-    int n_lista[2];
+    int poc_list[2][16];
+    int n_list[2];
 } hevcd_img_t;
 
 /* One coding tree block's sample adaptive offset, 7.3.8.3.
@@ -87,10 +87,10 @@ typedef struct {
  * whichever direction, which is why it is the last thing to run and why
  * nothing predicts from anything but its output. */
 typedef struct {
-    uint8_t tipo[3];        /* 0 nothing, 1 by band, 2 by edge */
+    uint8_t kind[3];        /* 0 nothing, 1 by band, 2 by edge */
     int8_t off[3][4];       /* signed already: edge offsets have fixed signs */
-    uint8_t posizione[3];   /* which four bands, for the band type */
-    uint8_t classe[3];      /* which way the edge runs, for the edge type */
+    uint8_t position[3];   /* which four bands, for the band type */
+    uint8_t category[3];      /* which way the edge runs, for the edge type */
 } hevcd_sao_t;
 
 typedef struct {
@@ -121,12 +121,12 @@ typedef struct {
      * only ever looks at that grid, so a transform block boundary at four
      * samples is not one of these: it is a boundary the filter is not
      * allowed to cross. */
-    uint8_t *bordi;
-    int bordi_passo;
-    size_t n_bordi;
+    uint8_t *edges;
+    int edges_stride;
+    size_t n_edges;
     /* Per min coding block: a unit whose samples the loop filters must
      * leave exactly as they are. Lossless coding, today. */
-    uint8_t *no_filtro;
+    uint8_t *no_filter;
     /* Per smallest transform block: does it carry a luma residual. The
      * boundary strength asks, and only about luma. */
     uint8_t *cbf_map;
@@ -136,9 +136,9 @@ typedef struct {
      * filter touched them, so it cannot read the plane it is writing. */
     hevcd_sao_t *sao;
     size_t n_sao;
-    uint8_t *copia[3];
-    size_t n_copia;
-    size_t n_ct_depth, n_intra_mode, n_zs, n_qp, n_no_filtro, n_skip;
+    uint8_t *copy_of[3];
+    size_t n_copy;
+    size_t n_ct_depth, n_intra_mode, n_zs, n_qp, n_no_filter, n_skip;
     int min_pu_width, min_pu_height;
 
     /* The coding unit being read. */
@@ -161,7 +161,7 @@ typedef struct {
     int qg_x, qg_y;
     /* The group takes the slice's parameter rather than the previous
      * group's: first of a slice, of a tile, or of a row under WPP. */
-    bool qg_riparte;
+    bool qg_restarts;
     bool cu_qp_delta_coded;
     int cu_qp_delta;
 
@@ -171,8 +171,8 @@ typedef struct {
 
     /* Where the picture is written. The decoder owns these; the harness
      * reads them back. */
-    uint8_t *piano[3];
-    int passo[3];
+    uint8_t *plane[3];
+    int stride[3];
     size_t n_piano;
 
     /* The picture being decoded, its motion field, and what it predicts
@@ -182,64 +182,64 @@ typedef struct {
      * about how long anything stays. */
     hevcd_img_t *buf;
     int n_buf;
-    hevcd_img_t *corrente;
+    hevcd_img_t *current;
     hevcd_mvf_t *mvf;
-    const hevcd_img_t *rif[2][16];
-    int n_rif[2];
+    const hevcd_img_t *ref_pic[2][16];
+    int n_refs[2];
     const hevcd_img_t *col;         /* the collocated picture, or NULL */
 
     int ctb_addr;                   /* in the picture's raster order */
-    bool fine_slice;
+    bool slice_end;
 } hevcd_t;
 
 /* Reading one coding tree unit and everything inside it. Returns 0, or
  * non-zero when the slice cannot go on. */
-int hevcd_leggi_ctu(hevcd_t *d, int x0, int y0);
+int hevcd_read_ctu(hevcd_t *d, int x0, int y0);
 
 /* Several coding tree block rows at once, when the stream was written to
  * allow it. Returns the same reasons as the serial walk, or -1 when this
  * slice is not one it can split up. */
 int hevcd_wavefront(hevcd_t *d, const hevc_sps_t *sps, const hevc_pps_t *pps,
-                    const hevc_slice_t *sl, const uint8_t *base, size_t resto,
+                    const hevc_slice_t *sl, const uint8_t *base, size_t rest,
                     int init_type);
 
 /* 8.7.2 and 8.7.3, over the whole finished picture, in that order. */
-void hevcd_deblocca(hevcd_t *d);
+void hevcd_deblock(hevcd_t *d);
 void hevcd_sao(hevcd_t *d);
-void hevcd_libera_filtri(hevcd_t *d);
+void hevcd_free_filters(hevcd_t *d);
 
 /* 8.5.3.2: what motion one prediction unit ended up with, and 8.5.3.3:
  * the samples that motion fetches. */
 void hevcd_merge(hevcd_t *d, int x0, int y0, int w, int h, int part_idx,
-                 int merge_idx, hevcd_mvf_t *fuori);
-void hevcd_amvp(hevcd_t *d, int x0, int y0, int w, int h, int lista,
+                 int merge_idx, hevcd_mvf_t *out);
+void hevcd_amvp(hevcd_t *d, int x0, int y0, int w, int h, int list_idx,
                 int mvp_flag, hevcd_mvf_t *mv);
-void hevcd_predici_inter(hevcd_t *d, int x0, int y0, int w, int h,
+void hevcd_predict_inter(hevcd_t *d, int x0, int y0, int w, int h,
                          const hevcd_mvf_t *m);
 
 /* How many prediction units a partition mode has, and where the k-th one
- * sits inside a coding block of side `lato`. */
-int hevcd_quante_pu(int part_mode);
-void hevcd_rettangolo_pu(int part_mode, int k, int lato,
+ * sits inside a coding block of side `side`. */
+int hevcd_pu_count(int part_mode);
+void hevcd_pu_rect(int part_mode, int k, int side,
                          int *x, int *y, int *w, int *h);
 
 /* residual_coding(), clause 7.3.8.11. The coefficients land in d->coeff,
  * in raster order inside the transform block. */
-void hevcd_leggi_residuo(hevcd_t *d, int x0, int y0, int log2_size, int c_idx);
+void hevcd_read_residual(hevcd_t *d, int x0, int y0, int log2_size, int c_idx);
 
 /* Intra prediction, 8.4.4.2: writes the prediction straight into the
  * picture, where the residual is then added to it. */
-void hevcd_predici_intra(hevcd_t *d, int c_idx, int x0, int y0, int log2_size,
-                         int modo);
+void hevcd_predict_intra(hevcd_t *d, int c_idx, int x0, int y0, int log2_size,
+                         int mode);
 
 /* 8.6.2 to 8.6.4: the coefficients into a residual, and onto the picture. */
 void hevcd_dequantizza(int16_t *coeff, int log2_size, int qp);
-void hevcd_trasforma(int16_t *coeff, int log2_size, bool dst);
-void hevcd_salta_trasformata(int16_t *coeff, int log2_size);
-void hevcd_aggiungi(uint8_t *dst, int passo, const int16_t *res, int log2_size);
+void hevcd_transform(int16_t *coeff, int log2_size, bool dst);
+void hevcd_skip_transform(int16_t *coeff, int log2_size);
+void hevcd_add(uint8_t *dst, int stride, const int16_t *res, int log2_size);
 
 /* 6.5.2: the z-scan address of every smallest transform block. Built once
  * per sequence parameter set. */
-int hevcd_prepara_zscan(hevcd_t *d);
+int hevcd_prepare_zscan(hevcd_t *d);
 
 #endif /* BC250_HEVC_DEC_INTERNAL_H */

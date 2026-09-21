@@ -23,12 +23,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-static inline int ritaglia(int v, int lo, int hi)
+static inline int clip(int v, int lo, int hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-static inline uint8_t ritaglia8(int v)
+static inline uint8_t clip8(int v)
 {
     return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
 }
@@ -36,39 +36,39 @@ static inline uint8_t ritaglia8(int v)
 /* The luma parameter of the coding unit covering a sample. */
 static int qp_di(const hevcd_t *d, int x, int y)
 {
-    const int passo = d->sps->min_cb_width;
+    const int stride = d->sps->min_cb_width;
     const int l = d->sps->log2_min_cb;
-    return d->qp_y_map[(y >> l) * passo + (x >> l)];
+    return d->qp_y_map[(y >> l) * stride + (x >> l)];
 }
 
 /* A coding unit coded losslessly keeps its samples exactly as they are:
  * filtering them would be the one thing that made the stream lossy. */
-static bool intoccabile(const hevcd_t *d, int x, int y)
+static bool untouchable(const hevcd_t *d, int x, int y)
 {
-    if (!d->no_filtro) return false;
-    const int passo = d->sps->min_cb_width;
+    if (!d->no_filter) return false;
+    const int stride = d->sps->min_cb_width;
     const int l = d->sps->log2_min_cb;
-    return d->no_filtro[(y >> l) * passo + (x >> l)] != 0;
+    return d->no_filter[(y >> l) * stride + (x >> l)] != 0;
 }
 
 /* One four-line segment of a luma edge.
  *
- * `base` points at q0 of the first line, `avanti` steps from p to q and
+ * `base` points at q0 of the first line, `forward` steps from p to q and
  * `giu` steps from one line to the next: for a vertical edge those are one
  * sample and one row, for a horizontal edge the other way round. Writing
  * it once in these two steps is what keeps the two directions from
  * drifting apart, which is where a hand-unrolled deblocking filter usually
  * goes wrong.
  */
-static void filtra_luma(uint8_t *base, int avanti, int giu,
-                        int beta, int tc, bool tieni_p, bool tieni_q)
+static void filter_luma(uint8_t *base, int forward, int giu,
+                        int beta, int tc, bool keep_p, bool keep_q)
 {
-#define P(k, i) ((int)base[(i) * giu - ((k) + 1) * avanti])
-#define Q(k, i) ((int)base[(i) * giu + (k) * avanti])
-#define SCRIVI_P(k, i, v) \
-    do { if (!tieni_p) base[(i) * giu - ((k) + 1) * avanti] = (v); } while (0)
-#define SCRIVI_Q(k, i, v) \
-    do { if (!tieni_q) base[(i) * giu + (k) * avanti] = (v); } while (0)
+#define P(k, i) ((int)base[(i) * giu - ((k) + 1) * forward])
+#define Q(k, i) ((int)base[(i) * giu + (k) * forward])
+#define WRITE_P(k, i, v) \
+    do { if (!keep_p) base[(i) * giu - ((k) + 1) * forward] = (v); } while (0)
+#define WRITE_Q(k, i, v) \
+    do { if (!keep_q) base[(i) * giu + (k) * forward] = (v); } while (0)
 
     /* 8.7.2.5.3. The decision looks at the first and the last line of the
      * four and at nothing in between: four lines of an eight-sample block
@@ -83,7 +83,7 @@ static void filtra_luma(uint8_t *base, int avanti, int giu,
     if (dpq0 + dpq3 >= beta) return;
 
     const int dp = dp0 + dp3, dq = dq0 + dq3;
-    const int soglia = (5 * tc + 1) >> 1;
+    const int threshold = (5 * tc + 1) >> 1;
 
     /* 8.7.2.5.6: strong only when the step really is a step - flat on both
      * sides, and the jump across small enough to be an artefact rather
@@ -93,7 +93,7 @@ static void filtra_luma(uint8_t *base, int avanti, int giu,
         const int dpq = 2 * (i == 0 ? dpq0 : dpq3);
         forte = dpq < (beta >> 2)
              && abs(P(3, i) - P(0, i)) + abs(Q(0, i) - Q(3, i)) < (beta >> 3)
-             && abs(P(0, i) - Q(0, i)) < soglia;
+             && abs(P(0, i) - Q(0, i)) < threshold;
     }
 
     if (forte) {
@@ -103,20 +103,20 @@ static void filtra_luma(uint8_t *base, int avanti, int giu,
         for (int i = 0; i < 4; i++) {
             const int p0 = P(0, i), p1 = P(1, i), p2 = P(2, i), p3 = P(3, i);
             const int q0 = Q(0, i), q1 = Q(1, i), q2 = Q(2, i), q3 = Q(3, i);
-            SCRIVI_P(0, i, (uint8_t)ritaglia((p2 + 2 * p1 + 2 * p0 + 2 * q0
+            WRITE_P(0, i, (uint8_t)clip((p2 + 2 * p1 + 2 * p0 + 2 * q0
                                               + q1 + 4) >> 3,
                                              p0 - 2 * tc, p0 + 2 * tc));
-            SCRIVI_P(1, i, (uint8_t)ritaglia((p2 + p1 + p0 + q0 + 2) >> 2,
+            WRITE_P(1, i, (uint8_t)clip((p2 + p1 + p0 + q0 + 2) >> 2,
                                              p1 - 2 * tc, p1 + 2 * tc));
-            SCRIVI_P(2, i, (uint8_t)ritaglia((2 * p3 + 3 * p2 + p1 + p0 + q0
+            WRITE_P(2, i, (uint8_t)clip((2 * p3 + 3 * p2 + p1 + p0 + q0
                                               + 4) >> 3,
                                              p2 - 2 * tc, p2 + 2 * tc));
-            SCRIVI_Q(0, i, (uint8_t)ritaglia((p1 + 2 * p0 + 2 * q0 + 2 * q1
+            WRITE_Q(0, i, (uint8_t)clip((p1 + 2 * p0 + 2 * q0 + 2 * q1
                                               + q2 + 4) >> 3,
                                              q0 - 2 * tc, q0 + 2 * tc));
-            SCRIVI_Q(1, i, (uint8_t)ritaglia((p0 + q0 + q1 + q2 + 2) >> 2,
+            WRITE_Q(1, i, (uint8_t)clip((p0 + q0 + q1 + q2 + 2) >> 2,
                                              q1 - 2 * tc, q1 + 2 * tc));
-            SCRIVI_Q(2, i, (uint8_t)ritaglia((p0 + q0 + q1 + 3 * q2 + 2 * q3
+            WRITE_Q(2, i, (uint8_t)clip((p0 + q0 + q1 + 3 * q2 + 2 * q3
                                               + 4) >> 3,
                                              q2 - 2 * tc, q2 + 2 * tc));
         }
@@ -125,54 +125,54 @@ static void filtra_luma(uint8_t *base, int avanti, int giu,
 
     /* 8.7.2.5.7, the weak filter. One sample each side always, a second
      * one only on whichever side was flat enough to deserve it. */
-    const bool tocca_p1 = dp < ((beta + (beta >> 1)) >> 3);
-    const bool tocca_q1 = dq < ((beta + (beta >> 1)) >> 3);
+    const bool touch_p1 = dp < ((beta + (beta >> 1)) >> 3);
+    const bool touch_q1 = dq < ((beta + (beta >> 1)) >> 3);
 
     for (int i = 0; i < 4; i++) {
         const int p0 = P(0, i), p1 = P(1, i), p2 = P(2, i);
         const int q0 = Q(0, i), q1 = Q(1, i), q2 = Q(2, i);
         int delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
         if (abs(delta) >= tc * 10) continue;
-        delta = ritaglia(delta, -tc, tc);
-        SCRIVI_P(0, i, ritaglia8(p0 + delta));
-        SCRIVI_Q(0, i, ritaglia8(q0 - delta));
-        if (tocca_p1) {
-            const int dp1 = ritaglia((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1,
+        delta = clip(delta, -tc, tc);
+        WRITE_P(0, i, clip8(p0 + delta));
+        WRITE_Q(0, i, clip8(q0 - delta));
+        if (touch_p1) {
+            const int dp1 = clip((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1,
                                      -(tc >> 1), tc >> 1);
-            SCRIVI_P(1, i, ritaglia8(p1 + dp1));
+            WRITE_P(1, i, clip8(p1 + dp1));
         }
-        if (tocca_q1) {
-            const int dq1 = ritaglia((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1,
+        if (touch_q1) {
+            const int dq1 = clip((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1,
                                      -(tc >> 1), tc >> 1);
-            SCRIVI_Q(1, i, ritaglia8(q1 + dq1));
+            WRITE_Q(1, i, clip8(q1 + dq1));
         }
     }
 #undef P
 #undef Q
-#undef SCRIVI_P
-#undef SCRIVI_Q
+#undef WRITE_P
+#undef WRITE_Q
 }
 
 /* 8.7.2.5.5. Chroma gets one sample each side and no decision at all: it
  * is filtered where the boundary strength is two and nowhere else, which
  * in an intra picture means every edge. */
-static void filtra_croma(uint8_t *base, int avanti, int giu, int tc,
-                         bool tieni_p, bool tieni_q)
+static void filter_chroma(uint8_t *base, int forward, int giu, int tc,
+                         bool keep_p, bool keep_q)
 {
     for (int i = 0; i < 4; i++) {
-        uint8_t *p1 = base + i * giu - 2 * avanti;
-        uint8_t *p0 = base + i * giu - avanti;
+        uint8_t *p1 = base + i * giu - 2 * forward;
+        uint8_t *p0 = base + i * giu - forward;
         uint8_t *q0 = base + i * giu;
-        uint8_t *q1 = base + i * giu + avanti;
-        const int delta = ritaglia(((((int)*q0 - *p0) * 4) + *p1 - *q1 + 4) >> 3,
+        uint8_t *q1 = base + i * giu + forward;
+        const int delta = clip(((((int)*q0 - *p0) * 4) + *p1 - *q1 + 4) >> 3,
                                    -tc, tc);
-        if (!tieni_p) *p0 = ritaglia8(*p0 + delta);
-        if (!tieni_q) *q0 = ritaglia8(*q0 - delta);
+        if (!keep_p) *p0 = clip8(*p0 + delta);
+        if (!keep_q) *q0 = clip8(*q0 - delta);
     }
 }
 
 /* Table 8-10 again, as 8.7.2.5.5 asks for it. */
-static int qp_croma(int qp_i)
+static int qp_chroma(int qp_i)
 {
     if (qp_i < 30) return qp_i < 0 ? 0 : qp_i;
     if (qp_i > 43) return qp_i - 6;
@@ -183,20 +183,20 @@ static int qp_croma(int qp_i)
  * reaches the tables through tC, and only by two quantiser steps. */
 static int beta_di(const hevcd_t *d, int qp)
 {
-    const int q = ritaglia(qp + d->slice->beta_offset, 0, 51);
+    const int q = clip(qp + d->slice->beta_offset, 0, 51);
     return hevcd_beta[q];
 }
 
 static int tc_di(const hevcd_t *d, int qp, int bs)
 {
-    const int q = ritaglia(qp + 2 * (bs - 1) + d->slice->tc_offset, 0, 53);
+    const int q = clip(qp + 2 * (bs - 1) + d->slice->tc_offset, 0, 53);
     return hevcd_tc[q];
 }
 
 /* Is the edge on this side of an 8x8 cell one the filter may cross. */
-static bool bordo(const hevcd_t *d, int x, int y, int quale)
+static bool edge(const hevcd_t *d, int x, int y, int which)
 {
-    return (d->bordi[(y >> 3) * d->bordi_passo + (x >> 3)] & quale) != 0;
+    return (d->edges[(y >> 3) * d->edges_stride + (x >> 3)] & which) != 0;
 }
 
 /* 8.7.2.4. Two, one, or nothing at all.
@@ -210,25 +210,25 @@ static bool bordo(const hevcd_t *d, int x, int y, int quale)
  * place, where any step across the edge would be something the filter
  * invented.
  */
-static int forza(const hevcd_t *d, int xp, int yp, int xq, int yq,
-                 bool bordo_trasformata)
+static int strength(const hevcd_t *d, int xp, int yp, int xq, int yq,
+                 bool transform_edge)
 {
-    const int passo = d->min_pu_width;
-    const hevcd_mvf_t *p = &d->mvf[(yp >> 2) * passo + (xp >> 2)];
-    const hevcd_mvf_t *q = &d->mvf[(yq >> 2) * passo + (xq >> 2)];
+    const int stride = d->min_pu_width;
+    const hevcd_mvf_t *p = &d->mvf[(yp >> 2) * stride + (xp >> 2)];
+    const hevcd_mvf_t *q = &d->mvf[(yq >> 2) * stride + (xq >> 2)];
 
     if (!p->pred_flag || !q->pred_flag) return 2;
 
-    if (bordo_trasformata && d->cbf_map
-        && (d->cbf_map[(yp >> 2) * passo + (xp >> 2)]
-            || d->cbf_map[(yq >> 2) * passo + (xq >> 2)]))
+    if (transform_edge && d->cbf_map
+        && (d->cbf_map[(yp >> 2) * stride + (xp >> 2)]
+            || d->cbf_map[(yq >> 2) * stride + (xq >> 2)]))
         return 1;
 
     const int np = (p->pred_flag == HEVCD_PF_BI) ? 2 : 1;
     const int nq = (q->pred_flag == HEVCD_PF_BI) ? 2 : 1;
     if (np != nq) return 1;
 
-#define LONTANI(a, la, b, lb)                                   \
+#define DIFFER(a, la, b, lb)                                   \
     (abs((a)->mv[la][0] - (b)->mv[lb][0]) >= 4                  \
      || abs((a)->mv[la][1] - (b)->mv[lb][1]) >= 4)
 
@@ -236,89 +236,89 @@ static int forza(const hevcd_t *d, int xp, int yp, int xq, int yq,
         const int lp = (p->pred_flag & HEVCD_PF_L0) ? 0 : 1;
         const int lq = (q->pred_flag & HEVCD_PF_L0) ? 0 : 1;
         if (p->ref_poc[lp] != q->ref_poc[lq]) return 1;
-        return LONTANI(p, lp, q, lq) ? 1 : 0;
+        return DIFFER(p, lp, q, lq) ? 1 : 0;
     }
 
     /* Both predict from two places. They agree only if the two pairs of
      * pictures are the same pair - in either order - and the vectors that
      * go with them are close enough. */
-    const bool stesse = (p->ref_poc[0] == q->ref_poc[0]
+    const bool same_ones = (p->ref_poc[0] == q->ref_poc[0]
                          && p->ref_poc[1] == q->ref_poc[1]);
-    const bool incrociate = (p->ref_poc[0] == q->ref_poc[1]
+    const bool crossed = (p->ref_poc[0] == q->ref_poc[1]
                              && p->ref_poc[1] == q->ref_poc[0]);
-    if (!stesse && !incrociate) return 1;
+    if (!same_ones && !crossed) return 1;
 
     if (p->ref_poc[0] != p->ref_poc[1]) {
         /* ⚠️ Two different pictures: there is only one way to pair them
          * up, and it is whichever way makes the pictures match. */
-        if (stesse)
-            return (LONTANI(p, 0, q, 0) || LONTANI(p, 1, q, 1)) ? 1 : 0;
-        return (LONTANI(p, 0, q, 1) || LONTANI(p, 1, q, 0)) ? 1 : 0;
+        if (same_ones)
+            return (DIFFER(p, 0, q, 0) || DIFFER(p, 1, q, 1)) ? 1 : 0;
+        return (DIFFER(p, 0, q, 1) || DIFFER(p, 1, q, 0)) ? 1 : 0;
     }
 
     /* The same picture twice: either pairing will do, and the edge is
      * quiet if either one is close enough. */
-    const bool dritte = !(LONTANI(p, 0, q, 0) || LONTANI(p, 1, q, 1));
-    const bool storte = !(LONTANI(p, 0, q, 1) || LONTANI(p, 1, q, 0));
-    return (dritte || storte) ? 0 : 1;
-#undef LONTANI
+    const bool dritte = !(DIFFER(p, 0, q, 0) || DIFFER(p, 1, q, 1));
+    const bool crossed_refs = !(DIFFER(p, 0, q, 1) || DIFFER(p, 1, q, 0));
+    return (dritte || crossed_refs) ? 0 : 1;
+#undef DIFFER
 }
 
-/* One direction over the whole picture. `verticale` says which edges are
+/* One direction over the whole picture. `vertical` says which edges are
  * looked at, not which way the filter reads: a vertical edge is filtered
  * along x and stepped along y. */
-static void una_direzione(hevcd_t *d, bool verticale)
+static void one_direction(hevcd_t *d, bool vertical)
 {
     const hevc_sps_t *sps = d->sps;
-    const int avanti_l = verticale ? 1 : d->passo[0];
-    const int giu_l = verticale ? d->passo[0] : 1;
-    const int quale = verticale ? 1 : 2;
+    const int forward_l = vertical ? 1 : d->stride[0];
+    const int giu_l = vertical ? d->stride[0] : 1;
+    const int which = vertical ? 1 : 2;
 
-    for (int y = 0; y < sps->height; y += verticale ? 4 : 8)
-        for (int x = 0; x < sps->width; x += verticale ? 8 : 4) {
+    for (int y = 0; y < sps->height; y += vertical ? 4 : 8)
+        for (int x = 0; x < sps->width; x += vertical ? 8 : 4) {
             /* The picture's own border is never an edge, and neither is a
              * position the coding tree never put a block boundary at. */
-            if (verticale ? x == 0 : y == 0) continue;
-            if (!bordo(d, x, y, quale)) continue;
+            if (vertical ? x == 0 : y == 0) continue;
+            if (!edge(d, x, y, which)) continue;
 
-            const int xp = verticale ? x - 1 : x;
-            const int yp = verticale ? y : y - 1;
+            const int xp = vertical ? x - 1 : x;
+            const int yp = vertical ? y : y - 1;
             const int bs = d->mvf
-                ? forza(d, xp, yp, x, y,
-                        (d->bordi[(y >> 3) * d->bordi_passo + (x >> 3)]
-                         & (verticale ? 4 : 8)) != 0)
+                ? strength(d, xp, yp, x, y,
+                        (d->edges[(y >> 3) * d->edges_stride + (x >> 3)]
+                         & (vertical ? 4 : 8)) != 0)
                 : 2;
             if (!bs) continue;
             const int qp = (qp_di(d, x, y) + qp_di(d, xp, yp) + 1) >> 1;
-            const bool tieni_p = intoccabile(d, xp, yp);
-            const bool tieni_q = intoccabile(d, x, y);
-            if (tieni_p && tieni_q) continue;
+            const bool keep_p = untouchable(d, xp, yp);
+            const bool keep_q = untouchable(d, x, y);
+            if (keep_p && keep_q) continue;
 
-            filtra_luma(d->piano[0] + (size_t)y * d->passo[0] + x,
-                        avanti_l, giu_l, beta_di(d, qp), tc_di(d, qp, bs),
-                        tieni_p, tieni_q);
+            filter_luma(d->plane[0] + (size_t)y * d->stride[0] + x,
+                        forward_l, giu_l, beta_di(d, qp), tc_di(d, qp, bs),
+                        keep_p, keep_q);
 
             /* ⚠️ Chroma is filtered on its own grid, which is eight chroma
              * samples and therefore sixteen luma ones. Filtering it
              * wherever luma is filtered doubles the edges it touches and
              * softens the picture in a way no reference decoder does. */
             if (bs != 2) continue;
-            if (verticale ? (x & 15) : (y & 15)) continue;
-            if (verticale ? (y & 7) : (x & 7)) continue;
+            if (vertical ? (x & 15) : (y & 15)) continue;
+            if (vertical ? (y & 7) : (x & 7)) continue;
 
             for (int c = 1; c < 3; c++) {
                 const int off = c == 1 ? d->pps->cb_qp_offset
                                        : d->pps->cr_qp_offset;
-                const int tc = hevcd_tc[ritaglia(qp_croma(ritaglia(qp + off,
+                const int tc = hevcd_tc[clip(qp_chroma(clip(qp + off,
                                                                    0, 57))
                                                  + 2 + d->slice->tc_offset,
                                                  0, 53)];
                 if (!tc) continue;
-                const int avanti_c = verticale ? 1 : d->passo[c];
-                const int giu_c = verticale ? d->passo[c] : 1;
-                filtra_croma(d->piano[c] + (size_t)(y / 2) * d->passo[c]
-                             + x / 2, avanti_c, giu_c, tc,
-                             tieni_p, tieni_q);
+                const int forward_c = vertical ? 1 : d->stride[c];
+                const int giu_c = vertical ? d->stride[c] : 1;
+                filter_chroma(d->plane[c] + (size_t)(y / 2) * d->stride[c]
+                             + x / 2, forward_c, giu_c, tc,
+                             keep_p, keep_q);
             }
         }
 }
@@ -331,11 +331,11 @@ static void una_direzione(hevcd_t *d, bool verticale)
  * offsets kept per coding tree block, the same way the quantisation
  * parameter already is.
  */
-void hevcd_deblocca(hevcd_t *d)
+void hevcd_deblock(hevcd_t *d)
 {
-    if (!d->bordi || d->slice->deblocking_filter_disabled) return;
-    una_direzione(d, true);
-    una_direzione(d, false);
+    if (!d->edges || d->slice->deblocking_filter_disabled) return;
+    one_direction(d, true);
+    one_direction(d, false);
 }
 
 /* ------------------------------------------------- sample adaptive offset */
@@ -350,7 +350,7 @@ void hevcd_deblocca(hevcd_t *d)
  * worth a handful of sample values and shows up only where the offsets
  * are large - which is exactly where nobody looks first.
  */
-static int segno(int v)
+static int sign(int v)
 {
     return v > 0 ? 1 : (v < 0 ? -1 : 0);
 }
@@ -360,33 +360,33 @@ static int segno(int v)
 static const int8_t sao_dx[4][2] = { { -1, 1 }, { 0, 0 }, { -1, 1 }, { 1, -1 } };
 static const int8_t sao_dy[4][2] = { { 0, 0 }, { -1, 1 }, { -1, 1 }, { -1, 1 } };
 
-static void sao_blocco(hevcd_t *d, int c, int rx, int ry,
+static void sao_block(hevcd_t *d, int c, int rx, int ry,
                        const hevcd_sao_t *s)
 {
-    if (!s->tipo[c]) return;
+    if (!s->kind[c]) return;
 
     const int giu = c ? 1 : 0;
     const int log2 = d->sps->log2_ctb - giu;
     const int w = d->sps->width >> giu, h = d->sps->height >> giu;
     const int x0 = rx << log2, y0 = ry << log2;
-    const int lato = 1 << log2;
-    const int x1 = x0 + lato < w ? x0 + lato : w;
-    const int y1 = y0 + lato < h ? y0 + lato : h;
-    const int passo = d->passo[c];
-    uint8_t *piano = d->piano[c];
-    const uint8_t *prima = d->copia[c];
+    const int side = 1 << log2;
+    const int x1 = x0 + side < w ? x0 + side : w;
+    const int y1 = y0 + side < h ? y0 + side : h;
+    const int stride = d->stride[c];
+    uint8_t *plane = d->plane[c];
+    const uint8_t *before = d->copy_of[c];
 
-    if (s->tipo[c] == 1) {
+    if (s->kind[c] == 1) {
         /* By band: the range of a sample is cut into thirty-two bands and
          * four consecutive ones get an offset each. An encoder reaches for
          * this where the error is a shift of level rather than a step -
          * a flat area that came out slightly too dark, say. */
         for (int y = y0; y < y1; y++)
             for (int x = x0; x < x1; x++) {
-                if (intoccabile(d, x << giu, y << giu)) continue;
-                uint8_t *p = piano + (size_t)y * passo + x;
-                const int k = ((*p >> 3) - s->posizione[c]) & 31;
-                if (k < 4) *p = ritaglia8(*p + s->off[c][k]);
+                if (untouchable(d, x << giu, y << giu)) continue;
+                uint8_t *p = plane + (size_t)y * stride + x;
+                const int k = ((*p >> 3) - s->position[c]) & 31;
+                if (k < 4) *p = clip8(*p + s->off[c][k]);
             }
         return;
     }
@@ -394,7 +394,7 @@ static void sao_blocco(hevcd_t *d, int c, int rx, int ry,
     /* By edge: each sample is compared with two neighbours along one of
      * four directions, which sorts it into a valley, a step, or a peak,
      * and each of those gets its own offset. */
-    const int cl = s->classe[c];
+    const int cl = s->category[c];
     const int ax = sao_dx[cl][0], ay = sao_dy[cl][0];
     const int bx = sao_dx[cl][1], by = sao_dy[cl][1];
 
@@ -404,51 +404,51 @@ static void sao_blocco(hevcd_t *d, int c, int rx, int ry,
              * left alone: there is nothing to compare it with. */
             if (x + ax < 0 || x + ax >= w || x + bx < 0 || x + bx >= w) continue;
             if (y + ay < 0 || y + ay >= h || y + by < 0 || y + by >= h) continue;
-            if (intoccabile(d, x << giu, y << giu)) continue;
+            if (untouchable(d, x << giu, y << giu)) continue;
 
-            const int v = prima[(size_t)y * passo + x];
-            int idx = 2 + segno(v - prima[(size_t)(y + ay) * passo + x + ax])
-                        + segno(v - prima[(size_t)(y + by) * passo + x + bx]);
+            const int v = before[(size_t)y * stride + x];
+            int idx = 2 + sign(v - before[(size_t)(y + ay) * stride + x + ax])
+                        + sign(v - before[(size_t)(y + by) * stride + x + bx]);
             /* Table 8-x: the five cases are renumbered so that "neither up
              * nor down" lands on zero, which is the one with no offset. */
             if (idx <= 2) idx = (idx == 2) ? 0 : idx + 1;
             if (!idx) continue;
-            piano[(size_t)y * passo + x] = ritaglia8(v + s->off[c][idx - 1]);
+            plane[(size_t)y * stride + x] = clip8(v + s->off[c][idx - 1]);
         }
 }
 
 void hevcd_sao(hevcd_t *d)
 {
-    if (!d->sao || !d->piano[0]) return;
+    if (!d->sao || !d->plane[0]) return;
 
     bool serve = false;
     for (int i = 0; i < d->sps->ctb_count && !serve; i++)
-        serve = d->sao[i].tipo[0] || d->sao[i].tipo[1] || d->sao[i].tipo[2];
+        serve = d->sao[i].kind[0] || d->sao[i].kind[1] || d->sao[i].kind[2];
     if (!serve) return;
 
-    const size_t misura[3] = { d->n_piano, d->n_piano / 4, d->n_piano / 4 };
+    const size_t measure[3] = { d->n_piano, d->n_piano / 4, d->n_piano / 4 };
     for (int c = 0; c < 3; c++) {
-        if (!d->copia[c] || d->n_copia < d->n_piano) {
-            free(d->copia[c]);
-            d->copia[c] = malloc(misura[c]);
-            if (!d->copia[c]) return;
+        if (!d->copy_of[c] || d->n_copy < d->n_piano) {
+            free(d->copy_of[c]);
+            d->copy_of[c] = malloc(measure[c]);
+            if (!d->copy_of[c]) return;
         }
-        memcpy(d->copia[c], d->piano[c], misura[c]);
+        memcpy(d->copy_of[c], d->plane[c], measure[c]);
     }
-    d->n_copia = d->n_piano;
+    d->n_copy = d->n_piano;
 
     for (int ry = 0; ry < d->sps->ctb_height; ry++)
         for (int rx = 0; rx < d->sps->ctb_width; rx++) {
             const hevcd_sao_t *s = &d->sao[ry * d->sps->ctb_width + rx];
-            for (int c = 0; c < 3; c++) sao_blocco(d, c, rx, ry, s);
+            for (int c = 0; c < 3; c++) sao_block(d, c, rx, ry, s);
         }
 }
 
-void hevcd_libera_filtri(hevcd_t *d)
+void hevcd_free_filters(hevcd_t *d)
 {
     free(d->sao);
     d->sao = NULL;
     d->n_sao = 0;
-    for (int c = 0; c < 3; c++) { free(d->copia[c]); d->copia[c] = NULL; }
-    d->n_copia = 0;
+    for (int c = 0; c < 3; c++) { free(d->copy_of[c]); d->copy_of[c] = NULL; }
+    d->n_copy = 0;
 }

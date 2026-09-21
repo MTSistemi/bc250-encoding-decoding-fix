@@ -19,7 +19,7 @@
 #include "h264_parts.h"
 #include "h264_pred.h"
 
-int h264d_cavlc_residuo(br_t *br, int nc, int n_max, int16_t *out);
+int h264d_cavlc_residual(br_t *br, int nc, int n_max, int16_t *out);
 
 static const uint8_t zscan[16] = {
     0, 1, 4, 5,  2, 3, 6, 7,  8, 9, 12, 13,  10, 11, 14, 15
@@ -47,7 +47,7 @@ static const h264d_mb_t *sopra4(const h264_decoder_t *d, int b, int *out)
     return m;
 }
 
-static const h264d_mb_t *sinistra_croma(const h264_decoder_t *d, int b, int *out)
+static const h264d_mb_t *left_chroma(const h264_decoder_t *d, int b, int *out)
 {
     *out = 0;
     if (b & 1) { *out = b - 1; return &d->mbs[d->mb_idx]; }
@@ -57,7 +57,7 @@ static const h264d_mb_t *sinistra_croma(const h264_decoder_t *d, int b, int *out
     return m;
 }
 
-static const h264d_mb_t *sopra_croma(const h264_decoder_t *d, int b, int *out)
+static const h264d_mb_t *above_chroma(const h264_decoder_t *d, int b, int *out)
 {
     *out = 0;
     if (b >= 2) { *out = b - 2; return &d->mbs[d->mb_idx]; }
@@ -73,23 +73,23 @@ static const h264d_mb_t *sopra_croma(const h264_decoder_t *d, int b, int *out)
  * sixteen. Everything else contributes the count of coefficients it
  * actually had, which is why that count has to be kept per block and
  * survive across macroblocks. */
-static int quanti_vicini(const h264d_mb_t *m, int blocco, int piano)
+static int n_neighbours(const h264d_mb_t *m, int block, int plane)
 {
     if (!m) return -1;                          /* not available */
     if (m->type == H264D_MB_I_PCM) return 16;
     if (m->type == H264D_MB_P_SKIP || m->type == H264D_MB_B_SKIP) return 0;
-    return m->nnz[piano][blocco];
+    return m->nnz[plane][block];
 }
 
-static int nc_di(const h264_decoder_t *d, int blocco, int piano, bool croma)
+static int nc_di(const h264_decoder_t *d, int block, int plane, bool chroma)
 {
     int pa, pb;
-    const h264d_mb_t *a = croma ? sinistra_croma(d, blocco, &pa)
-                                : sinistra4(d, blocco, &pa);
-    const h264d_mb_t *b = croma ? sopra_croma(d, blocco, &pb)
-                                : sopra4(d, blocco, &pb);
-    const int na = quanti_vicini(a, pa, piano);
-    const int nb = quanti_vicini(b, pb, piano);
+    const h264d_mb_t *a = chroma ? left_chroma(d, block, &pa)
+                                : sinistra4(d, block, &pa);
+    const h264d_mb_t *b = chroma ? above_chroma(d, block, &pb)
+                                : sopra4(d, block, &pb);
+    const int na = n_neighbours(a, pa, plane);
+    const int nb = n_neighbours(b, pb, plane);
 
     if (na >= 0 && nb >= 0) return (na + nb + 1) >> 1;
     if (na >= 0) return na;
@@ -101,7 +101,7 @@ static int nc_di(const h264_decoder_t *d, int blocco, int piano, bool croma)
 
 /* te(v), clause 9.1.1: one inverted bit when the range is two, otherwise
  * an ordinary Exp-Golomb code. */
-static int leggi_te(br_t *br, int cap)
+static int read_te(br_t *br, int cap)
 {
     if (cap <= 1) return 0;
     if (cap == 2) return 1 - (int)br_read1(br);
@@ -109,7 +109,7 @@ static int leggi_te(br_t *br, int cap)
 }
 
 /* me(v), clause 9.1.2: an Exp-Golomb code mapped through Table 9-4. */
-static int leggi_cbp(br_t *br, bool intra_nxn)
+static int read_cbp(br_t *br, bool intra_nxn)
 {
     const uint32_t k = br_read_ue(br);
     if (k > 47) return 0;
@@ -119,14 +119,14 @@ static int leggi_cbp(br_t *br, bool intra_nxn)
 
 /* ------------------------------------------------------------- residual */
 
-static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
+static void read_residual_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
 {
     br_t *br = &d->br;
 
     if (i16) {
         /* The DC block borrows luma block 0's neighbourhood. */
         int16_t tmp[16];
-        const int nz = h264d_cavlc_residuo(br, nc_di(d, 0, 0, false), 16, tmp);
+        const int nz = h264d_cavlc_residual(br, nc_di(d, 0, 0, false), 16, tmp);
         for (int k = 0; k < 16; k++)
             d->res->dc_luma[h264d_zigzag4[k]] = tmp[k];
         m->cbf_dc[0] = nz ? 1 : 0;
@@ -152,7 +152,7 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
             }
 
             const int n = i16 ? 15 : 16;
-            const int nz = h264d_cavlc_residuo(br, nc_di(d, b, 0, false), n, tmp);
+            const int nz = h264d_cavlc_residual(br, nc_di(d, b, 0, false), n, tmp);
             m->nnz[0][b] = (uint8_t)nz;
 
             if (m->transform8x8) {
@@ -183,7 +183,7 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
         if (cbp_c) {
             /* nC is -1 for a 4:2:0 chroma DC block: it has a table of its
              * own and no neighbourhood. */
-            const int nz = h264d_cavlc_residuo(br, -1, 4, d->res->dc_chroma[p]);
+            const int nz = h264d_cavlc_residual(br, -1, 4, d->res->dc_chroma[p]);
             m->cbf_dc[p + 1] = nz ? 1 : 0;
         } else {
             memset(d->res->dc_chroma[p], 0, sizeof(d->res->dc_chroma[p]));
@@ -192,17 +192,17 @@ static void leggi_residuo_mb(h264_decoder_t *d, h264d_mb_t *m, bool i16)
     }
     for (int p = 0; p < 2; p++) {
         for (int b = 0; b < 4; b++) {
-            memset(d->res->croma[p][b], 0, sizeof(d->res->croma[p][b]));
+            memset(d->res->chroma[p][b], 0, sizeof(d->res->chroma[p][b]));
             if (cbp_c != 2) {
                 m->nnz[p + 1][b] = 0;
                 continue;
             }
             int16_t tmp[16];
-            const int nz = h264d_cavlc_residuo(br, nc_di(d, b, p + 1, true),
+            const int nz = h264d_cavlc_residual(br, nc_di(d, b, p + 1, true),
                                                15, tmp);
             m->nnz[p + 1][b] = (uint8_t)nz;
             for (int c = 0; c < 15; c++)
-                d->res->croma[p][b][h264d_zigzag4[c + 1]] = tmp[c];
+                d->res->chroma[p][b][h264d_zigzag4[c + 1]] = tmp[c];
         }
     }
 }
@@ -214,13 +214,13 @@ static void azzera_mb(h264d_mb_t *m)
     memset(m, 0, sizeof(*m));
     memset(m->ref, -1, sizeof(m->ref));
     memset(m->ref_idx, -1, sizeof(m->ref_idx));
-    memset(m->sub_tipo, -1, sizeof(m->sub_tipo));
+    memset(m->sub_type, -1, sizeof(m->sub_type));
 }
 
-static void spacchetta_i16(int t, int *modo, int *cbp)
+static void spacchetta_i16(int t, int *mode, int *cbp)
 {
     const int k = t - 1;
-    *modo = k & 3;
+    *mode = k & 3;
     *cbp = ((k / 4) % 3) << 4;
     if (k >= 12) *cbp |= 15;
 }
@@ -228,156 +228,156 @@ static void spacchetta_i16(int t, int *modo, int *cbp)
 /* The motion of one macroblock, clause 7.3.5.1 and 7.3.5.2. Same shape as
  * the CABAC path: reference indices per partition, differences per
  * sub-partition, four passes, and the derivation in partition order. */
-static int leggi_movimento(h264_decoder_t *d, h264d_mb_t *m, bool bslice,
-                           int t, bool ref0_forzato)
+static int read_motion(h264_decoder_t *d, h264d_mb_t *m, bool bslice,
+                           int t, bool ref0_forced)
 {
     br_t *br = &d->br;
     struct {
         uint8_t pred, n, blk[4], w4, h4;
         int8_t  ref[2];
         int16_t dx[2][4], dy[2][4];
-    } parte[4];
+    } part[4];
     int np = 0;
-    bool sotto_8x8 = false;
+    bool below_8x8 = false;
 
     if (m->type == H264D_MB_P_8x8 || m->type == H264D_MB_B_8x8) {
         h264d_sub_t sub[4];
         for (int i = 0; i < 4; i++) {
             const int s = (int)br_read_ue(br);
-            m->sub_tipo[i] = (int8_t)s;
+            m->sub_type[i] = (int8_t)s;
             sub[i] = bslice ? h264d_sub_b[s >= 0 && s < 13 ? s : 12]
                             : h264d_sub_p[s >= 0 && s < 4 ? s : 3];
             if (bslice && s == 0) {
-                if (!d->pic.direct_8x8_inference) sotto_8x8 = true;
+                if (!d->pic.direct_8x8_inference) below_8x8 = true;
             } else if (sub[i].w4 < 2 || sub[i].h4 < 2) {
-                sotto_8x8 = true;
+                below_8x8 = true;
             }
         }
         for (int i = 0; i < 4; i++) {
-            parte[i].pred = sub[i].pred;
-            parte[i].n = sub[i].n;
-            parte[i].w4 = sub[i].w4;
-            parte[i].h4 = sub[i].h4;
+            part[i].pred = sub[i].pred;
+            part[i].n = sub[i].n;
+            part[i].w4 = sub[i].w4;
+            part[i].h4 = sub[i].h4;
             for (int k = 0; k < sub[i].n; k++)
-                parte[i].blk[k] = (uint8_t)(h264d_blk8[i]
+                part[i].blk[k] = (uint8_t)(h264d_blk8[i]
                                             + h264d_sub_offset(&sub[i], k));
         }
         np = 4;
     } else if (m->type == H264D_MB_P_16x16 || m->type == H264D_MB_B_16x16) {
-        parte[0].pred = (uint8_t)(bslice ? (t == 1 ? H264D_PRED_L0
+        part[0].pred = (uint8_t)(bslice ? (t == 1 ? H264D_PRED_L0
                                           : t == 2 ? H264D_PRED_L1
                                                    : H264D_PRED_BI)
                                          : H264D_PRED_L0);
-        parte[0].n = 1; parte[0].blk[0] = 0; parte[0].w4 = 4; parte[0].h4 = 4;
+        part[0].n = 1; part[0].blk[0] = 0; part[0].w4 = 4; part[0].h4 = 4;
         np = 1;
     } else if (m->type == H264D_MB_B_DIRECT) {
-        parte[0].pred = H264D_PRED_DIRECT;
-        parte[0].n = 1; parte[0].blk[0] = 0; parte[0].w4 = 4; parte[0].h4 = 4;
+        part[0].pred = H264D_PRED_DIRECT;
+        part[0].n = 1; part[0].blk[0] = 0; part[0].w4 = 4; part[0].h4 = 4;
         np = 1;
     } else {
-        const bool verticale = (m->type == H264D_MB_P_8x16
+        const bool vertical = (m->type == H264D_MB_P_8x16
                              || m->type == H264D_MB_B_8x16);
-        const int w4 = verticale ? 2 : 4, h4 = verticale ? 4 : 2;
-        const int secondo = verticale ? 2 : 8;
+        const int w4 = vertical ? 2 : 4, h4 = vertical ? 4 : 2;
+        const int second = vertical ? 2 : 8;
         uint8_t p0 = H264D_PRED_L0, p1 = H264D_PRED_L0;
         if (bslice) {
-            int coppia = (t - 4) / 2;
-            if (coppia < 0) coppia = 0;
-            if (coppia > 8) coppia = 8;
-            p0 = h264d_b_pair[coppia][0];
-            p1 = h264d_b_pair[coppia][1];
+            int pair = (t - 4) / 2;
+            if (pair < 0) pair = 0;
+            if (pair > 8) pair = 8;
+            p0 = h264d_b_pair[pair][0];
+            p1 = h264d_b_pair[pair][1];
         }
-        parte[0].pred = p0; parte[0].n = 1; parte[0].blk[0] = 0;
-        parte[0].w4 = (uint8_t)w4; parte[0].h4 = (uint8_t)h4;
-        parte[1].pred = p1; parte[1].n = 1; parte[1].blk[0] = (uint8_t)secondo;
-        parte[1].w4 = (uint8_t)w4; parte[1].h4 = (uint8_t)h4;
+        part[0].pred = p0; part[0].n = 1; part[0].blk[0] = 0;
+        part[0].w4 = (uint8_t)w4; part[0].h4 = (uint8_t)h4;
+        part[1].pred = p1; part[1].n = 1; part[1].blk[0] = (uint8_t)second;
+        part[1].w4 = (uint8_t)w4; part[1].h4 = (uint8_t)h4;
         np = 2;
     }
 
-    m->sub_8x8 = sotto_8x8 ? 1 : 0;
+    m->sub_8x8 = below_8x8 ? 1 : 0;
     m->direct = 0;
     for (int i = 0; i < np; i++)
-        if (parte[i].pred == H264D_PRED_DIRECT)
+        if (part[i].pred == H264D_PRED_DIRECT)
             m->direct |= (uint8_t)(np == 1 ? 0xf : (1 << i));
 
     for (int i = 0; i < np; i++) {
-        parte[i].ref[0] = parte[i].ref[1] = -1;
-        memset(parte[i].dx, 0, sizeof(parte[i].dx));
-        memset(parte[i].dy, 0, sizeof(parte[i].dy));
+        part[i].ref[0] = part[i].ref[1] = -1;
+        memset(part[i].dx, 0, sizeof(part[i].dx));
+        memset(part[i].dy, 0, sizeof(part[i].dy));
     }
 
-    for (int lista = 0; lista < (bslice ? 2 : 1); lista++) {
-        const int cap = d->slice.num_ref_idx[lista];
+    for (int list_idx = 0; list_idx < (bslice ? 2 : 1); list_idx++) {
+        const int cap = d->slice.num_ref_idx[list_idx];
         for (int i = 0; i < np; i++) {
-            if (parte[i].pred == H264D_PRED_DIRECT
-                || !((parte[i].pred == H264D_PRED_BI)
-                     || parte[i].pred == (lista ? H264D_PRED_L1 : H264D_PRED_L0)))
+            if (part[i].pred == H264D_PRED_DIRECT
+                || !((part[i].pred == H264D_PRED_BI)
+                     || part[i].pred == (list_idx ? H264D_PRED_L1 : H264D_PRED_L0)))
                 continue;
             /* P_8x8ref0 pins every partition to reference zero and signals
              * nothing. It exists only in CAVLC. */
-            const int r = ref0_forzato ? 0 : leggi_te(br, cap);
-            parte[i].ref[lista] = (int8_t)r;
-            for (int k = 0; k < parte[i].n; k++) {
-                const int b = parte[i].blk[k];
+            const int r = ref0_forced ? 0 : read_te(br, cap);
+            part[i].ref[list_idx] = (int8_t)r;
+            for (int k = 0; k < part[i].n; k++) {
+                const int b = part[i].blk[k];
                 const int x4 = b & 3, y4 = b >> 2;
-                for (int yy = 0; yy < parte[i].h4; yy++)
-                    for (int xx = 0; xx < parte[i].w4; xx++) {
+                for (int yy = 0; yy < part[i].h4; yy++)
+                    for (int xx = 0; xx < part[i].w4; xx++) {
                         const int bb = (y4 + yy) * 4 + x4 + xx;
-                        m->ref[lista][h264d_part8(bb)] =
-                            (int8_t)d->slice.ref_list[lista][r];
-                        m->ref_idx[lista][h264d_part8(bb)] = (int8_t)r;
+                        m->ref[list_idx][h264d_part8(bb)] =
+                            (int8_t)d->slice.ref_list[list_idx][r];
+                        m->ref_idx[list_idx][h264d_part8(bb)] = (int8_t)r;
                     }
             }
         }
     }
 
-    for (int lista = 0; lista < (bslice ? 2 : 1); lista++) {
+    for (int list_idx = 0; list_idx < (bslice ? 2 : 1); list_idx++) {
         for (int i = 0; i < np; i++) {
-            if (parte[i].pred == H264D_PRED_DIRECT
-                || !((parte[i].pred == H264D_PRED_BI)
-                     || parte[i].pred == (lista ? H264D_PRED_L1 : H264D_PRED_L0)))
+            if (part[i].pred == H264D_PRED_DIRECT
+                || !((part[i].pred == H264D_PRED_BI)
+                     || part[i].pred == (list_idx ? H264D_PRED_L1 : H264D_PRED_L0)))
                 continue;
-            for (int k = 0; k < parte[i].n; k++) {
+            for (int k = 0; k < part[i].n; k++) {
                 const int dx = br_read_se(br);
                 const int dy = br_read_se(br);
-                parte[i].dx[lista][k] = (int16_t)dx;
-                parte[i].dy[lista][k] = (int16_t)dy;
-                const int b = parte[i].blk[k];
+                part[i].dx[list_idx][k] = (int16_t)dx;
+                part[i].dy[list_idx][k] = (int16_t)dy;
+                const int b = part[i].blk[k];
                 const int x4 = b & 3, y4 = b >> 2;
-                for (int yy = 0; yy < parte[i].h4; yy++)
-                    for (int xx = 0; xx < parte[i].w4; xx++) {
+                for (int yy = 0; yy < part[i].h4; yy++)
+                    for (int xx = 0; xx < part[i].w4; xx++) {
                         const int bb = (y4 + yy) * 4 + x4 + xx;
-                        m->mvd[lista][bb][0] = (int16_t)dx;
-                        m->mvd[lista][bb][1] = (int16_t)dy;
+                        m->mvd[list_idx][bb][0] = (int16_t)dx;
+                        m->mvd[list_idx][bb][1] = (int16_t)dy;
                     }
             }
         }
     }
 
     for (int i = 0; i < np; i++) {
-        if (parte[i].pred == H264D_PRED_DIRECT) {
-            const int maschera = (np == 1) ? 0xf : (1 << i);
-            if (h264d_direct(d, m, maschera) != 0)
+        if (part[i].pred == H264D_PRED_DIRECT) {
+            const int mask = (np == 1) ? 0xf : (1 << i);
+            if (h264d_direct(d, m, mask) != 0)
                 return 1;
             continue;
         }
-        for (int lista = 0; lista < (bslice ? 2 : 1); lista++) {
-            if (!((parte[i].pred == H264D_PRED_BI)
-                  || parte[i].pred == (lista ? H264D_PRED_L1 : H264D_PRED_L0)))
+        for (int list_idx = 0; list_idx < (bslice ? 2 : 1); list_idx++) {
+            if (!((part[i].pred == H264D_PRED_BI)
+                  || part[i].pred == (list_idx ? H264D_PRED_L1 : H264D_PRED_L0)))
                 continue;
-            const int r = parte[i].ref[lista];
-            for (int k = 0; k < parte[i].n; k++) {
-                const int b = parte[i].blk[k];
+            const int r = part[i].ref[list_idx];
+            for (int k = 0; k < part[i].n; k++) {
+                const int b = part[i].blk[k];
                 int16_t pmv[2];
-                h264d_predict_mv(d, lista, b, parte[i].w4, parte[i].h4, r, pmv);
+                h264d_predict_mv(d, list_idx, b, part[i].w4, part[i].h4, r, pmv);
                 const int x4 = b & 3, y4 = b >> 2;
-                const int16_t mx = (int16_t)(pmv[0] + parte[i].dx[lista][k]);
-                const int16_t my = (int16_t)(pmv[1] + parte[i].dy[lista][k]);
-                for (int yy = 0; yy < parte[i].h4; yy++)
-                    for (int xx = 0; xx < parte[i].w4; xx++) {
+                const int16_t mx = (int16_t)(pmv[0] + part[i].dx[list_idx][k]);
+                const int16_t my = (int16_t)(pmv[1] + part[i].dy[list_idx][k]);
+                for (int yy = 0; yy < part[i].h4; yy++)
+                    for (int xx = 0; xx < part[i].w4; xx++) {
                         const int bb = (y4 + yy) * 4 + x4 + xx;
-                        m->mv[lista][bb][0] = mx;
-                        m->mv[lista][bb][1] = my;
+                        m->mv[list_idx][bb][0] = mx;
+                        m->mv[list_idx][bb][1] = my;
                     }
             }
         }
@@ -387,7 +387,7 @@ static int leggi_movimento(h264_decoder_t *d, h264d_mb_t *m, bool bslice,
 
 int h264d_decode_mb_cavlc(h264_decoder_t *d)
 {
-    h264d_punta_residuo(d);
+    h264d_residual_at(d);
     br_t *br = &d->br;
     h264d_mb_t *m = &d->mbs[d->mb_idx];
     azzera_mb(m);
@@ -397,8 +397,8 @@ int h264d_decode_mb_cavlc(h264_decoder_t *d)
 
     int t = (int)br_read_ue(br);
 
-    int i16_modo = -1;
-    bool ref0_forzato = false;
+    int i16_mode = -1;
+    bool ref0_forced = false;
 
     if (islice || (!bslice && t >= 5) || (bslice && t >= 23)) {
         const int ti = islice ? t : (bslice ? t - 23 : t - 5);
@@ -414,11 +414,11 @@ int h264d_decode_mb_cavlc(h264_decoder_t *d)
             m->type = H264D_MB_I_16x16;
             m->intra = 1;
             int cbp;
-            spacchetta_i16(ti, &i16_modo, &cbp);
+            spacchetta_i16(ti, &i16_mode, &cbp);
             m->cbp = (uint8_t)cbp;
         }
     } else if (bslice) {
-        static const uint8_t mappa_b[23] = {
+        static const uint8_t map_b[23] = {
             H264D_MB_B_DIRECT, H264D_MB_B_16x16, H264D_MB_B_16x16,
             H264D_MB_B_16x16,
             H264D_MB_B_16x8, H264D_MB_B_8x16, H264D_MB_B_16x8, H264D_MB_B_8x16,
@@ -427,17 +427,17 @@ int h264d_decode_mb_cavlc(h264_decoder_t *d)
             H264D_MB_B_16x8, H264D_MB_B_8x16, H264D_MB_B_16x8, H264D_MB_B_8x16,
             H264D_MB_B_16x8, H264D_MB_B_8x16, H264D_MB_B_8x8,
         };
-        m->type = mappa_b[t < 23 ? t : 22];
+        m->type = map_b[t < 23 ? t : 22];
     } else {
         /* Table 7-13. mb_type 4 is P_8x8ref0, which has no CABAC
          * binarization and so appears only here: the same partitioning as
          * P_8x8 with every reference pinned to zero and nothing signalled. */
-        static const uint8_t mappa_p[5] = {
+        static const uint8_t map_p[5] = {
             H264D_MB_P_16x16, H264D_MB_P_16x8, H264D_MB_P_8x16,
             H264D_MB_P_8x8, H264D_MB_P_8x8
         };
-        m->type = mappa_p[t < 5 ? t : 3];
-        ref0_forzato = (t == 4);
+        m->type = map_p[t < 5 ? t : 3];
+        ref0_forced = (t == 4);
     }
 
     if (m->intra) {
@@ -445,8 +445,8 @@ int h264d_decode_mb_cavlc(h264_decoder_t *d)
             if (d->pic.transform_8x8_mode)
                 m->transform8x8 = (uint8_t)br_read1(br);
 
-            const int passo = m->transform8x8 ? 4 : 1;
-            for (int k = 0; k < 16; k += passo) {
+            const int stride = m->transform8x8 ? 4 : 1;
+            for (int k = 0; k < 16; k += stride) {
                 const int b = zscan[k];
                 int pa, pb;
                 const h264d_mb_t *a = sinistra4(d, b, &pa);
@@ -455,34 +455,34 @@ int h264d_decode_mb_cavlc(h264_decoder_t *d)
                              : (a ? 2 : -1);
                 const int mb2 = (bm && bm->type == H264D_MB_I_NxN) ? bm->ipred[pb]
                               : (bm ? 2 : -1);
-                const int previsto = (ma < 0 || mb2 < 0) ? 2
+                const int predicted = (ma < 0 || mb2 < 0) ? 2
                                    : (ma < mb2 ? ma : mb2);
-                int modo;
+                int mode;
                 if (br_read1(br)) {
-                    modo = previsto;
+                    mode = predicted;
                 } else {
                     const int r = (int)br_read(br, 3);
-                    modo = r < previsto ? r : r + 1;
+                    mode = r < predicted ? r : r + 1;
                 }
-                if (passo == 1) {
-                    m->ipred[b] = (int8_t)modo;
+                if (stride == 1) {
+                    m->ipred[b] = (int8_t)mode;
                 } else {
                     const int bx = b & 3, by = b >> 2;
                     for (int y = 0; y < 2; y++)
                         for (int x = 0; x < 2; x++)
-                            m->ipred[(by + y) * 4 + bx + x] = (int8_t)modo;
+                            m->ipred[(by + y) * 4 + bx + x] = (int8_t)mode;
                 }
             }
         }
         m->chroma_pred_mode = (int8_t)br_read_ue(br);
     } else {
-        if (leggi_movimento(d, m, bslice, t, ref0_forzato) != 0)
+        if (read_motion(d, m, bslice, t, ref0_forced) != 0)
             return 1;
     }
 
     const bool i16 = (m->type == H264D_MB_I_16x16);
     if (!i16) {
-        m->cbp = (uint8_t)leggi_cbp(br, m->type == H264D_MB_I_NxN);
+        m->cbp = (uint8_t)read_cbp(br, m->type == H264D_MB_I_NxN);
         if ((m->cbp & 15) && d->pic.transform_8x8_mode
             && m->type != H264D_MB_I_NxN && !m->sub_8x8
             && (m->type != H264D_MB_B_DIRECT || d->pic.direct_8x8_inference))
@@ -495,9 +495,9 @@ int h264d_decode_mb_cavlc(h264_decoder_t *d)
     }
     m->qpy = (int8_t)d->qpy;
 
-    leggi_residuo_mb(d, m, i16);
+    read_residual_mb(d, m, i16);
     if (i16)
-        m->ipred[0] = (int8_t)i16_modo;
+        m->ipred[0] = (int8_t)i16_mode;
 
     return 0;
 }
@@ -506,7 +506,7 @@ int h264d_decode_mb_cavlc(h264_decoder_t *d)
  * flagging each one. */
 int h264d_cavlc_skip(h264_decoder_t *d)
 {
-    h264d_punta_residuo(d);
+    h264d_residual_at(d);
     h264d_mb_t *m = &d->mbs[d->mb_idx];
     azzera_mb(m);
 

@@ -177,8 +177,8 @@ static inline size_t br_extract_rbsp_map(uint8_t *dst, size_t dst_cap,
                                          const uint8_t *src, size_t src_len,
                                          size_t *bit_offset)
 {
-    const size_t limite = bit_offset ? (*bit_offset >> 3) : src_len;
-    size_t tolti = 0;
+    const size_t limit = bit_offset ? (*bit_offset >> 3) : src_len;
+    size_t removed = 0;
     size_t o = 0;
     size_t zeros = 0;
     for (size_t i = 0; i < src_len && o < dst_cap; i++) {
@@ -190,13 +190,13 @@ static inline size_t br_extract_rbsp_map(uint8_t *dst, size_t dst_cap,
                 continue;
             }
             zeros = 0;
-            if (i < limite) tolti++;
+            if (i < limit) removed++;
             continue;
         }
         dst[o++] = c;
         zeros = (c == 0x00) ? zeros + 1 : 0;
     }
-    if (bit_offset) *bit_offset -= tolti * 8;
+    if (bit_offset) *bit_offset -= removed * 8;
     return o;
 }
 
@@ -208,11 +208,11 @@ static inline size_t br_extract_rbsp_map(uint8_t *dst, size_t dst_cap,
 static inline size_t br_raw_offset(const uint8_t *src, size_t src_len,
                                    size_t rbsp_bit)
 {
-    const size_t bersaglio = rbsp_bit >> 3;
+    const size_t target = rbsp_bit >> 3;
     size_t o = 0;
     size_t zeros = 0;
     for (size_t i = 0; i < src_len; i++) {
-        if (o == bersaglio)
+        if (o == target)
             return (i << 3) | (rbsp_bit & 7);
         uint8_t c = src[i];
         if (zeros >= 2 && c == 0x03) {

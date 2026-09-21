@@ -1889,12 +1889,12 @@ int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t
  */
 #if defined(__x86_64__) || defined(_M_X64)
 __attribute__((target("avx2")))
-static void copia_da_wc_avx2(uint8_t *dst, const uint8_t *src, size_t n) {
+static void copy_from_wc_avx2(uint8_t *dst, const uint8_t *src, size_t n) {
     size_t i = 0;
     /* MOVNTDQA needs a 32-byte aligned source: walk up to it normally. */
-    size_t testa = (size_t)((0u - (uintptr_t)src) & 31u);
-    if (testa > n) testa = n;
-    if (testa) { memcpy(dst, src, testa); i = testa; }
+    size_t head = (size_t)((0u - (uintptr_t)src) & 31u);
+    if (head > n) head = n;
+    if (head) { memcpy(dst, src, head); i = head; }
     for (; i + 128 <= n; i += 128) {
         __m256i a = _mm256_stream_load_si256((const __m256i *)(src + i));
         __m256i b = _mm256_stream_load_si256((const __m256i *)(src + i + 32));
@@ -1914,11 +1914,11 @@ static void copia_da_wc_avx2(uint8_t *dst, const uint8_t *src, size_t n) {
 }
 #endif
 
-static void copia_da_wc(uint8_t *dst, const uint8_t *src, size_t n) {
+static void copy_from_wc(uint8_t *dst, const uint8_t *src, size_t n) {
 #if defined(__x86_64__) || defined(_M_X64)
     static int ha_avx2 = -1;
     if (ha_avx2 < 0) ha_avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
-    if (ha_avx2) { copia_da_wc_avx2(dst, src, n); return; }
+    if (ha_avx2) { copy_from_wc_avx2(dst, src, n); return; }
 #endif
     memcpy(dst, src, n);
 }
@@ -1926,7 +1926,7 @@ static void copia_da_wc(uint8_t *dst, const uint8_t *src, size_t n) {
 /* Public wrapper: the H.264 path's shadow_copy() reads the same kind of
  * write-combining staging memory and was paying the same price. */
 void gpu_compute_copy_from_wc(void *dst, const void *src, size_t n) {
-    copia_da_wc((uint8_t *)dst, (const uint8_t *)src, n);
+    copy_from_wc((uint8_t *)dst, (const uint8_t *)src, n);
 }
 
 int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,
@@ -1960,12 +1960,12 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
 
     const uint8_t *src_y = mapped + layout_y.offset;
     for (int r = 0; r < height; r++) {
-        copia_da_wc(y_plane + (size_t)r * y_pitch, src_y + (size_t)r * layout_y.rowPitch, (size_t)width);
+        copy_from_wc(y_plane + (size_t)r * y_pitch, src_y + (size_t)r * layout_y.rowPitch, (size_t)width);
     }
 
     const uint8_t *src_uv = mapped + uv_offset + layout_uv.offset;
     for (int r = 0; r < height / 2; r++) {
-        copia_da_wc(uv_plane + (size_t)r * uv_pitch, src_uv + (size_t)r * layout_uv.rowPitch, (size_t)width);
+        copy_from_wc(uv_plane + (size_t)r * uv_pitch, src_uv + (size_t)r * layout_uv.rowPitch, (size_t)width);
     }
 
     if (needs_unmap) {
