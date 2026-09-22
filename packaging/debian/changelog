@@ -1,0 +1,7 @@
+bc250-vaapi (26.09.2) unstable; urgency=medium
+
+  * H.264 and H.265 decoding through VAEntrypointVLD, bit-exact against
+    the reference decoder.
+  * H.265 decoding reaches 96 frames per second at 1920x1080 on the board.
+
+ -- SkillFishOS <info@mtsistemi.it>  Tue, 22 Sep 2026 02:00:00 +0200

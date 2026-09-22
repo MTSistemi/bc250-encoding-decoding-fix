@@ -1,0 +1,68 @@
+# Maintainer: SkillFishOS <info@mtsistemi.it>
+#
+# VA-API video encoding and decoding for the AMD BC-250 (Cyan Skillfish).
+# For CachyOS, Arch, SteamOS, HoloISO and anything else pacman-based.
+#
+# ⚠️ Installing this does not switch anything on by itself. The driver is
+# only used on a machine that really is a BC-250, decided at session start
+# by /usr/lib/systemd/user-environment-generators/60-bc250-vaapi. See that
+# file for why.
+
+pkgname=bc250-vaapi
+pkgver=26.09.2
+pkgrel=1
+pkgdesc="VA-API video encoding and decoding for the AMD BC-250 (Cyan Skillfish)"
+arch=('x86_64')
+url="https://github.com/MTSistemi/bc250-vaapi"
+license=('GPL-3.0-only')
+depends=('libva' 'libdrm' 'vulkan-icd-loader')
+makedepends=('cmake' 'glslang' 'vulkan-headers' 'pkgconf')
+optdepends=('ffmpeg: to record, stream or play through the driver'
+            'libva-utils: vainfo, to see what the driver offers')
+provides=('bc250-encoding-decoding-fix')
+options=('!strip' '!debug')
+
+# ⚠️ This tracks the branch rather than a tagged tarball, so the checksum
+# is skipped. When the project tags a release, pin the tag here and put
+# its real checksum in: a package that builds something different every
+# time is not a package.
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/heads/main.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir"/bc250-vaapi-main/approach1-compute-encoder
+
+    # ⚠️ THE PREFIX IS NOT A DETAIL. The shaders are looked for at a path
+    # compiled into the library, which CMake derives from
+    # CMAKE_INSTALL_PREFIX. With the default they would land under
+    # /usr/local/share, where a package may not write: built with /usr they
+    # go to /usr/share/bc250/shaders, where the library finds them itself.
+    #
+    # ⚠️ And the tests are deliberately not built: on some versions they
+    # are missing includes and fail the whole build, while the library
+    # itself is perfectly well.
+    cmake -B build -S . \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DLIBVA_DRIVERS_PATH=/usr/lib/dri \
+        -DBUILD_TESTS=OFF
+    cmake --build build -j"$(nproc)" \
+        --target bc250_drv_video compile_shaders
+}
+
+package() {
+    cd "$srcdir"/bc250-vaapi-main
+
+    install -Dm644 approach1-compute-encoder/build/bc250_drv_video.so \
+        "$pkgdir/usr/lib/dri/bc250_drv_video.so"
+
+    install -d "$pkgdir/usr/share/bc250/shaders"
+    install -m644 approach1-compute-encoder/build/*.spv \
+        "$pkgdir/usr/share/bc250/shaders/"
+
+    install -Dm755 packaging/common/60-bc250-vaapi \
+        "$pkgdir/usr/lib/systemd/user-environment-generators/60-bc250-vaapi"
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

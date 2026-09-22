@@ -1,0 +1,46 @@
+#!/usr/bin/make -f
+# VA-API video encoding and decoding for the AMD BC-250.
+#
+# The CMake project is not at the root of the source tree, so every dh step
+# that would normally find it on its own is pointed at it by hand.
+
+include /usr/share/dpkg/architecture.mk
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+SRC = approach1-compute-encoder
+BLD = $(SRC)/build
+PKG = debian/bc250-vaapi
+
+%:
+	dh $@
+
+# ⚠️ THE PREFIX IS NOT A DETAIL. The shaders are looked for at a path
+# compiled into the library, which CMake derives from CMAKE_INSTALL_PREFIX.
+# With the default they would land under /usr/local/share, where a package
+# may not write.
+override_dh_auto_configure:
+	cmake -S $(SRC) -B $(BLD) \
+	    -DCMAKE_BUILD_TYPE=Release \
+	    -DCMAKE_INSTALL_PREFIX=/usr \
+	    -DLIBVA_DRIVERS_PATH=/usr/lib/$(DEB_HOST_MULTIARCH)/dri \
+	    -DBUILD_TESTS=OFF
+
+# ⚠️ The tests are deliberately not built: on some versions they are missing
+# includes and fail the whole build, while the library itself is well.
+override_dh_auto_build:
+	cmake --build $(BLD) -j$(shell nproc) \
+	    --target bc250_drv_video compile_shaders
+
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -D -m 0644 $(BLD)/bc250_drv_video.so \
+	    $(PKG)/usr/lib/$(DEB_HOST_MULTIARCH)/dri/bc250_drv_video.so
+	install -d $(PKG)/usr/share/bc250/shaders
+	install -m 0644 $(BLD)/*.spv $(PKG)/usr/share/bc250/shaders/
+	install -D -m 0755 packaging/common/60-bc250-vaapi \
+	    $(PKG)/usr/lib/systemd/user-environment-generators/60-bc250-vaapi
+
+override_dh_auto_clean:
+	rm -rf $(BLD)
