@@ -128,6 +128,26 @@ typedef struct {
     int32_t *tile_of_ts;
     size_t n_tile_map;
     int n_tiles;
+    /* Which SLICE each coding tree block was decoded as part of, by
+     * raster address, or -1 for one nothing has reached yet. 6.4.1 wants
+     * the same slice as well as the same tile, and a hole left at the
+     * end of the picture is a slice that never arrived.
+     *
+     * ⚠️ Slices, not slice segments: a dependent segment continues the
+     * slice before it and carries its number. */
+    int32_t *slice_of_ctb;
+    size_t n_slice_map;
+    int slice_now;
+    /* 9.3.1: the context state as the previous slice segment left it. A
+     * dependent segment starts from here instead of from the table. */
+    uint8_t ctx_at_segment_end[HEVCD_CTX];
+    bool have_segment_end;
+    /* 9.3.2.3: the state two units into a row, which the row below
+     * starts from. ⚠️ Kept here and not in the walk, because with one
+     * slice segment per row the walk that takes it is not the walk that
+     * needs it. */
+    uint8_t wpp_snapshot[HEVCD_CTX];
+    bool have_wpp_snapshot;
     /* Which tile the coding tree unit being read belongs to. Set on the
      * way into hevcd_read_ctu(), because the availability tests are
      * asked about a neighbour and know nothing about where "here" is. */
@@ -263,5 +283,6 @@ int hevcd_prepare_zscan(hevcd_t *d);
 int hevcd_prepare_tiles(hevcd_t *d);
 void hevcd_free_tiles(hevcd_t *d);
 int hevcd_tile_at(const hevcd_t *d, int x, int y);
+int hevcd_slice_at(const hevcd_t *d, int x, int y);
 
 #endif /* BC250_HEVC_DEC_INTERNAL_H */

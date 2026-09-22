@@ -48,6 +48,7 @@ static bool already_done(const hevcd_t *d, int xc, int yc, int xn, int yn)
      * earlier has LOWER z-scan addresses, so it would pass while being
      * on the other side of a wall. */
     if (hevcd_tile_at(d, xn, yn) != d->tile_now) return false;
+    if (hevcd_slice_at(d, xn, yn) != d->slice_now) return false;
     const int w = sps->width >> sps->log2_min_tb;
     const int32_t a = d->min_tb_addr_zs[(yc >> sps->log2_min_tb) * w
                                         + (xc >> sps->log2_min_tb)];
@@ -85,14 +86,19 @@ static neighbours_t neighbours(const hevcd_t *d, int x0, int y0, int w, int h)
      * comes earlier in raster order, and ⚠️ is in the same tile. */
     const int lg = sps->log2_ctb;
     const int mine = d->tile_now;
+    const int my_slice = d->slice_now;
     const bool ctb_left = cx > 0
-        && hevcd_tile_at(d, (cx - 1) << lg, cy << lg) == mine;
+        && hevcd_tile_at(d, (cx - 1) << lg, cy << lg) == mine
+        && hevcd_slice_at(d, (cx - 1) << lg, cy << lg) == my_slice;
     const bool ctb_above = cy > 0
-        && hevcd_tile_at(d, cx << lg, (cy - 1) << lg) == mine;
+        && hevcd_tile_at(d, cx << lg, (cy - 1) << lg) == mine
+        && hevcd_slice_at(d, cx << lg, (cy - 1) << lg) == my_slice;
     const bool ctb_above_left = cx > 0 && cy > 0
-        && hevcd_tile_at(d, (cx - 1) << lg, (cy - 1) << lg) == mine;
+        && hevcd_tile_at(d, (cx - 1) << lg, (cy - 1) << lg) == mine
+        && hevcd_slice_at(d, (cx - 1) << lg, (cy - 1) << lg) == my_slice;
     const bool ctb_above_right = cy > 0 && cx + 1 < sps->ctb_width
-        && hevcd_tile_at(d, (cx + 1) << lg, (cy - 1) << lg) == mine;
+        && hevcd_tile_at(d, (cx + 1) << lg, (cy - 1) << lg) == mine
+        && hevcd_slice_at(d, (cx + 1) << lg, (cy - 1) << lg) == my_slice;
 
     neighbours_t v;
     v.left = ctb_left || xb;
