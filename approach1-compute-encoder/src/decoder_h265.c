@@ -21,7 +21,7 @@
 struct hevc_decoder {
     hevcd_t d;
     hevcd_img_t buffer[IMG_SLOTS];
-    uintptr_t nome[IMG_SLOTS];      /* what the caller calls each picture */
+    uintptr_t surface_id[IMG_SLOTS];  /* what the caller calls each picture */
     void *gpu;
     int width, height;
     hevc_sps_t sps;
@@ -35,7 +35,7 @@ static void free_img(hevcd_img_t *g)
     for (int i = 0; i < 3; i++) { free(g->plane[i]); g->plane[i] = NULL; }
     free(g->mvf);
     g->mvf = NULL;
-    g->n_piano = 0;
+    g->n_planes = 0;
     g->n_mvf = 0;
     g->is_valid = false;
 }
@@ -48,7 +48,7 @@ static hevcd_img_t *find_img(const hevcd_t *d, int poc)
 }
 
 /* Everything the reference picture set no longer names can go. */
-static void sfoltisci(hevcd_t *d, const hevc_slice_t *sl)
+static void unescape(hevcd_t *d, const hevc_slice_t *sl)
 {
     if (sl->nal_type == HEVC_NAL_IDR_W_RADL || sl->nal_type == HEVC_NAL_IDR_N_LP) {
         for (int i = 0; i < d->n_buf; i++) d->buf[i].is_valid = false;
@@ -72,18 +72,25 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
 {
     const int w = sps->width, h = sps->height;
     const size_t n_mvf = (size_t)(w >> 2) * (h >> 2);
+    /* ⚠️ Above eight bits a sample is two bytes. n_planes counts BYTES,
+     * because that is what the SAO snapshot mallocs and copies, and it
+     * doubles as the test below: a sequence that changes depth finds the
+     * size different and reallocates, instead of writing ten-bit samples
+     * into a buffer sized for eight. Luma and chroma share the figure,
+     * which holds while we refuse streams whose two depths differ. */
+    const size_t bytes = sps->bit_depth_luma > 8 ? 2 : 1;
 
     hevcd_img_t *g = NULL;
     for (int i = 0; i < d->n_buf && !g; i++)
         if (!d->buf[i].is_valid) g = &d->buf[i];
     if (!g) return -1;
 
-    if (g->n_piano != (size_t)w * h) {
+    if (g->n_planes != (size_t)w * h * bytes) {
         free_img(g);
-        g->plane[0] = malloc((size_t)w * h);
-        g->plane[1] = malloc((size_t)(w / 2) * (h / 2));
-        g->plane[2] = malloc((size_t)(w / 2) * (h / 2));
-        g->n_piano = (size_t)w * h;
+        g->plane[0] = malloc((size_t)w * h * bytes);
+        g->plane[1] = malloc((size_t)(w / 2) * (h / 2) * bytes);
+        g->plane[2] = malloc((size_t)(w / 2) * (h / 2) * bytes);
+        g->n_planes = (size_t)w * h * bytes;
     }
     if (g->n_mvf != n_mvf) {
         free(g->mvf);
@@ -102,7 +109,7 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
     d->current = g;
     d->mvf = g->mvf;
     for (int i = 0; i < 3; i++) { d->plane[i] = g->plane[i]; d->stride[i] = g->stride[i]; }
-    d->n_piano = g->n_piano;
+    d->n_planes = g->n_planes;
     return 0;
 }
 
@@ -440,7 +447,7 @@ void hevc_decoder_set_references(hevc_decoder_t *h, const uintptr_t *id,
         if (!h->buffer[i].is_valid) continue;
         bool serve = false;
         for (int k = 0; k < n && !serve; k++)
-            if (h->nome[i] == id[k] && h->buffer[i].poc == poc[k]) serve = true;
+            if (h->surface_id[i] == id[k] && h->buffer[i].poc == poc[k]) serve = true;
         if (!serve) h->buffer[i].is_valid = false;
     }
 }
@@ -452,7 +459,7 @@ int hevc_decoder_begin_picture(hevc_decoder_t *h, const hevc_sps_t *sps,
     h->pps = *pps;
     if (open_picture(&h->d, &h->sps, poc)) return -1;
     for (int i = 0; i < IMG_SLOTS; i++)
-        if (&h->buffer[i] == h->d.current) h->nome[i] = id;
+        if (&h->buffer[i] == h->d.current) h->surface_id[i] = id;
     h->is_open = true;
     return 0;
 }
@@ -484,7 +491,7 @@ const uint8_t *hevc_decoder_plane(const hevc_decoder_t *h, int plane,
 
 void hevc_decoder_unescape(hevc_decoder_t *h, const hevc_slice_t *sl)
 {
-    sfoltisci(&h->d, sl);
+    unescape(&h->d, sl);
 }
 
 void hevc_decoder_shift_entry_points(hevc_slice_t *s, const uint8_t *grezzo,
@@ -504,8 +511,34 @@ int hevc_decoder_load(hevc_decoder_t *h, gpu_image_t out, gpu_memory_t mem)
     if (!g || !g->plane[0]) return -1;
 
     const int cw = h->width / 2, ch = h->height / 2;
-    uint8_t *uv = malloc((size_t)cw * 2 * ch);
+    const int ten_bit = h->sps.bit_depth_luma > 8;
+    const size_t sample = ten_bit ? 2 : 1;
+
+    uint8_t *uv = malloc((size_t)cw * 2 * ch * sample);
     if (!uv) return -1;
+
+    if (ten_bit) {
+        /* ⚠️ Every one of these is a sample count, so every offset is
+         * multiplied. The shift into P010's high bits is not here - it
+         * belongs to the upload, which is the part that knows what a
+         * surface format is. */
+        for (int r = 0; r < ch; r++) {
+            const uint16_t *a = (const uint16_t *)g->plane[1]
+                                + (size_t)r * g->stride[1];
+            const uint16_t *b = (const uint16_t *)g->plane[2]
+                                + (size_t)r * g->stride[2];
+            uint16_t *o = (uint16_t *)uv + (size_t)r * cw * 2;
+            for (int x = 0; x < cw; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
+        }
+        const int r = gpu_compute_upload_p010(h->gpu, &out, mem,
+                                              (const uint16_t *)g->plane[0],
+                                              g->stride[0] * 2,
+                                              (const uint16_t *)uv, cw * 4,
+                                              h->width, h->height);
+        free(uv);
+        return r;
+    }
+
     for (int r = 0; r < ch; r++) {
         const uint8_t *a = g->plane[1] + (size_t)r * g->stride[1];
         const uint8_t *b = g->plane[2] + (size_t)r * g->stride[2];

@@ -78,11 +78,19 @@ static void read_sao(hevcd_t *d, int rx, int ry)
         }
         if (kind == 0) continue;
 
+        /* ⚠️ Truncated Rice in bypass, and cMax MOVES with the depth:
+         * (1 << (Min(BitDepth, 10) - 5)) - 1, so seven at eight bits and
+         * thirty-one at ten. Stopping at seven in a ten-bit stream ends
+         * the codeword in the wrong place and everything after it is
+         * noise - it showed up as a terminating bin that was not one. */
+        const int depth = plane ? d->sps->bit_depth_chroma
+                                : d->sps->bit_depth_luma;
+        const int cmax = (1 << ((depth < 10 ? depth : 10) - 5)) - 1;
+
         int absolute[4];
         for (int i = 0; i < 4; i++) {
-            /* Truncated Rice, cMax 7 at eight bits, all in bypass. */
             int v = 0;
-            while (v < 7 && hevcd_bypass(c)) v++;
+            while (v < cmax && hevcd_bypass(c)) v++;
             absolute[i] = v;
         }
         mine->kind[plane] = (uint8_t)kind;
@@ -542,7 +550,12 @@ static void read_qp_delta(hevcd_t *d)
     if (value && hevcd_bypass(c))
         value = -value;
     d->cu_qp_delta = value;
-    d->qp_y = ((d->qp_y_pred + value + 52) % 52 + 52) % 52;
+    /* ⚠️ The wrap is over 52 + QpBdOffsetY, not 52, and it lands on
+     * -QpBdOffsetY rather than zero. Same shape at eight bits, where the
+     * offset is nothing, and different at ten. */
+    const int qp_bd_offset = 6 * (d->sps->bit_depth_luma - 8);
+    d->qp_y = ((d->qp_y_pred + value + 52 + 2 * qp_bd_offset)
+               % (52 + qp_bd_offset)) - qp_bd_offset;
 }
 
 /* 8.6.1: the luma quantisation parameter's prediction, worked out once
@@ -594,22 +607,35 @@ static void start_qg(hevcd_t *d, int x0, int y0)
  * in a table rather than a formula. */
 static int qp_chroma(int qp_i)
 {
-    if (qp_i < 30) return qp_i < 0 ? 0 : qp_i;
+    /* ⚠️ No clamp at zero. Table 8-10 says qPCb = qPiCb for anything
+     * under thirty, and above eight bits qPiCb is allowed to be negative
+     * - down to -QpBdOffsetC. The caller has already clipped it there;
+     * flooring it again here would quietly raise the quantiser. */
+    if (qp_i < 30) return qp_i;
     if (qp_i > 43) return qp_i - 6;
     return hevcd_qp_c[qp_i - 30];
 }
 
 /* 8.6.1, for the coding unit being reconstructed. */
+/* ⚠️ What the dequantiser wants is QP', not QP: QP'Y = QpY + QpBdOffsetY
+ * and QpBdOffsetY = 6 * (BitDepth - 8), which is nothing at eight bits
+ * and twelve at ten. Leave it out and every coefficient comes back a
+ * factor of four thousand too small, which is a grey picture rather than
+ * a wrong one - no crash, no complaint. The chroma side clips in QP
+ * space first and adds the offset after, as 8.6.1 spells out. */
 static int block_qp(const hevcd_t *d, int c_idx)
 {
-    if (c_idx == 0) return d->qp_y;
+    const int bd = c_idx ? d->sps->bit_depth_chroma : d->sps->bit_depth_luma;
+    const int qp_bd_offset = 6 * (bd - 8);
+
+    if (c_idx == 0) return d->qp_y + qp_bd_offset;
     const int off = (c_idx == 1)
         ? d->pps->cb_qp_offset + d->slice->cb_qp_offset
         : d->pps->cr_qp_offset + d->slice->cr_qp_offset;
     int q = d->qp_y + off;
-    if (q < 0) q = 0;
+    if (q < -qp_bd_offset) q = -qp_bd_offset;
     if (q > 57) q = 57;
-    return qp_chroma(q);
+    return qp_chroma(q) + qp_bd_offset;
 }
 
 /* One transform block: predict it, then add whatever residual it has.
@@ -618,7 +644,7 @@ static int block_qp(const hevcd_t *d, int c_idx)
  * this one's reconstructed samples, so a version that read all the
  * residuals first and reconstructed afterwards would predict from
  * whatever was in the picture before. */
-static void ricostruisci_tb(hevcd_t *d, int c_idx, int x, int y,
+static void reconstruct_tb(hevcd_t *d, int c_idx, int x, int y,
                             int log2_size, bool has_residual)
 {
     /* The luma mode is per prediction block; chroma has one per coding
@@ -639,21 +665,26 @@ static void ricostruisci_tb(hevcd_t *d, int c_idx, int x, int y,
     /* 8.6.2: with the bypass the coefficients are the residual already.
      * Everything below this point - the scaling, the two transform stages,
      * the rounding - exists to undo a quantisation that never happened. */
+    /* ⚠️ Luma and chroma carry their own depth. They are equal in every
+     * profile we accept, and reading the wrong one would be invisible
+     * until the day they are not. */
+    const int bd = c_idx ? d->sps->bit_depth_chroma : d->sps->bit_depth_luma;
+
     if (d->cu.transquant_bypass) {
-        hevcd_add(d->plane[c_idx] + (size_t)y * d->stride[c_idx] + x,
-                       d->stride[c_idx], d->coeff, log2_size);
+        hevcd_add(d->plane[c_idx], d->stride[c_idx], x, y,
+                  d->coeff, log2_size, bd);
         return;
     }
 
-    hevcd_dequantizza(d->coeff, log2_size, block_qp(d, c_idx));
+    hevcd_dequantize(d->coeff, log2_size, block_qp(d, c_idx), bd);
     if (d->transform_skip)
-        hevcd_skip_transform(d->coeff, log2_size);
+        hevcd_skip_transform(d->coeff, log2_size, bd);
     else
         hevcd_transform(d->coeff, log2_size,
                         c_idx == 0 && log2_size == 2
-                        && d->cu.pred_mode == HEVCD_MODE_INTRA);
-    hevcd_add(d->plane[c_idx] + (size_t)y * d->stride[c_idx] + x,
-                   d->stride[c_idx], d->coeff, log2_size);
+                        && d->cu.pred_mode == HEVCD_MODE_INTRA, bd);
+    hevcd_add(d->plane[c_idx], d->stride[c_idx], x, y,
+              d->coeff, log2_size, bd);
 }
 
 static void read_tu(hevcd_t *d, int x0, int y0, int x_base, int y_base,
@@ -665,23 +696,23 @@ static void read_tu(hevcd_t *d, int x0, int y0, int x_base, int y_base,
 
     if (cbf_luma)
         hevcd_read_residual(d, x0, y0, log2_size, 0);
-    ricostruisci_tb(d, 0, x0, y0, log2_size, cbf_luma);
+    reconstruct_tb(d, 0, x0, y0, log2_size, cbf_luma);
 
     if (log2_size > 2) {
         const int cx = x0 >> 1, cy = y0 >> 1;
         if (cbf_cb) hevcd_read_residual(d, x0, y0, log2_size - 1, 1);
-        ricostruisci_tb(d, 1, cx, cy, log2_size - 1, cbf_cb);
+        reconstruct_tb(d, 1, cx, cy, log2_size - 1, cbf_cb);
         if (cbf_cr) hevcd_read_residual(d, x0, y0, log2_size - 1, 2);
-        ricostruisci_tb(d, 2, cx, cy, log2_size - 1, cbf_cr);
+        reconstruct_tb(d, 2, cx, cy, log2_size - 1, cbf_cr);
     } else if (blk == 3) {
         /* ⚠️ At the smallest luma size the four 4x4 blocks share one 4x4
          * chroma block, which is read with the last of them and lives at
          * the parent's corner. */
         const int cx = x_base >> 1, cy = y_base >> 1;
         if (cbf_cb) hevcd_read_residual(d, x_base, y_base, 2, 1);
-        ricostruisci_tb(d, 1, cx, cy, 2, cbf_cb);
+        reconstruct_tb(d, 1, cx, cy, 2, cbf_cb);
         if (cbf_cr) hevcd_read_residual(d, x_base, y_base, 2, 2);
-        ricostruisci_tb(d, 2, cx, cy, 2, cbf_cr);
+        reconstruct_tb(d, 2, cx, cy, 2, cbf_cr);
     }
     (void)depth;
 }

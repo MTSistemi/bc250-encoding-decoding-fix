@@ -77,7 +77,7 @@ struct h264d_pool {
 };
 
 /* How far a row has to have got before the row below may touch column x. */
-static inline void attendi(const atomic_int *p, int up_to)
+static inline void await_row(const atomic_int *p, int up_to)
 {
     int rounds = 0;
     while (atomic_load_explicit(p, memory_order_acquire) < up_to) {
@@ -140,7 +140,7 @@ static void work(struct h264d_pool *p)
 
         for (int x = x0; x <= x1; x++) {
             if (wait_for)
-                attendi(&p->progress_of[r - 1], x + 2);
+                await_row(&p->progress_of[r - 1], x + 2);
 
             if (p->kind == 0) {
                 c.mb_idx = r * mb_w + x;
@@ -321,6 +321,12 @@ void h264d_reconstruct_range(h264_decoder_t *d, int first, int count,
     }
 
     pthread_mutex_lock(&p->m);
+    /* ⚠️ The workers are about to be handed pointers that belong to the
+     * caller, `d` and what it points at. That is safe for exactly one
+     * reason: this function does not return until every worker has
+     * finished, on the wait below. Make this asynchronous and those
+     * pointers outlive their owner - it is the cheapest possible way to
+     * turn a decoder into a heisenbug. */
     p->kind = 0;
     p->d = d;
     p->first = first;
@@ -421,6 +427,12 @@ int h264d_slices_pool(h264_decoder_t *d, const h264d_slice_input_t *in,
         return first_error;
     }
 
+    /* ⚠️ The workers are about to be handed pointers that belong to the
+     * caller, `d` and what it points at. That is safe for exactly one
+     * reason: this function does not return until every worker has
+     * finished, on the wait below. Make this asynchronous and those
+     * pointers outlive their owner - it is the cheapest possible way to
+     * turn a decoder into a heisenbug. */
     p->kind = 2;
     p->d = d;
     p->in = in;
