@@ -32,6 +32,8 @@ struct hevc_decoder {
 
 static void free_img(hevcd_img_t *g)
 {
+    free(g->lists); g->lists = NULL; g->n_lists = 0;
+    free(g->slice_of_ctb); g->slice_of_ctb = NULL; g->n_slice_map = 0;
     for (int i = 0; i < 3; i++) { free(g->plane[i]); g->plane[i] = NULL; }
     free(g->mvf);
     g->mvf = NULL;
@@ -104,7 +106,7 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
     g->stride[1] = g->stride[2] = w / 2;
     g->poc = poc;
     g->is_valid = true;
-    g->n_list[0] = g->n_list[1] = 0;
+    g->n_lists = 0;   /* filled as each slice is read */
 
     d->current = g;
     d->mvf = g->mvf;
@@ -152,13 +154,28 @@ static void build_lists(hevcd_t *d, const hevc_slice_t *sl)
         }
     }
 
-    /* What the indices mean, kept with the picture: a later one that takes
-     * this as its collocated picture asks what it pointed at, and an index
-     * means nothing outside the slice that wrote it. */
-    for (int l = 0; l < 2; l++) {
-        d->current->n_list[l] = d->n_refs[l];
-        for (int i = 0; i < d->n_refs[l]; i++)
-            d->current->poc_list[l][i] = d->ref_pic[l][i]->poc;
+    /* What the indices mean, kept with the picture and with the SLICE:
+     * a later picture that takes this as its collocated one asks what a
+     * stored index pointed at, and an index means nothing outside the
+     * slice that wrote it. */
+    if (d->slice_now >= 0) {
+        hevcd_img_t *g = d->current;
+        if ((size_t)d->slice_now >= g->n_lists) {
+            const size_t want = (size_t)d->slice_now + 64;
+            void *p = realloc(g->lists, want * sizeof *g->lists);
+            if (p) {
+                g->lists = p;
+                g->n_lists = want;
+            }
+        }
+        if ((size_t)d->slice_now < g->n_lists) {
+            for (int l = 0; l < 2; l++) {
+                g->lists[d->slice_now].n_list[l] = d->n_refs[l];
+                for (int i = 0; i < d->n_refs[l]; i++)
+                    g->lists[d->slice_now].poc_list[l][i] =
+                        d->ref_pic[l][i]->poc;
+            }
+        }
     }
 
     d->col = NULL;
@@ -635,6 +652,22 @@ int hevc_decoder_slice(hevc_decoder_t *h, const hevc_slice_t *sl,
 void hevc_decoder_end_picture(hevc_decoder_t *h)
 {
     if (!h->is_open || !h->d.current) return;
+    /* ⚠️ Before the filters or after makes no difference to them, but
+     * it has to happen while the map is still this picture's: the next
+     * begin_picture() clears it. */
+    if (h->d.slice_of_ctb && h->d.current) {
+        hevcd_img_t *g = h->d.current;
+        const size_t n = (size_t)h->sps.ctb_count;
+        if (g->n_slice_map < n) {
+            free(g->slice_of_ctb);
+            g->slice_of_ctb = malloc(n * sizeof *g->slice_of_ctb);
+            g->n_slice_map = g->slice_of_ctb ? n : 0;
+        }
+        if (g->slice_of_ctb)
+            memcpy(g->slice_of_ctb, h->d.slice_of_ctb,
+                   n * sizeof *g->slice_of_ctb);
+    }
+
     if (h->d.slice) { hevcd_deblock(&h->d); hevcd_sao(&h->d); }
     h->is_open = false;
 }

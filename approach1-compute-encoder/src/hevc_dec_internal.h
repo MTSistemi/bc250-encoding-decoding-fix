@@ -76,8 +76,18 @@ typedef struct {
     bool is_valid;
     hevcd_mvf_t *mvf;
     size_t n_mvf;
-    int poc_list[2][16];
-    int n_list[2];
+    /* ⚠️ Per SLICE, and kept with the picture because they are read
+     * long after it is finished: a later picture resolves a collocated
+     * motion vector's reference through the list of the slice that
+     * DECODED that block. One pair per picture handed every block the
+     * last slice's. */
+    struct hevcd_img_lists {
+        int poc_list[2][16];
+        int n_list[2];
+    } *lists;
+    size_t n_lists;
+    int32_t *slice_of_ctb;      /* a copy, taken when the picture ends */
+    size_t n_slice_map;
 } hevcd_img_t;
 
 /* One coding tree block's sample adaptive offset, 7.3.8.3.
