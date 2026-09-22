@@ -1113,15 +1113,19 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             res_cr[y * 4 + x] = (int16_t)(enc->src_cr[(cy + y) * ccw + (cx + x)] - pred_cr[y * 4 + x]);
         }
 
+    /* Chroma quantizes at QpC, not QpY - Rec. ITU-T H.265 Table 8-10.
+     * Passing luma QP directly causes divergence from the standard when QP >= 30. */
+    int cqp = hevc_chroma_qp_from_luma(qp);
+
     int16_t coeff_cb[16], coeff_cr[16];
-    hevc_transform_quant_4x4(res_cb, qp, 0, coeff_cb);
-    hevc_transform_quant_4x4(res_cr, qp, 0, coeff_cr);
+    hevc_transform_quant_4x4(res_cb, cqp, 0, coeff_cb);
+    hevc_transform_quant_4x4(res_cr, cqp, 0, coeff_cr);
     int cbf_cb = any_nonzero16(coeff_cb);
     int cbf_cr = any_nonzero16(coeff_cr);
 
     if (cbf_cb) {
         int16_t rres_cb[16];
-        hevc_dequant_itransform_4x4(coeff_cb, qp, 0, rres_cb);
+        hevc_dequant_itransform_4x4(coeff_cb, cqp, 0, rres_cb);
         for (int y = 0; y < 4; y++)
             for (int x = 0; x < 4; x++)
                 enc->recon_cb[(cy + y) * ccw + (cx + x)] = clip8i(pred_cb[y * 4 + x] + rres_cb[y * 4 + x]);
@@ -1132,7 +1136,7 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
 
     if (cbf_cr) {
         int16_t rres_cr[16];
-        hevc_dequant_itransform_4x4(coeff_cr, qp, 0, rres_cr);
+        hevc_dequant_itransform_4x4(coeff_cr, cqp, 0, rres_cr);
         for (int y = 0; y < 4; y++)
             for (int x = 0; x < 4; x++)
                 enc->recon_cr[(cy + y) * ccw + (cx + x)] = clip8i(pred_cr[y * 4 + x] + rres_cr[y * 4 + x]);
