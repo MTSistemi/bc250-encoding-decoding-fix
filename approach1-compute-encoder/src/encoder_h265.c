@@ -335,6 +335,7 @@ struct hevc_encoder {
     bool     has_ref;
     int qp;
     int pps_init_qp;
+    int qp_hint_applied;         /* Last QP explicitly handed to hevc_encoder_set_qp(), or -1 if never called yet */
     rate_control_t rc;
     uint32_t quality_level;      /* 1..7 (1 = Quality, 4 = Balanced, 7 = Speed) */
     uint32_t max_frame_bits;     /* Maximum frame size in bits (0 = unlimited) */
@@ -440,6 +441,7 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
             (double)enc->fps, width, height);
     enc->rc.current_qp = enc->qp;
     enc->rc.base_qp = enc->qp;
+    enc->qp_hint_applied = -1; /* no explicit QP hint applied yet - see hevc_encoder_set_qp() */
     enc->quality_level = 4;
     enc->max_frame_bits = 0;
 
@@ -558,25 +560,16 @@ void hevc_encoder_set_qp(hevc_encoder_t *encoder, int qp)
     if (encoder) {
         if (qp < 0) qp = 0;
         if (qp > 51) qp = 51;
-        encoder->qp = qp;
-        /* In a bitrate-driven mode the loop owns its own state.
-         *
-         * va_backend.c calls this for EVERY picture, with pic_init_qp out of
-         * the VAEncPictureParameterBufferHEVC - and pic_init_qp is the PPS's
-         * starting QP, not an instruction to restart rate control. Resetting
-         * base_qp and current_qp here handed the feedback loop its starting
-         * value again before every single frame, so it could never walk
-         * anywhere: measured on a BC-250, QP stayed at 30 for the whole
-         * sequence while the stream ran at 1.3 Mbit/s against an 8 Mbit/s
-         * request. The H.264 path has no per-picture call like this.
-         *
-         * In RC_CQP there is no loop to protect and the caller's QP is the
-         * whole point, so that path is untouched.
-         */
-        if (encoder->rc.mode == RC_CQP) {
+        /* va_backend.c calls this for EVERY picture with pic_init_qp out of
+         * VAEncPictureParameterBufferHEVC. To prevent per-frame unchanged hints
+         * from stomping the rate controller's QP walk, only reset base_qp/current_qp
+         * when the hint genuinely changes. */
+        if (qp != encoder->qp_hint_applied) {
             encoder->rc.base_qp = qp;
             encoder->rc.current_qp = qp;
+            encoder->qp_hint_applied = qp;
         }
+        encoder->qp = qp;
     }
 }
 
