@@ -349,6 +349,26 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
         return 5;
     if (!d->current) return 5;
     d->slice = sl;
+
+    /* ⚠️ Kept because the filters run after every slice has been read,
+     * by which time d->slice is the last one. Reading the offsets from
+     * there applied one slice's settings to the whole picture. */
+    if (d->slice_now >= 0) {
+        if ((size_t)d->slice_now >= d->n_slice_filter) {
+            const size_t want = (size_t)d->slice_now + 64;
+            hevcd_slice_filter_t *p = realloc(d->slice_filter,
+                                              want * sizeof *p);
+            if (!p) return 5;
+            d->slice_filter = p;
+            d->n_slice_filter = want;
+        }
+        hevcd_slice_filter_t *f = &d->slice_filter[d->slice_now];
+        f->beta_offset = (int16_t)sl->beta_offset;
+        f->tc_offset = (int16_t)sl->tc_offset;
+        f->disabled = sl->deblocking_filter_disabled ? 1 : 0;
+        f->across_slices = sl->loop_filter_across_slices ? 1 : 0;
+    }
+
     d->min_pu_width = sps->width >> 2;
     d->min_pu_height = sps->height >> 2;
     /* ⚠️ 8.6.1: a dependent segment continues the quantisation parameter
@@ -532,6 +552,7 @@ void hevc_decoder_destroy(hevc_decoder_t *h)
     for (int i = 0; i < IMG_SLOTS; i++) free_img(&h->buffer[i]);
     hevcd_t *d = &h->d;
     hevcd_free_tiles(d);
+    free(d->slice_filter);
     free(d->ct_depth); free(d->intra_mode); free(d->min_tb_addr_zs);
     free(d->qp_y_map); free(d->edges); free(d->no_filter);
     free(d->skip); free(d->cbf_map);

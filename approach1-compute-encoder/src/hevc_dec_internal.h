@@ -93,6 +93,19 @@ typedef struct {
     uint8_t category[3];      /* which way the edge runs, for the edge type */
 } hevcd_sao_t;
 
+/* What one slice says about the loop filters.
+ *
+ * ⚠️ Per slice and not per picture. Two slices of one picture may
+ * disable deblocking differently, carry different beta and tC offsets,
+ * and disagree about whether the filters may cross between them - and
+ * the filters run once, over the whole picture, after every slice of it
+ * has been read. */
+typedef struct {
+    int16_t beta_offset, tc_offset;
+    uint8_t disabled;
+    uint8_t across_slices;
+} hevcd_slice_filter_t;
+
 typedef struct {
     const hevc_sps_t *sps;
     const hevc_pps_t *pps;
@@ -138,6 +151,10 @@ typedef struct {
     int32_t *slice_of_ctb;
     size_t n_slice_map;
     int slice_now;
+    /* One entry per slice of this picture, indexed by the number in
+     * slice_of_ctb. */
+    hevcd_slice_filter_t *slice_filter;
+    size_t n_slice_filter;
     /* 9.3.1: the context state as the previous slice segment left it. A
      * dependent segment starts from here instead of from the table. */
     uint8_t ctx_at_segment_end[HEVCD_CTX];
