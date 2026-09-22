@@ -168,4 +168,4 @@ sudo cmake --install build
 * **Special Thanks**:
   * **Mattia Tadini (@MTSistemi)** for authoring the complete bit-exact H.264 & HEVC decoders (`VAEntrypointVLD`), multi-slice HEVC, 16-bit Vulkan features, and distro packaging.
   * **Shalasere** for SPS crop research, Table 8-10 chroma QP mapping, and CABAC residual optimizations.
-  * **Community Testers**: `oblique99`, `Cosmos`, `land_and_air`, and `Mix` for extensive hardware validation, WiVRn benchmarks, and feedback.
+  * **Community Testers**: `oblique99`, `Cosmos`, `land_and_air`
