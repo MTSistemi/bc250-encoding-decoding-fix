@@ -79,7 +79,7 @@ int hevc_scan_idx_for_mode(int mode);
  * comparison target for "which mode is best" is always the true picture
  * content, not the neighbor data used to build the candidate. */
 int hevc_choose_luma_mode(int y_min, const uint8_t *src_y, const uint8_t *recon_y, int stride,
-                           int width, int height, int x0, int y0);
+                           int width, int height, int x0, int y0, uint8_t pred_out[16]);
 
 /* Derive the 3 most-probable-mode candidates for a 4x4 luma PU at (x0,y0)
  * from its already-decided left/above neighbor block modes, per 8.4.2.

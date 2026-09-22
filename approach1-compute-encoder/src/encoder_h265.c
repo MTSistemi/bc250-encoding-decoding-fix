@@ -1070,11 +1070,15 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     /* Step 1: decide + reconstruct all 4 luma PUs in z-order */
     for (int pu = 0; pu < 4; pu++) {
         int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-        int mode = (enc->quality_level >= 4) ? HEVC_MODE_DC : hevc_choose_luma_mode(y_min, enc->src_y, enc->recon_y, (int)cw, (int)cw, (int)ch, px, py);
-        pu_modes[pu] = mode;
-
         uint8_t pred[16];
-        hevc_predict_4x4(enc->recon_y, cw, cw, ch, px, py, mode, 1, y_min, pred);
+        int mode;
+        if (enc->quality_level >= 4) {
+            mode = HEVC_MODE_DC;
+            hevc_predict_4x4(enc->recon_y, cw, cw, ch, px, py, mode, 1, y_min, pred);
+        } else {
+            mode = hevc_choose_luma_mode(y_min, enc->src_y, enc->recon_y, (int)cw, (int)cw, (int)ch, px, py, pred);
+        }
+        pu_modes[pu] = mode;
 
         int16_t residual[16];
         for (int y = 0; y < 4; y++)
