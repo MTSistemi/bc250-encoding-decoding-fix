@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <immintrin.h>
 #include <errno.h>
 #include <time.h>
 #include <unistd.h>
@@ -788,6 +789,63 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         .timelineSemaphore = VK_TRUE
     };
 
+    /* 16-bit has to be ENABLED, not merely supported.
+     *
+     * deblock_filter, intra_wavefront, quantize and reconstruct declare Int16
+     * and StorageBuffer16BitAccess: quantized levels are stored as int16_t,
+     * as the buffer sizing above explains. That comment notes the device
+     * supports it - but supporting a feature and enabling it are different
+     * things in Vulkan, and a shader may only use what vkCreateDevice was
+     * asked for. Without these three the SPIR-V is invalid, and the
+     * validation layers say so in as many words:
+     *
+     *   vkCreateShaderModule(): SPIR-V Capability Int16 was declared, but one
+     *   of the following requirements is required
+     *   (VkPhysicalDeviceFeatures::shaderInt16)
+     *
+     * What happens when it is used anyway is undefined, and on RADV it is not
+     * subtle. Measured on a BC-250: HEVC segfaults inside libvulkan_radeon.so
+     * on v0.4.3, and on v0.4.2 it encodes an almost black picture - 5.3 dB
+     * PSNR against the source, where libx265 gives 61.8 dB on the same clip.
+     * H.264 survives because its hot path happens not to hit those shaders in
+     * the same way; that is luck, not design.
+     *
+     * The device is asked what it actually has rather than assumed at: one
+     * that lacks these still gets a working H.264 path and a line in the log
+     * saying why, instead of failing somewhere further along.
+     */
+    VkPhysicalDeviceVulkan11Features have11 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES
+    };
+    VkPhysicalDeviceFeatures2 have2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &have11
+    };
+    vkGetPhysicalDeviceFeatures2(ctx->physical_device, &have2);
+
+    VkPhysicalDeviceVulkan11Features features11 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+        .pNext = &features12,
+        .storageBuffer16BitAccess = have11.storageBuffer16BitAccess,
+        .uniformAndStorageBuffer16BitAccess = have11.uniformAndStorageBuffer16BitAccess
+    };
+    VkPhysicalDeviceFeatures2 features2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &features11
+    };
+    features2.features.shaderInt16 = have2.features.shaderInt16;
+
+    if (!have2.features.shaderInt16 || !have11.storageBuffer16BitAccess ||
+        !have11.uniformAndStorageBuffer16BitAccess) {
+        fprintf(stderr, "[bc250-gpu] warning: this device does not offer 16-bit "
+                        "shader support (shaderInt16=%d storageBuffer16=%d "
+                        "uniformAndStorageBuffer16=%d) - the shaders that use it "
+                        "will misbehave\n",
+                (int)have2.features.shaderInt16,
+                (int)have11.storageBuffer16BitAccess,
+                (int)have11.uniformAndStorageBuffer16BitAccess);
+    }
+
     /* VK_KHR_external_memory_fd (provides vkGetMemoryFdKHR) and
      * VK_EXT_external_memory_dma_buf (adds the DMA_BUF handle type these
      * NV12 images are created/allocated with - see gpu_compute_create_image())
@@ -888,7 +946,7 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
 
     VkDeviceCreateInfo dev_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = &features12,
+        .pNext = &features2,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &q_info,
         .enabledExtensionCount = device_ext_count,
@@ -1812,6 +1870,65 @@ int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t
     return 0;
 }
 
+/* Reading a mapped surface back is a read from WRITE-COMBINING memory.
+ *
+ * The frame the HEVC encoder works on comes out of the VA surface through
+ * gpu_compute_download_nv12(), which used to memcpy row by row. WC memory has
+ * no cache line to fill, so an ordinary load fetches a few bytes at a time and
+ * the copy crawls: measured on a BC-250, 230 MB/s, which came to 40% of the
+ * entire HEVC encode - more than the transform, the quantiser, the intra
+ * prediction and CABAC put together.
+ *
+ * MOVNTDQA is the instruction for this case: it reads a full line into a fill
+ * buffer and hands it over in one go. On memory that IS cached it behaves like
+ * an ordinary load, so this is safe whichever way the driver ends up mapping
+ * the surface, and it does not need to be told which one happened.
+ *
+ * Dispatched at runtime like cpu_simd_me.c does, so a build that runs
+ * somewhere without AVX2 still works.
+ */
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx2")))
+static void copy_from_wc_avx2(uint8_t *dst, const uint8_t *src, size_t n) {
+    size_t i = 0;
+    /* MOVNTDQA needs a 32-byte aligned source: walk up to it normally. */
+    size_t head = (size_t)((0u - (uintptr_t)src) & 31u);
+    if (head > n) head = n;
+    if (head) { memcpy(dst, src, head); i = head; }
+    for (; i + 128 <= n; i += 128) {
+        __m256i a = _mm256_stream_load_si256((const __m256i *)(src + i));
+        __m256i b = _mm256_stream_load_si256((const __m256i *)(src + i + 32));
+        __m256i c = _mm256_stream_load_si256((const __m256i *)(src + i + 64));
+        __m256i d = _mm256_stream_load_si256((const __m256i *)(src + i + 96));
+        _mm256_storeu_si256((__m256i *)(dst + i), a);
+        _mm256_storeu_si256((__m256i *)(dst + i + 32), b);
+        _mm256_storeu_si256((__m256i *)(dst + i + 64), c);
+        _mm256_storeu_si256((__m256i *)(dst + i + 96), d);
+    }
+    for (; i + 32 <= n; i += 32) {
+        _mm256_storeu_si256((__m256i *)(dst + i),
+                            _mm256_stream_load_si256((const __m256i *)(src + i)));
+    }
+    if (i < n) memcpy(dst + i, src + i, n - i);
+    _mm_sfence();
+}
+#endif
+
+static void copy_from_wc(uint8_t *dst, const uint8_t *src, size_t n) {
+#if defined(__x86_64__) || defined(_M_X64)
+    static int ha_avx2 = -1;
+    if (ha_avx2 < 0) ha_avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
+    if (ha_avx2) { copy_from_wc_avx2(dst, src, n); return; }
+#endif
+    memcpy(dst, src, n);
+}
+
+/* Public wrapper: the H.264 path's shadow_copy() reads the same kind of
+ * write-combining staging memory and was paying the same price. */
+void gpu_compute_copy_from_wc(void *dst, const void *src, size_t n) {
+    copy_from_wc((uint8_t *)dst, (const uint8_t *)src, n);
+}
+
 int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,
                              uint8_t *y_plane, int y_pitch,
                              uint8_t *uv_plane, int uv_pitch,
@@ -1843,12 +1960,12 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
 
     const uint8_t *src_y = mapped + layout_y.offset;
     for (int r = 0; r < height; r++) {
-        memcpy(y_plane + (size_t)r * y_pitch, src_y + (size_t)r * layout_y.rowPitch, width);
+        copy_from_wc(y_plane + (size_t)r * y_pitch, src_y + (size_t)r * layout_y.rowPitch, (size_t)width);
     }
 
     const uint8_t *src_uv = mapped + uv_offset + layout_uv.offset;
     for (int r = 0; r < height / 2; r++) {
-        memcpy(uv_plane + (size_t)r * uv_pitch, src_uv + (size_t)r * layout_uv.rowPitch, width);
+        copy_from_wc(uv_plane + (size_t)r * uv_pitch, src_uv + (size_t)r * layout_uv.rowPitch, (size_t)width);
     }
 
     if (needs_unmap) {
@@ -2396,6 +2513,32 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
 
 int gpu_compute_dispatch_me_only(gpu_context_t *ctx, gpu_image_t render_target, int width, int height) {
     if (!ctx || !ctx->motion_est_pipeline) return -1;
+
+    /* The buffers have to be allocated here as well.
+     *
+     * gpu_compute_dispatch_encode_ext() carries a comment saying its
+     * allocation is "the ONLY place they get allocated" and that "proceeding
+     * with VK_NULL_HANDLE buffers is what turned an out-of-memory into a
+     * SEGV". This function is a second door into the same buffers, and it
+     * walked past that check: the only caller is the HEVC encoder, which
+     * therefore dispatched motion estimation with an OutputMV descriptor
+     * nobody had written and then copied from a null mv_buffer.
+     *
+     * Measured on a BC-250: SIGSEGV in radv_CmdCopyBuffer2, with the
+     * validation layers naming both halves - "the descriptor ... variable
+     * OutputMV is being used in dispatch but has never been updated" and
+     * "vkCmdCopyBuffer(): srcBuffer is VK_NULL_HANDLE".
+     *
+     * Same condition and same failure handling as the encode path, so the two
+     * doors behave alike.
+     */
+    if (ctx->staging_buffers[0] == VK_NULL_HANDLE ||
+        ctx->frame_width != (uint32_t)width ||
+        ctx->frame_height != (uint32_t)height) {
+        if (allocate_encoding_buffers(ctx, (uint32_t)width, (uint32_t)height) != 0) {
+            return -1;
+        }
+    }
 
     VkCommandBuffer cmd_buf = ctx->cmd_bufs[ctx->current_buf];
     uint32_t width_mbs = ((uint32_t)width + 15) / 16;

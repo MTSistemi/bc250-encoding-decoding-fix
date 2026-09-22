@@ -15,6 +15,7 @@
  */
 #include "hevc_intra.h"
 #include <string.h>
+#include <immintrin.h>
 #include <stdlib.h>
 
 /* ===================== mode/scan helpers ===================== */
@@ -91,25 +92,41 @@ static inline uint8_t clip8(int v) { return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255
  * available iff it's in-picture AND its rank is strictly less than the
  * current block's.
  */
+/* Shifts, not divisions.
+ *
+ * Every divisor here is a power of two, but all of them are derived from the
+ * is_luma argument, so the compiler cannot prove it and emits real div
+ * instructions - six per call, and this is called five times per 4x4 block
+ * (once for the block itself, four for its neighbours), which comes to about
+ * four million integer divisions per 1080p frame. The profiler put
+ * zorder_available() at 5% of the HEVC encode on a BC-250 on its own, before
+ * counting what it costs inside gather_neighbors().
+ *
+ * x and y are never negative at either call site - zorder_available() bounds
+ * checks first and the cur_rank call passes the block's own coordinates - so
+ * >> and & give exactly what / and % gave. */
 static long long zorder_rank(int x, int y, int width, int is_luma) {
-    int ctu_size = is_luma ? 16 : 8;
-    int width_ctu = (width + ctu_size - 1) / ctu_size;
-    int ctu_col = x / ctu_size, ctu_row = y / ctu_size;
-    int rx = x % ctu_size, ry = y % ctu_size;
-    int half = ctu_size / 2; /* CU size in this plane's pixels */
-    int cu_col = rx / half, cu_row = ry / half;
+    const int sh = is_luma ? 4 : 3;              /* ctu_size = 1 << sh */
+    const int ctu_size = 1 << sh;
+    const int hs = sh - 1;                       /* CU size  = 1 << hs */
+    int width_ctu = (width + ctu_size - 1) >> sh;
+    int ctu_col = x >> sh, ctu_row = y >> sh;
+    int rx = x & (ctu_size - 1), ry = y & (ctu_size - 1);
+    int cu_col = rx >> hs, cu_row = ry >> hs;
     long long rank = ((long long)ctu_row * width_ctu + ctu_col) * 4 + (cu_row * 2 + cu_col);
     if (is_luma) {
-        int rx2 = rx % half, ry2 = ry % half;
-        int quarter = half / 2; /* PU size (4) */
-        int pu_col = rx2 / quarter, pu_row = ry2 / quarter;
-        rank = rank * 4 + (pu_row * 2 + pu_col);
+        const int qs = hs - 1;                   /* PU size = 1 << qs = 4 */
+        int rx2 = rx & ((1 << hs) - 1), ry2 = ry & ((1 << hs) - 1);
+        rank = rank * 4 + ((ry2 >> qs) * 2 + (rx2 >> qs));
     }
     return rank;
 }
 
-static int zorder_available(int nx, int ny, int width, int height, int is_luma, long long cur_rank) {
-    if (nx < 0 || ny < 0 || nx >= width || ny >= height) return 0;
+/* y_min is the first pixel row of the current slice: anything above it belongs
+ * to another slice and a decoder will not have it, so neither may we. */
+static int zorder_available(int nx, int ny, int width, int height, int is_luma,
+                            int y_min, long long cur_rank) {
+    if (nx < 0 || ny < y_min || nx >= width || ny >= height) return 0;
     return zorder_rank(nx, ny, width, is_luma) < cur_rank;
 }
 
@@ -125,13 +142,14 @@ static int zorder_available(int nx, int ny, int width, int height, int is_luma, 
  * be positionally-plausible but z-scan-unavailable (see zorder_rank()'s
  * comment above). */
 static void gather_neighbors(const uint8_t *plane, int stride, int width, int height,
-                              int x0, int y0, int is_luma, uint8_t left[5], uint8_t top[5], uint8_t *corner,
+                              int x0, int y0, int is_luma, int y_min,
+                              uint8_t left[5], uint8_t top[5], uint8_t *corner,
                               int *avail_left_out, int *avail_top_out) {
     long long cur_rank = zorder_rank(x0, y0, width, is_luma);
-    int avail_left = zorder_available(x0 - 1, y0, width, height, is_luma, cur_rank);
-    int avail_top = zorder_available(x0, y0 - 1, width, height, is_luma, cur_rank);
-    int avail_corner = zorder_available(x0 - 1, y0 - 1, width, height, is_luma, cur_rank);
-    int avail_top_right = zorder_available(x0 + 4, y0 - 1, width, height, is_luma, cur_rank);
+    int avail_left = zorder_available(x0 - 1, y0, width, height, is_luma, y_min, cur_rank);
+    int avail_top = zorder_available(x0, y0 - 1, width, height, is_luma, y_min, cur_rank);
+    int avail_corner = zorder_available(x0 - 1, y0 - 1, width, height, is_luma, y_min, cur_rank);
+    int avail_top_right = zorder_available(x0 + 4, y0 - 1, width, height, is_luma, y_min, cur_rank);
 
     if (avail_left_out) *avail_left_out = avail_left;
     if (avail_top_out) *avail_top_out = avail_top;
@@ -192,10 +210,11 @@ static void gather_neighbors(const uint8_t *plane, int stride, int width, int he
 /* ===================== prediction (8.4.4.2.5-8.4.4.2.7) ===================== */
 
 void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
-                      int x0, int y0, int mode, int is_luma, uint8_t pred_out[16]) {
+                      int x0, int y0, int mode, int is_luma, int y_min,
+                      uint8_t pred_out[16]) {
     uint8_t left[5], top[5], corner;
     int avail_left = 0, avail_top = 0;
-    gather_neighbors(recon_plane, stride, width, height, x0, y0, is_luma, left, top, &corner, &avail_left, &avail_top);
+    gather_neighbors(recon_plane, stride, width, height, x0, y0, is_luma, y_min, left, top, &corner, &avail_left, &avail_top);
 
     switch (mode) {
     case HEVC_MODE_PLANAR:
@@ -208,27 +227,34 @@ void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int hei
         break;
 
     case HEVC_MODE_DC: {
-        int dc;
-        if (avail_left && avail_top) {
-            dc = (left[0] + left[1] + left[2] + left[3] + top[0] + top[1] + top[2] + top[3] + 4) >> 3;
-        } else if (avail_top) {
-            dc = (top[0] + top[1] + top[2] + top[3] + 2) >> 2;
-        } else if (avail_left) {
-            dc = (left[0] + left[1] + left[2] + left[3] + 2) >> 2;
-        } else {
-            dc = 128;
-        }
+        /* No branching on availability here, deliberately.
+         *
+         * gather_neighbors() has already run the reference sample
+         * substitution of Rec. ITU-T H.265 8.4.4.2.2: it scans bottom-left to
+         * top-right, takes the first available sample and fills every
+         * unavailable one from its neighbour (all 128 when the block has no
+         * neighbours at all). By the time we get here left[] and top[] are
+         * full, and there is no longer any such thing as an unavailable
+         * reference - which is exactly the state 8.4.4.2.5 assumes when it
+         * computes dcVal over BOTH edges and applies the boundary filter for
+         * luma below 32x32.
+         *
+         * Branching on avail_left/avail_top computed dcVal from one edge with
+         * different rounding, and filtered only that edge. A decoder does
+         * neither, so every block touching a picture edge came out a few
+         * units off - and since this encoder predicts DC everywhere, that
+         * difference then rode the prediction chain across the whole picture.
+         * Measured on a BC-250 before this: the encoder's own reconstruction
+         * reached 53.7 dB against the source while the decoded stream sat at
+         * 24.1 dB, and the two disagreed on 56% of pixels.
+         */
+        int dc = (left[0] + left[1] + left[2] + left[3] +
+                  top[0] + top[1] + top[2] + top[3] + 4) >> 3;
         for (int i = 0; i < 16; i++) pred_out[i] = (uint8_t)dc;
         if (is_luma) {
-            if (avail_left && avail_top) {
-                pred_out[0] = (uint8_t)((left[0] + 2 * dc + top[0] + 2) >> 2);
-                for (int x = 1; x < 4; x++) pred_out[x] = (uint8_t)((top[x] + 3 * dc + 2) >> 2);
-                for (int y = 1; y < 4; y++) pred_out[y * 4] = (uint8_t)((left[y] + 3 * dc + 2) >> 2);
-            } else if (avail_top) {
-                for (int x = 0; x < 4; x++) pred_out[x] = (uint8_t)((top[x] + 3 * dc + 2) >> 2);
-            } else if (avail_left) {
-                for (int y = 0; y < 4; y++) pred_out[y * 4] = (uint8_t)((left[y] + 3 * dc + 2) >> 2);
-            }
+            pred_out[0] = (uint8_t)((left[0] + 2 * dc + top[0] + 2) >> 2);
+            for (int x = 1; x < 4; x++) pred_out[x] = (uint8_t)((top[x] + 3 * dc + 2) >> 2);
+            for (int y = 1; y < 4; y++) pred_out[y * 4] = (uint8_t)((left[y] + 3 * dc + 2) >> 2);
         }
         break;
     }
@@ -259,7 +285,7 @@ void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int hei
     }
 }
 
-int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
+int hevc_choose_luma_mode(int y_min, const uint8_t *src_y, const uint8_t *recon_y, int stride,
                            int width, int height, int x0, int y0) {
     static const int candidates[4] = { HEVC_MODE_PLANAR, HEVC_MODE_DC, HEVC_MODE_HORIZONTAL, HEVC_MODE_VERTICAL };
     int best_mode = HEVC_MODE_DC;
@@ -267,7 +293,7 @@ int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stri
 
     for (int c = 0; c < 4; c++) {
         uint8_t pred[16];
-        hevc_predict_4x4(recon_y, stride, width, height, x0, y0, candidates[c], 1, pred);
+        hevc_predict_4x4(recon_y, stride, width, height, x0, y0, candidates[c], 1, y_min, pred);
         long sad = 0;
         for (int y = 0; y < 4; y++)
             for (int x = 0; x < 4; x++) {
@@ -330,7 +356,100 @@ static inline int32_t clip_coeff(int32_t v) {
  * including the real x265/HM ones - see this file's header comment), only
  * well-scaled - forward quantization error is what's supposed to make the
  * picture lossy, not a transform bug. */
-static void forward_transform_4x4(const int16_t residual[16], const int16_t M[4][4], int32_t out[16]) {
+/* SSE4.1 versions of the two 4x4 transforms.
+ *
+ * Each pass is a 4x4 matrix product: the scalar code walks it as three nested
+ * loops, 64 multiply-adds per pass. But the four outputs of a pass share their
+ * inputs, so one register covers a whole row. _mm_cvtepi16_epi32 widens the
+ * four int16 of a row, _mm_mullo_epi32 multiplies by a broadcast matrix entry,
+ * and the accumulation order, the rounding constants and the shifts stay
+ * exactly as they were. _mm_packs_epi32 saturates to int16 precisely the way
+ * clip_coeff() does.
+ *
+ * So the output is bit-identical, and that is verified by encoding the same
+ * clip before and after and comparing the md5 of the bitstream - not by
+ * reading the code and hoping.
+ */
+#if defined(__x86_64__) || defined(_M_X64)
+
+__attribute__((target("sse4.1")))
+static inline __m128i row_i32(const int16_t *p) {
+    return _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)p));
+}
+
+__attribute__((target("sse4.1")))
+static void forward_transform_4x4_sse(const int16_t residual[16], const int16_t M[4][4],
+                                      int32_t out[16]) {
+    __m128i res[4];
+    for (int r = 0; r < 4; r++) res[r] = row_i32(&residual[r * 4]);
+
+    /* pass 1: tmp[i][c] = (sum_r M[i][r] * residual[r*4+c] + 1) >> 1 */
+    __m128i tmp[4];
+    const __m128i one_pred = _mm_set1_epi32(1);
+    for (int i = 0; i < 4; i++) {
+        __m128i acc = _mm_setzero_si128();
+        for (int r = 0; r < 4; r++)
+            acc = _mm_add_epi32(acc, _mm_mullo_epi32(_mm_set1_epi32(M[i][r]), res[r]));
+        tmp[i] = _mm_srai_epi32(_mm_add_epi32(acc, one_pred), 1);
+    }
+
+    /* pass 2: out[i*4+j] = (sum_c M[j][c] * tmp[i][c] + 128) >> 8 */
+    __m128i column[4];
+    for (int c = 0; c < 4; c++)
+        column[c] = _mm_setr_epi32(M[0][c], M[1][c], M[2][c], M[3][c]);
+    const __m128i centoventotto = _mm_set1_epi32(128);
+    for (int i = 0; i < 4; i++) {
+        int32_t t[4];
+        _mm_storeu_si128((__m128i *)t, tmp[i]);
+        __m128i acc = _mm_setzero_si128();
+        for (int c = 0; c < 4; c++)
+            acc = _mm_add_epi32(acc, _mm_mullo_epi32(_mm_set1_epi32(t[c]), column[c]));
+        _mm_storeu_si128((__m128i *)&out[i * 4],
+                         _mm_srai_epi32(_mm_add_epi32(acc, centoventotto), 8));
+    }
+}
+
+__attribute__((target("sse4.1")))
+static void inverse_transform_4x4_sse(const int16_t coeff[16], const int16_t M[4][4],
+                                      int16_t out[16]) {
+    __m128i co[4];
+    for (int k = 0; k < 4; k++) co[k] = row_i32(&coeff[k * 4]);
+
+    /* pass 1: tmp[r][c] = clip((sum_k M[k][r] * coeff[k*4+c] + 64) >> 7) */
+    const __m128i sixtyfour = _mm_set1_epi32(64);
+    const __m128i alto = _mm_set1_epi32(32767), basso = _mm_set1_epi32(-32768);
+    int32_t tmp[4][4];
+    for (int r = 0; r < 4; r++) {
+        __m128i acc = _mm_setzero_si128();
+        for (int k = 0; k < 4; k++)
+            acc = _mm_add_epi32(acc, _mm_mullo_epi32(_mm_set1_epi32(M[k][r]), co[k]));
+        acc = _mm_srai_epi32(_mm_add_epi32(acc, sixtyfour), 7);
+        acc = _mm_min_epi32(_mm_max_epi32(acc, basso), alto);
+        _mm_storeu_si128((__m128i *)tmp[r], acc);
+    }
+
+    /* pass 2: out[r*4+c] = clip((sum_k M[k][c] * tmp[r][k] + 2048) >> 12) */
+    __m128i row_m[4];
+    for (int k = 0; k < 4; k++) row_m[k] = row_i32(M[k]);
+    const __m128i duemila48 = _mm_set1_epi32(2048);
+    for (int r = 0; r < 4; r++) {
+        __m128i acc = _mm_setzero_si128();
+        for (int k = 0; k < 4; k++)
+            acc = _mm_add_epi32(acc, _mm_mullo_epi32(_mm_set1_epi32(tmp[r][k]), row_m[k]));
+        acc = _mm_srai_epi32(_mm_add_epi32(acc, duemila48), 12);
+        /* packs saturates to int16 exactly as clip_coeff does */
+        _mm_storel_epi64((__m128i *)&out[r * 4], _mm_packs_epi32(acc, acc));
+    }
+}
+
+static int ha_sse41(void) {
+    static int answer = -1;
+    if (answer < 0) answer = __builtin_cpu_supports("sse4.1") ? 1 : 0;
+    return answer;
+}
+#endif
+
+static void forward_transform_4x4_scalar(const int16_t residual[16], const int16_t M[4][4], int32_t out[16]) {
     int32_t tmp[4][4];
     for (int c = 0; c < 4; c++) {
         for (int i = 0; i < 4; i++) {
@@ -355,7 +474,7 @@ static void forward_transform_4x4(const int16_t residual[16], const int16_t M[4]
  * This exact process is what a real HEVC decoder performs, and this
  * encoder uses the SAME code for its own reconstruction chaining, so the
  * two are trivially identical by construction. */
-static void inverse_transform_4x4(const int16_t coeff[16], const int16_t M[4][4], int16_t out[16]) {
+static void inverse_transform_4x4_scalar(const int16_t coeff[16], const int16_t M[4][4], int16_t out[16]) {
     int32_t tmp[4][4];
     for (int c = 0; c < 4; c++) {
         for (int r = 0; r < 4; r++) {
@@ -465,6 +584,23 @@ static int32_t quantize_coeff(int32_t coeff_raw, int qp) {
     uint64_t num = (uint64_t)mag << HEVC_BDSHIFT;
     int32_t level = (int32_t)(((num + half_denom) * recip) >> 40);
     return sign * level;
+}
+
+
+static inline void forward_transform_4x4(const int16_t residual[16], const int16_t M[4][4],
+                                         int32_t out[16]) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (ha_sse41()) { forward_transform_4x4_sse(residual, M, out); return; }
+#endif
+    forward_transform_4x4_scalar(residual, M, out);
+}
+
+static inline void inverse_transform_4x4(const int16_t coeff[16], const int16_t M[4][4],
+                                         int16_t out[16]) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (ha_sse41()) { inverse_transform_4x4_sse(coeff, M, out); return; }
+#endif
+    inverse_transform_4x4_scalar(coeff, M, out);
 }
 
 void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,

@@ -1,0 +1,39 @@
+Source: bc250-vaapi
+Section: video
+Priority: optional
+Maintainer: SkillFishOS <info@mtsistemi.it>
+Build-Depends: debhelper-compat (= 13),
+               cmake,
+               pkgconf,
+               libva-dev,
+               libdrm-dev,
+               libvulkan-dev,
+               glslang-tools
+Standards-Version: 4.7.0
+Homepage: https://github.com/MTSistemi/bc250-vaapi
+Rules-Requires-Root: no
+
+Package: bc250-vaapi
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Suggests: ffmpeg, vainfo
+Description: VA-API video encoding and decoding for the AMD BC-250
+ The AMD BC-250 has no usable video engine, so recording, streaming and
+ playback all fall back to the processor. This is a VA-API driver that does
+ the work itself: it encodes H.264 and HEVC with Vulkan compute shaders on the
+ board's 40 compute units, and decodes H.264 and H.265 on the processor. Any
+ application that speaks VA-API finds it, where otherwise it would find
+ nothing at all - no other VA-API driver initialises on this hardware.
+ .
+ Measured on the board at 1920x1080: encoding reaches 129 frames per second
+ with H.264 and 113 with HEVC, decoding 119 with H.264 and 96 with H.265.
+ Every picture comes out sample for sample as the reference decoder makes it.
+ .
+ Faster than nothing, not faster than everything: a threaded software decoder
+ reaches around 360 frames per second on the same processor. This driver is
+ for an application that asks for VA-API and would otherwise be told there is
+ none.
+ .
+ Installing it does not switch anything on by itself: the driver is used only
+ on a machine that really is a BC-250, decided at session start by a systemd
+ user environment generator.

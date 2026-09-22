@@ -330,6 +330,7 @@ int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t
                            const uint8_t *uv_plane, int uv_pitch,
                            int width, int height);
 
+void gpu_compute_copy_from_wc(void *dst, const void *src, size_t n);
 int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,
                              uint8_t *y_plane, int y_pitch,
                              uint8_t *uv_plane, int uv_pitch,

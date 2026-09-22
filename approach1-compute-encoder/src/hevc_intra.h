@@ -78,7 +78,7 @@ int hevc_scan_idx_for_mode(int mode);
  * (x0,y0) in `src_y` (both planes share `stride`/`width`/`height`) - the
  * comparison target for "which mode is best" is always the true picture
  * content, not the neighbor data used to build the candidate. */
-int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
+int hevc_choose_luma_mode(int y_min, const uint8_t *src_y, const uint8_t *recon_y, int stride,
                            int width, int height, int x0, int y0);
 
 /* Derive the 3 most-probable-mode candidates for a 4x4 luma PU at (x0,y0)
@@ -100,7 +100,8 @@ void hevc_derive_mpm(int left_mode, int left_avail, int above_mode, int above_av
  * project's existing H.264 "chroma is simpler" precedent). Writes 16
  * predicted samples, row-major (pred[y*4+x]). */
 void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
-                      int x0, int y0, int mode, int is_luma, uint8_t pred_out[16]);
+                      int x0, int y0, int mode, int is_luma, int y_min,
+                      uint8_t pred_out[16]);
 
 /* Forward transform (DST-VII if use_dst, else DCT-II) + real HEVC
  * quantization (8.6.3) of a 4x4 pixel-domain residual (row-major,

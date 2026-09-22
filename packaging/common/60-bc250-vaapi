@@ -1,0 +1,27 @@
+#!/bin/sh
+# Turn the BC-250 VA-API driver on, but only on a BC-250.
+#
+# systemd runs this when a user session's environment is built, ON THE
+# MACHINE ITSELF, and takes whatever it prints as NAME=VALUE.
+#
+# ⚠️ THE "ONLY ON A BC-250" PART IS NOT FUSSINESS. A fixed
+# LIBVA_DRIVER_NAME=bc250 in /etc/environment.d would follow an image onto
+# an ordinary PC, where radeonsi or iHD provide a VA-API that a graphics
+# chip actually runs; this driver decodes on the processor, so it would
+# take their place and give back less. On a BC-250 there is nothing to
+# lose: no other VA-API driver initialises there at all.
+#
+# The question is therefore asked where the answer is true. No lspci, no
+# helper program, nothing that has to be installed first: the PCI
+# identifier of the Cyan Skillfish APU is read straight out of sysfs.
+set -eu
+
+for dev in /sys/bus/pci/devices/*/; do
+    [ -r "$dev/vendor" ] && [ -r "$dev/device" ] || continue
+    [ "$(cat "$dev/vendor")" = "0x1002" ] || continue
+    [ "$(cat "$dev/device")" = "0x13fe" ] || continue
+    echo "LIBVA_DRIVER_NAME=bc250"
+    exit 0
+done
+
+exit 0
