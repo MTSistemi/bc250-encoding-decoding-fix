@@ -48,6 +48,21 @@ with zipfile.ZipFile(sys.argv[1]) as z:
 PY
 }
 
+# ⚠️ When ffmpeg's software decoder disagrees, the archive's own digest
+# decides - an exact match of the whole output only, which cannot be a
+# false positive. It is taken over the cropped picture, so the hardware
+# path is decoded once more with cropping on. SAODBLK_A and SAODBLK_B
+# need this: ffmpeg 9.0.2 gets them wrong, and the driver matches the
+# published digest.
+published_md5_matches() {
+    local sum
+    sum=$(ffmpeg -v error -hwaccel vaapi -hwaccel_device "$DEV" \
+                 -hwaccel_output_format vaapi -i "$1" -noautoscale \
+                 -vf "hwdownload,format=$3" -f rawvideo -pix_fmt "$2" - \
+                 2>/dev/null | md5sum | cut -d' ' -f1)
+    grep -rqsi --include='*md5*' "$sum" "$4"
+}
+
 ok=0
 refused=0
 wrong=0
@@ -104,6 +119,10 @@ for z in "$ZIPS"/*.zip; do
 
     if cmp -s "$T/sw.yuv" "$T/hw.yuv"; then
         printf '  %-34s identical\n' "$name"
+        ok=$((ok + 1))
+    elif published_md5_matches "$stream" "$fmt" "$hw" "$T/x"; then
+        printf '  %-34s identical to the published digest; ffmpeg is not\n' \
+               "$name"
         ok=$((ok + 1))
     else
         detail=$(python3 - "$T/sw.yuv" "$T/hw.yuv" <<'PY'
