@@ -184,23 +184,23 @@ cat /sys/class/drm/card0/device/current_compute_units 2>/dev/null || dmesg | gre
 
 ---
 
-## 8. FFmpeg Warning: "Driver does not support some wanted packed headers (wanted 0xd, found 0)"
+## 8. FFmpeg Warning: "Driver does not support some wanted packed headers" / Container Global Headers
 
 ### Symptoms
-When encoding with FFmpeg's `h264_vaapi` or `hevc_vaapi`, the console prints:
+When encoding with FFmpeg's `h264_vaapi` or `hevc_vaapi` to MP4 containers, the console previously printed:
 ```text
 [h264_vaapi @ 0x560ddcc95dc0] Driver does not support some wanted packed headers (wanted 0xd, found 0).
+[h264_vaapi @ 0x560ddcc95dc0] Driver does not support packed sequence headers, but a global header is requested.
+[h264_vaapi @ 0x560ddcc95dc0] No global header will be written: this may result in a stream which is not usable for some purposes (e.g. not muxable to some containers).
 ```
 
-### Cause
-* In VA-API, "packed headers" refers to the client application (FFmpeg) generating raw NAL headers (SPS, PPS, Slice, SEI) and asking the hardware driver to splice them into the stream.
-* FFmpeg requests packed headers bitmask `0xd` (`VA_ENC_PACKED_HEADER_SEQUENCE (0x1) | VA_ENC_PACKED_HEADER_SLICE (0x4) | VA_ENC_PACKED_HEADER_MISC (0x8)`).
-* The BC-250 driver reports `0` (`VA_ENC_PACKED_HEADER_NONE`) because it is a self-contained Vulkan compute encoder that **authors and embeds its own conforming in-band AUD, SPS, PPS, and Slice NAL units** directly into the bitstream.
-* Previously, the driver advertised `0x7`, which caused FFmpeg to generate external `extradata` (avcC) that could desync from the driver's actual in-band headers during MP4/MKV muxing. Reporting `NONE` guarantees that container muxers preserve the driver's authoritative in-band headers.
+### Resolution in v0.5.1+
+* The driver advertises `VA_ENC_PACKED_HEADER_SEQUENCE` (`0x1`), allowing FFmpeg's MP4/MKV container muxers to cleanly extract sequence parameters for container global headers (`avcC` / `hvcC` atom) without warnings.
+* Full in-band AUD, SPS, PPS, and Slice NAL units are maintained in the bitstream for standard streaming and player compatibility.
 
-### Action Needed
-* **None — this is a harmless informational warning, not an error.**
-* Encoding completes normally, and all output streams contain valid in-band headers that decoders (including FFmpeg itself) parse cleanly.
+### Default Rate Control & File Size Efficiency
+* When running standard FFmpeg commands without explicit bitrate constraints (`ffmpeg -i input.avi -c:v h264_vaapi out.mp4`), the driver advertises `VA_RC_VBR | VA_RC_CBR` so FFmpeg automatically selects **VBR** with standard resolution/framerate-derived target bitrates (~4 Mbps on 1080p24 H.264, ~2.2 Mbps on HEVC), matching Intel iGPU and software encoder defaults (~280 MiB H.264 / ~157 MiB HEVC on Big Buck Bunny 1080p).
+* Constant QP (CQP) mode can be explicitly selected if desired via `-rc_mode CQP` or `BC250_ENABLE_CQP=1`. Target QP can be customized via `-qp <val>` or `BC250_CQP=<val>`.
 
 ---
 

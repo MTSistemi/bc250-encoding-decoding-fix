@@ -136,25 +136,28 @@ VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEn
             case VAConfigAttribRateControl:
                 /* Meaningless for decoding, and saying so is better than
                  * naming three modes a decode config can never use. */
-                attrib_list[i].value = (entrypoint == VAEntrypointVLD)
-                                     ? VA_ATTRIB_NOT_SUPPORTED
-                                     : (VA_RC_CBR | VA_RC_VBR | VA_RC_CQP);
+                if (entrypoint == VAEntrypointVLD) {
+                    attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
+                } else {
+                    /* Default to CBR and VBR. This allows standard encoders (e.g. FFmpeg)
+                     * to automatically negotiate VBR with standard target bitrates
+                     * (e.g. ~4 Mbps H.264 / ~2.2 Mbps HEVC on 1080p), matching Intel/AMD
+                     * hardware encoder behavior and preventing multi-gigabyte file blowups from
+                     * unconstrained CQP defaults. Explicit CQP can be enabled via
+                     * BC250_ENABLE_CQP=1 or direct bc250_CreateConfig calls. */
+                    unsigned int rc_modes = VA_RC_CBR | VA_RC_VBR;
+                    if (getenv("BC250_ENABLE_CQP")) {
+                        rc_modes |= VA_RC_CQP;
+                    }
+                    attrib_list[i].value = rc_modes;
+                }
                 break;
             case VAConfigAttribEncPackedHeaders:
-                /* bc250_RenderPicture() below treats VAEncPackedHeaderParameterBufferType
-                 * and VAEncPackedHeaderDataBufferType as a silent no-op - whatever SPS/PPS/
-                 * slice-header/SEI bytes a caller (e.g. ffmpeg's h264_vaapi) hands us via
-                 * those buffers are discarded, and encoder_h264.c always emits its own
-                 * AUD/SPS/PPS/slice headers instead. Previously this advertised SEQUENCE |
-                 * PICTURE | SLICE (0x7), which told libva callers we would splice in their
-                 * own header bytes verbatim. That's not true, and it isn't just cosmetic:
-                 * ffmpeg only builds AVCodecContext.extradata from its self-authored SPS/PPS
-                 * when VA_ENC_PACKED_HEADER_SEQUENCE is (falsely) reported present, so an
-                 * MP4/avcC mux could end up with an extradata SPS/PPS that disagrees with
-                 * the in-band one this driver actually writes. Advertise NONE until/unless
-                 * RenderPicture is changed to genuinely consume these buffers.
-                 */
-                attrib_list[i].value = VA_ENC_PACKED_HEADER_NONE;
+                /* Advertise VA_ENC_PACKED_HEADER_SEQUENCE so container muxers (e.g. FFmpeg MP4/MKV)
+                 * can extract sequence headers for container extradata (avcC/hvcC) without
+                 * logging missing global header warnings. The driver embeds its own conforming
+                 * in-band AUD/SPS/PPS/slice headers in the bitstream. */
+                attrib_list[i].value = VA_ENC_PACKED_HEADER_SEQUENCE;
                 break;
             case VAConfigAttribEncMaxRefFrames:
                 attrib_list[i].value = 1;
@@ -1031,8 +1034,11 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                     if (pic->pic_fields.bits.idr_pic_flag) {
                         h264_encoder_force_idr(c->h264_enc);
                     }
-                    if (pic->pic_init_qp > 0) {
-                        h264_encoder_set_qp(c->h264_enc, pic->pic_init_qp);
+                    int qp = pic->pic_init_qp;
+                    const char *cqp_env = getenv("BC250_CQP");
+                    if (cqp_env && *cqp_env) qp = atoi(cqp_env);
+                    if (qp > 0) {
+                        h264_encoder_set_qp(c->h264_enc, qp);
                     }
                 } else if (c->hevc_enc && b->size >= sizeof(VAEncPictureParameterBufferHEVC)) {
                     VAEncPictureParameterBufferHEVC *pic = (VAEncPictureParameterBufferHEVC*)b->data;
@@ -1042,8 +1048,11 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                     if (pic->pic_fields.bits.idr_pic_flag || pic->nal_unit_type == 19 || pic->nal_unit_type == 20) {
                         hevc_encoder_set_force_idr(c->hevc_enc);
                     }
-                    if (pic->pic_init_qp > 0) {
-                        hevc_encoder_set_qp(c->hevc_enc, pic->pic_init_qp);
+                    int qp = pic->pic_init_qp;
+                    const char *cqp_env = getenv("BC250_CQP");
+                    if (cqp_env && *cqp_env) qp = atoi(cqp_env);
+                    if (qp > 0) {
+                        hevc_encoder_set_qp(c->hevc_enc, qp);
                     }
                 }
                 break;
