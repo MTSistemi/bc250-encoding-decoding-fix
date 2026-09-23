@@ -239,7 +239,7 @@ int hevc_ps_read_sps(hevc_sps_t *out, const uint8_t *rbsp, size_t n)
     for (int i = per_sub_layer ? 0 : max_sub; i <= max_sub; i++) {
         s.max_dec_pic_buffering = (int)br_read_ue(&br) + 1;
         s.num_reorder_pics = (int)br_read_ue(&br);
-        br_read_ue(&br);                    /* max_latency_increase_plus1 */
+        s.max_latency_increase_plus1 = (int)br_read_ue(&br);
     }
 
     s.log2_min_cb = 3 + (int)br_read_ue(&br);

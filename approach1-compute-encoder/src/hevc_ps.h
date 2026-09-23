@@ -71,6 +71,7 @@ typedef struct {
     int bit_depth_luma, bit_depth_chroma;
     int log2_max_poc_lsb;
     int max_dec_pic_buffering, num_reorder_pics;
+    int max_latency_increase_plus1;     /* all three for the top layer */
 
     int log2_min_cb, log2_ctb;          /* coding block, smallest and largest */
     int log2_min_tb, log2_max_tb;
@@ -140,6 +141,10 @@ typedef struct {
     bool pic_output_flag;
     int poc_lsb;
     int poc;                             /* derived by the caller */
+    /* 8.1.3, also the caller's: whether this IRAP restarts the sequence,
+     * which depends on what came before it in the stream - an end of
+     * sequence, or nothing at all. */
+    bool no_rasl_output_flag;
 
     bool short_term_ref_pic_set_sps_flag;
     int short_term_ref_pic_set_idx;
