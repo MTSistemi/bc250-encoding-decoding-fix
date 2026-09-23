@@ -244,6 +244,21 @@ static void build_lists(hevcd_t *d, const hevc_slice_t *sl)
         }
     }
 
+    /* ⚠️ Never shorter than the header asked for. A reference that
+     * could not be found - a picture the stream or the application no
+     * longer holds - would leave a hole that every index past it falls
+     * into, and an index is a pointer here: the first version of the VA
+     * path crashed the application on exactly that. The last picture
+     * found stands in for the rest, which is a wrong picture and not a
+     * crash; a list with nothing in it at all is refused by the caller. */
+    for (int l = 0; l < 2; l++)
+        if (d->n_refs[l] > 0)
+            while (d->n_refs[l] < sl->num_ref_idx[l] && d->n_refs[l] < 16) {
+                d->ref_pic[l][d->n_refs[l]] = d->ref_pic[l][d->n_refs[l] - 1];
+                d->ref_is_lt[l][d->n_refs[l]] = d->ref_is_lt[l][d->n_refs[l] - 1];
+                d->n_refs[l]++;
+            }
+
     /* What the indices mean, kept with the picture and with the SLICE:
      * a later picture that takes this as its collocated one asks what a
      * stored index pointed at, and an index means nothing outside the
@@ -331,6 +346,7 @@ static const char *slice_reason(int e)
     case 5: return "out of memory";
     case 6: return "end of subset was not one";
     case 7: return "a row is not as long as the header says";
+    case 8: return "a reference picture is missing";
     default: return "?";
     }
 }
@@ -836,6 +852,10 @@ int hevc_decoder_slice(hevc_decoder_t *h, const hevc_slice_t *sl,
     if (!sl->dependent_slice_segment || h->d.slice_now < 0)
         h->d.slice_now++;
     build_lists(&h->d, &h->last_one);
+    if (h->last_one.type != 2) {
+        for (int l = 0; l < (h->last_one.type == 0 ? 2 : 1); l++)
+            if (!h->d.n_refs[l]) return 8;
+    }
     return walk_slice(&h->d, &h->sps, &h->pps, &h->last_one, rbsp, n);
 }
 
