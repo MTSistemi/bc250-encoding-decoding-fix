@@ -76,8 +76,14 @@ for z in "$ZIPS"/*.zip; do
            noref=$((noref + 1)); continue ;;
     esac
 
-    if ! ffmpeg -v error -y -i "$stream" -noautoscale -f rawvideo \
-                -pix_fmt "$fmt" "$T/sw.yuv" 2>/dev/null \
+    # ⚠️ The whole decoded picture on both sides, conformance window
+    # included (-apply_cropping 0). ffmpeg cannot crop a VA surface on the
+    # left or at the top, so with cropping on, a stream like CONFWIN_A
+    # comes back 414x238 from the hardware path and 412x236 from the
+    # software one - a difference in ffmpeg, not in the driver. Comparing
+    # the full picture is also the stricter test.
+    if ! ffmpeg -v error -y -apply_cropping 0 -i "$stream" -noautoscale \
+                -f rawvideo -pix_fmt "$fmt" "$T/sw.yuv" 2>/dev/null \
        || [ ! -s "$T/sw.yuv" ]; then
         printf '  %-34s ffmpeg will not decode it either\n' "$name"
         noref=$((noref + 1)); continue
@@ -85,7 +91,8 @@ for z in "$ZIPS"/*.zip; do
 
     rm -f "$T/hw.yuv"
     ffmpeg -v error -y -hwaccel vaapi -hwaccel_device "$DEV" \
-           -hwaccel_output_format vaapi -i "$stream" -noautoscale \
+           -hwaccel_output_format vaapi -apply_cropping 0 -i "$stream" \
+           -noautoscale \
            -vf "hwdownload,format=$hw" -f rawvideo -pix_fmt "$fmt" \
            "$T/hw.yuv" 2>"$T/err"
     if [ ! -s "$T/hw.yuv" ]; then
