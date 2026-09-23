@@ -447,8 +447,6 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     if (qp_pinned) {
         enc->rc.current_qp = enc->qp;
         enc->rc.base_qp = enc->qp;
-    } else {
-        enc->qp = enc->rc.base_qp;
     }
     enc->pps_init_qp = enc->qp;
     enc->cbr_intent = false;
@@ -571,17 +569,12 @@ void hevc_encoder_set_qp(hevc_encoder_t *encoder, int qp)
     if (encoder) {
         if (qp < 0) qp = 0;
         if (qp > 51) qp = 51;
-        /* Only override base_qp/current_qp when in constant QP mode,
-         * or when explicitly forced via environment variable. In CBR/VBR/LOW_LATENCY
-         * modes, the rate controller owns base_qp derived from bitrate/resolution. */
-        if (encoder->rc.mode == RC_CQP || getenv("BC250_CQP") || getenv("BC250_HEVC_QP")) {
-            if (qp != encoder->qp_hint_applied) {
-                encoder->rc.base_qp = qp;
-                encoder->rc.current_qp = qp;
-                encoder->qp_hint_applied = qp;
-            }
-            encoder->qp = qp;
+        if (qp != encoder->qp_hint_applied) {
+            encoder->rc.base_qp = qp;
+            encoder->rc.current_qp = qp;
+            encoder->qp_hint_applied = qp;
         }
+        encoder->qp = qp;
     }
 }
 

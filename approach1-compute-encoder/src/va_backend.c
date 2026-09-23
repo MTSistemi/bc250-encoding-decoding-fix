@@ -1026,9 +1026,13 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                     if (pic->pic_fields.bits.idr_pic_flag) {
                         h264_encoder_force_idr(c->h264_enc);
                     }
-                    int qp = pic->pic_init_qp;
+                    int qp = 0;
                     const char *cqp_env = getenv("BC250_CQP");
-                    if (cqp_env && *cqp_env) qp = atoi(cqp_env);
+                    if (cqp_env && *cqp_env) {
+                        qp = atoi(cqp_env);
+                    } else if (h264_encoder_get_rc_mode(c->h264_enc) == RC_CQP) {
+                        qp = pic->pic_init_qp;
+                    }
                     if (qp > 0) {
                         h264_encoder_set_qp(c->h264_enc, qp);
                     }
@@ -1040,9 +1044,13 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                     if (pic->pic_fields.bits.idr_pic_flag || pic->nal_unit_type == 19 || pic->nal_unit_type == 20) {
                         hevc_encoder_set_force_idr(c->hevc_enc);
                     }
-                    int qp = pic->pic_init_qp;
+                    int qp = 0;
                     const char *cqp_env = getenv("BC250_CQP");
-                    if (cqp_env && *cqp_env) qp = atoi(cqp_env);
+                    if (cqp_env && *cqp_env) {
+                        qp = atoi(cqp_env);
+                    } else if (hevc_encoder_get_rc_mode(c->hevc_enc) == RC_CQP) {
+                        qp = pic->pic_init_qp;
+                    }
                     if (qp > 0) {
                         hevc_encoder_set_qp(c->hevc_enc, qp);
                     }

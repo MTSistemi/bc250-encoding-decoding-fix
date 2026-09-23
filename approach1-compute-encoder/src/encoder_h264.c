@@ -1937,37 +1937,18 @@ void h264_encoder_set_rc_mode(h264_encoder_t *encoder, rc_mode_t mode) {
         encoder->rc.buffer_fullness = encoder->rc.buffer_size / 2;
         encoder->rc.error_integral = 0;
     }
+rc_mode_t h264_encoder_get_rc_mode(const h264_encoder_t *encoder) {
+    return encoder ? encoder->rc.mode : RC_LOW_LATENCY;
 }
 
 void h264_encoder_set_qp(h264_encoder_t *encoder, int qp) {
     if (encoder) {
         if (qp < 0) qp = 0;
         if (qp > 51) qp = 51;
-        /* encoder->pps.pic_init_qp's own contract (bitstream.h: "Initial QP
-         * - 26") is to already hold QP-26, matching bitstream.c's direct
-         * signed exp-Golomb write of this field as pic_init_qp_minus26 -
-         * NOT the raw QP. Storing raw `qp` here (as this line previously
-         * did) made a real decoder compute SliceQPY's base as qp+26 instead
-         * of qp, and for any qp >= 26 pushed pic_init_qp_minus26 itself
-         * outside its legal ITU-T range of [-26,25] entirely (confirmed
-         * on-hardware: a real Sunshine session sending pic_init_qp=26 wrote
-         * an SPS/PPS with pic_init_qp_minus26=26, which ffmpeg's own h264
-         * bitstream reader correctly rejected as out of range, corrupting
-         * the very first frame of the stream). This code path is only
-         * reachable when a caller explicitly sets a nonzero pic_init_qp in
-         * VAEncPictureParameterBufferH264 - this project's own synthetic
-         * ffmpeg-testsrc testing never has, which is why this went
-         * uncaught all session until a real VA-API consumer (Sunshine)
-         * exercised it for the first time. */
-        /* Only reset rate-control state when in constant QP mode, or when
-         * explicitly forced via environment variable. In CBR/VBR/LOW_LATENCY
-         * modes, the rate controller owns base_qp derived from bitrate/resolution. */
-        if (encoder->rc.mode == RC_CQP || getenv("BC250_CQP") || getenv("BC250_H264_QP")) {
-            if (qp != encoder->qp_hint_applied) {
-                encoder->rc.base_qp = qp;
-                encoder->rc.current_qp = qp;
-                encoder->qp_hint_applied = qp;
-            }
+        if (qp != encoder->qp_hint_applied) {
+            encoder->rc.base_qp = qp;
+            encoder->rc.current_qp = qp;
+            encoder->qp_hint_applied = qp;
         }
         encoder->pps.pic_init_qp = qp - 26;
     }
