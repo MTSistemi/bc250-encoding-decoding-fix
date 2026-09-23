@@ -82,7 +82,13 @@ static const hevcd_img_t *find_lt(const hevcd_t *d, const hevc_slice_t *sl,
  * or long-term, used now or kept for later. */
 static void unescape(hevcd_t *d, const hevc_slice_t *sl)
 {
-    if (sl->nal_type == HEVC_NAL_IDR_W_RADL || sl->nal_type == HEVC_NAL_IDR_N_LP) {
+    /* 8.3.2: an IRAP that restarts the sequence leaves no reference
+     * behind. Every IDR does; a CRA or a BLA does when the caller says it
+     * restarts, and its own reference picture set - which a CRA may well
+     * carry, for the leading pictures that are not decoded - names
+     * pictures that are gone. */
+    if (sl->nal_type == HEVC_NAL_IDR_W_RADL || sl->nal_type == HEVC_NAL_IDR_N_LP
+        || sl->no_rasl_output_flag) {
         for (int i = 0; i < d->n_buf; i++) d->buf[i].is_valid = false;
         return;
     }
@@ -839,6 +845,13 @@ const uint8_t *hevc_decoder_plane(const hevc_decoder_t *h, int plane,
     if (!h->d.current || plane < 0 || plane > 2) return NULL;
     if (stride) *stride = h->d.current->stride[plane];
     return h->d.current->plane[plane];
+}
+
+bool hevc_decoder_holds(const hevc_decoder_t *h, uintptr_t id)
+{
+    for (int i = 0; i < IMG_SLOTS; i++)
+        if (h->buffer[i].is_valid && h->surface_id[i] == id) return true;
+    return false;
 }
 
 void hevc_decoder_unescape(hevc_decoder_t *h, const hevc_slice_t *sl)

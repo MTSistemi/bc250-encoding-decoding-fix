@@ -53,6 +53,11 @@ int hevc_decoder_slice(hevc_decoder_t *d, const hevc_slice_t *sl,
 /* Let go of everything the reference picture set no longer names. */
 void hevc_decoder_unescape(hevc_decoder_t *d, const hevc_slice_t *sl);
 
+/* Whether the picture a caller named `id` is still held as a reference.
+ * The output process needs it: a picture that has been output but is
+ * still referenced still takes a place in the buffer. */
+bool hevc_decoder_holds(const hevc_decoder_t *d, uintptr_t id);
+
 /* The loop filters, which are defined over the whole picture and so can
  * only run once every slice of it is in. */
 void hevc_decoder_end_picture(hevc_decoder_t *d);
