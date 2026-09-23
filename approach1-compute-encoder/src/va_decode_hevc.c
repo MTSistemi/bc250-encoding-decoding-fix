@@ -461,9 +461,6 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
     if (pp->pic_fields.bits.tiles_enabled_flag
         && pp->pic_fields.bits.entropy_coding_sync_enabled_flag)
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-    if (pp->pic_fields.bits.pcm_enabled_flag)
-        return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-
     hevc_sps_t sps;
     hevc_pps_t pps;
     fill_sps(pp, &sps);
