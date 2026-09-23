@@ -578,6 +578,8 @@ static int parse_slice_remainder(hevc_slice_t *s, br_t *br, const hevc_sps_t *sp
                 if (s->st_rps.used[i]) count++;
             for (int i = 0; i < s->num_lt; i++)
                 if (s->lt_used[i]) count++;
+            if (pps->num_pic_total_curr > 0)
+                count = pps->num_pic_total_curr;
             if (count > 1) {
                 /* 7.3.6.2: list one only for a B slice, and each entry
                  * Ceil(Log2(NumPicTotalCurr)) bits wide. */
@@ -747,9 +749,16 @@ int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
         s.log2_max_poc_lsb = sps->log2_max_poc_lsb;
         s.short_term_ref_pic_set_sps_flag = br_read1(&br) != 0;
         if (!s.short_term_ref_pic_set_sps_flag) {
-            const int e = read_st_rps(&br, &s.st_rps, sps->st_rps,
-                                       sps->num_st_rps, sps->num_st_rps);
-            if (e) return e;
+            if (sps->st_rps_bits > 0) {
+                /* ⚠️ Stepped over, not read: an inline set may predict
+                 * from the SPS's own sets, which this caller could not
+                 * provide - and it does not need the contents. */
+                br_skip(&br, sps->st_rps_bits);
+            } else {
+                const int e = read_st_rps(&br, &s.st_rps, sps->st_rps,
+                                           sps->num_st_rps, sps->num_st_rps);
+                if (e) return e;
+            }
         } else if (sps->num_st_rps > 1) {
             int bit = 0;
             while ((1 << bit) < sps->num_st_rps) bit++;
