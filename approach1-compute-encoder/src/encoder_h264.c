@@ -1959,14 +1959,15 @@ void h264_encoder_set_qp(h264_encoder_t *encoder, int qp) {
          * ffmpeg-testsrc testing never has, which is why this went
          * uncaught all session until a real VA-API consumer (Sunshine)
          * exercised it for the first time. */
-        /* Only reset rate-control state the first time this value is seen, or when it
-         * genuinely changes. A resend of the SAME hint (e.g. from Sunshine's per-frame
-         * pic_init_qp) is then a no-op, and the rate controller's feedback loop is left
-         * alone to keep walking frame to frame. A genuinely new hint still applies immediately. */
-        if (qp != encoder->qp_hint_applied) {
-            encoder->rc.base_qp = qp;
-            encoder->rc.current_qp = qp;
-            encoder->qp_hint_applied = qp;
+        /* Only reset rate-control state when in constant QP mode, or when
+         * explicitly forced via environment variable. In CBR/VBR/LOW_LATENCY
+         * modes, the rate controller owns base_qp derived from bitrate/resolution. */
+        if (encoder->rc.mode == RC_CQP || getenv("BC250_CQP") || getenv("BC250_H264_QP")) {
+            if (qp != encoder->qp_hint_applied) {
+                encoder->rc.base_qp = qp;
+                encoder->rc.current_qp = qp;
+                encoder->qp_hint_applied = qp;
+            }
         }
         encoder->pps.pic_init_qp = qp - 26;
     }

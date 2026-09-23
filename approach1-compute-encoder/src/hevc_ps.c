@@ -456,6 +456,122 @@ static void read_weights(br_t *br, hevc_slice_t *s, bool chroma)
 
 /* ------------------------------------------------------- slice segment header */
 
+static int parse_slice_tail(hevc_slice_t *s, br_t *br, const hevc_pps_t *pps)
+{
+    if (pps->tiles_enabled || pps->entropy_coding_sync_enabled) {
+        s->num_entry_point_offsets = (int)br_read_ue(br);
+        if (s->num_entry_point_offsets > 0) {
+            const int len = (int)br_read_ue(br) + 1;
+            if (len > 32) return PS_NONSENSE;
+            if (s->num_entry_point_offsets > 600) return PS_UNSUPPORTED;
+            uint32_t sum = 0;
+            for (int i = 0; i < s->num_entry_point_offsets; i++) {
+                sum += (uint32_t)br_read(br, len) + 1;
+                s->entry_point[i] = sum;
+            }
+        }
+    }
+
+    if (pps->slice_segment_header_extension_present) {
+        const int len = (int)br_read_ue(br);
+        br_skip(br, len * 8);
+    }
+
+    /* byte_alignment(): a one bit, then zeros to the next byte. */
+    if (!br_read1(br)) return PS_NONSENSE;
+    while (br->bitpos & 7)
+        if (br_read1(br)) return PS_NONSENSE;
+
+    if (br_overrun(br)) return PS_TRUNCATED;
+    s->data_bit_offset = br->bitpos;
+    return PS_OK;
+}
+
+static int parse_slice_remainder(hevc_slice_t *s, br_t *br, const hevc_sps_t *sps,
+                                 const hevc_pps_t *pps)
+{
+    if (sps->long_term_ref_pics_present)
+        return PS_UNSUPPORTED;   /* long-term references */
+
+    if (sps->temporal_mvp_enabled)
+        s->temporal_mvp_enabled = br_read1(br) != 0;
+
+    if (sps->sao_enabled) {
+        s->sao_luma = br_read1(br) != 0;
+        s->sao_chroma = br_read1(br) != 0;
+    }
+
+    s->num_ref_idx[0] = pps->num_ref_idx_default[0];
+    s->num_ref_idx[1] = pps->num_ref_idx_default[1];
+
+    if (s->type != 2) {                       /* P or B */
+        if (br_read1(br)) {                 /* num_ref_idx_active_override */
+            s->num_ref_idx[0] = (int)br_read_ue(br) + 1;
+            if (s->type == 0)
+                s->num_ref_idx[1] = (int)br_read_ue(br) + 1;
+        }
+        if (s->type != 0)
+            s->num_ref_idx[1] = 0;
+        if (s->num_ref_idx[0] > 15 || s->num_ref_idx[1] > 15)
+            return PS_NONSENSE;
+
+        if (pps->lists_modification_present) {
+            int count = 0;
+            for (int i = 0; i < s->st_rps.num_negative + s->st_rps.num_positive; i++)
+                if (s->st_rps.used[i]) count++;
+            if (count > 1)
+                return PS_UNSUPPORTED;    /* reference list modification */
+        }
+
+        if (s->type == 0)
+            s->mvd_l1_zero = br_read1(br) != 0;
+        if (pps->cabac_init_present)
+            s->cabac_init_flag = br_read1(br) != 0;
+        if (s->temporal_mvp_enabled) {
+            s->collocated_from_l0 = true;
+            if (s->type == 0)
+                s->collocated_from_l0 = br_read1(br) != 0;
+            if ((s->collocated_from_l0 && s->num_ref_idx[0] > 1)
+                || (!s->collocated_from_l0 && s->num_ref_idx[1] > 1))
+                s->collocated_ref_idx = (int)br_read_ue(br);
+        }
+        if ((pps->weighted_pred && s->type == 1)
+            || (pps->weighted_bipred && s->type == 0))
+            read_weights(br, s, sps->chroma_format_idc != 0);
+
+        s->five_minus_max_num_merge_cand = (int)br_read_ue(br);
+        if (s->five_minus_max_num_merge_cand > 4) return PS_NONSENSE;
+    }
+
+    s->qp = pps->init_qp + br_read_se(br);
+    if (s->qp < -6 * (sps->bit_depth_luma - 8) || s->qp > 51) return PS_NONSENSE;
+
+    if (pps->slice_chroma_qp_offsets_present) {
+        s->cb_qp_offset = br_read_se(br);
+        s->cr_qp_offset = br_read_se(br);
+    }
+
+    s->deblocking_filter_disabled = pps->deblocking_filter_disabled;
+    s->beta_offset = pps->beta_offset;
+    s->tc_offset = pps->tc_offset;
+    if (pps->deblocking_filter_override_enabled && br_read1(br)) {
+        s->deblocking_filter_disabled = br_read1(br) != 0;
+        if (!s->deblocking_filter_disabled) {
+            s->beta_offset = 2 * br_read_se(br);
+            s->tc_offset = 2 * br_read_se(br);
+        }
+    }
+
+    s->loop_filter_across_slices = pps->loop_filter_across_slices;
+    if (pps->loop_filter_across_slices
+        && (s->sao_luma || s->sao_chroma || !s->deblocking_filter_disabled))
+        s->loop_filter_across_slices = br_read1(br) != 0;
+
+    return parse_slice_tail(s, br, pps);
+}
+
+/* ------------------------------------------------------- slice segment header */
+
 int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
                         int nal_type, const hevc_sps_t *sps_store,
                         const hevc_pps_t *pps_store)
@@ -492,14 +608,10 @@ int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
     }
 
     if (s.dependent_slice_segment) {
-        /* ⚠️ A dependent slice segment inherits the previous independent
-         * header entire, and reconstructing that is the caller's
-         * business - but it still carries its OWN entry points, header
-         * extension and byte alignment. Returning here skipped all
-         * three and left data_bit_offset pointing at the alignment bit
-         * instead of at the slice data. So it jumps to the tail rather
-         * than out. */
-        goto tail;
+        const int e = parse_slice_tail(&s, &br, pps);
+        if (e != PS_OK) return e;
+        *out = s;
+        return PS_OK;
     }
 
     for (int i = 0; i < pps->num_extra_slice_header_bits; i++)
@@ -527,122 +639,22 @@ int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
             s.st_rps = sps->st_rps[s.short_term_ref_pic_set_idx];
         } else if (sps->num_st_rps == 1) {
             s.st_rps = sps->st_rps[0];
-        }
-
-        if (sps->long_term_ref_pics_present)
-            return PS_UNSUPPORTED;   /* long-term references */
-
-        if (sps->temporal_mvp_enabled)
-            s.temporal_mvp_enabled = br_read1(&br) != 0;
-    }
-
-    if (sps->sao_enabled) {
-        s.sao_luma = br_read1(&br) != 0;
-        s.sao_chroma = br_read1(&br) != 0;
-    }
-
-    s.num_ref_idx[0] = pps->num_ref_idx_default[0];
-    s.num_ref_idx[1] = pps->num_ref_idx_default[1];
-
-    if (s.type != 2) {                       /* P or B */
-        if (br_read1(&br)) {                 /* num_ref_idx_active_override */
-            s.num_ref_idx[0] = (int)br_read_ue(&br) + 1;
-            if (s.type == 0)
-                s.num_ref_idx[1] = (int)br_read_ue(&br) + 1;
-        }
-        if (s.type != 0)
-            s.num_ref_idx[1] = 0;
-        if (s.num_ref_idx[0] > 15 || s.num_ref_idx[1] > 15)
-            return PS_NONSENSE;
-
-        if (pps->lists_modification_present) {
-            /* NumPicTotalCurr: how many pictures the lists can be built
-             * from. The modification syntax is only present when there is
-             * more than one. */
-            int count = 0;
-            for (int i = 0; i < s.st_rps.num_negative + s.st_rps.num_positive; i++)
-                if (s.st_rps.used[i]) count++;
-            if (count > 1)
-                return PS_UNSUPPORTED;    /* reference list modification */
-        }
-
-        if (s.type == 0)
-            s.mvd_l1_zero = br_read1(&br) != 0;
-        if (pps->cabac_init_present)
-            s.cabac_init_flag = br_read1(&br) != 0;
-        if (s.temporal_mvp_enabled) {
-            /* Inferred to one when it is not sent, which for a P slice is
-             * always. */
-            s.collocated_from_l0 = true;
-            if (s.type == 0)
-                s.collocated_from_l0 = br_read1(&br) != 0;
-            if ((s.collocated_from_l0 && s.num_ref_idx[0] > 1)
-                || (!s.collocated_from_l0 && s.num_ref_idx[1] > 1))
-                s.collocated_ref_idx = (int)br_read_ue(&br);
-        }
-        if ((pps->weighted_pred && s.type == 1)
-            || (pps->weighted_bipred && s.type == 0))
-            read_weights(&br, &s, sps->chroma_format_idc != 0);
-
-        s.five_minus_max_num_merge_cand = (int)br_read_ue(&br);
-        if (s.five_minus_max_num_merge_cand > 4) return PS_NONSENSE;
-    }
-
-    s.qp = pps->init_qp + br_read_se(&br);
-    if (s.qp < -6 * (sps->bit_depth_luma - 8) || s.qp > 51) return PS_NONSENSE;
-
-    if (pps->slice_chroma_qp_offsets_present) {
-        s.cb_qp_offset = br_read_se(&br);
-        s.cr_qp_offset = br_read_se(&br);
-    }
-
-    s.deblocking_filter_disabled = pps->deblocking_filter_disabled;
-    s.beta_offset = pps->beta_offset;
-    s.tc_offset = pps->tc_offset;
-    if (pps->deblocking_filter_override_enabled && br_read1(&br)) {
-        s.deblocking_filter_disabled = br_read1(&br) != 0;
-        if (!s.deblocking_filter_disabled) {
-            s.beta_offset = 2 * br_read_se(&br);
-            s.tc_offset = 2 * br_read_se(&br);
-        }
-    }
-
-    s.loop_filter_across_slices = pps->loop_filter_across_slices;
-    if (pps->loop_filter_across_slices
-        && (s.sao_luma || s.sao_chroma || !s.deblocking_filter_disabled))
-        s.loop_filter_across_slices = br_read1(&br) != 0;
-
-tail:
-    if (pps->tiles_enabled || pps->entropy_coding_sync_enabled) {
-        s.num_entry_point_offsets = (int)br_read_ue(&br);
-        if (s.num_entry_point_offsets > 0) {
-            const int len = (int)br_read_ue(&br) + 1;
-            if (len > 32) return PS_NONSENSE;
-            if (s.num_entry_point_offsets > 600) return PS_UNSUPPORTED;
-            uint32_t sum = 0;
-            for (int i = 0; i < s.num_entry_point_offsets; i++) {
-                sum += (uint32_t)br_read(&br, len) + 1;
-                s.entry_point[i] = sum;
+        } else if (sps->num_st_rps == 0) {
+            /* Container-muxed stream where SPS tables are missing: scan candidate bit widths (0..6) */
+            for (int try_bit = 0; try_bit <= 6; try_bit++) {
+                br_t try_br = br;
+                if (try_bit > 0) br_skip(&try_br, try_bit);
+                hevc_slice_t cand = s;
+                if (parse_slice_remainder(&cand, &try_br, sps, pps) == PS_OK) {
+                    *out = cand;
+                    return PS_OK;
+                }
             }
         }
     }
 
-    if (pps->slice_segment_header_extension_present) {
-        const int len = (int)br_read_ue(&br);
-        br_skip(&br, len * 8);
-    }
-
-    /* byte_alignment(): a one bit, then zeros to the next byte.
-     *
-     * ⚠️ Read and checked, not skipped: see the note at the top of this
-     * file's history. It is the cheapest possible proof that the header
-     * above was read correctly. */
-    if (!br_read1(&br)) return PS_NONSENSE;
-    while (br.bitpos & 7)
-        if (br_read1(&br)) return PS_NONSENSE;
-
-    if (br_overrun(&br)) return PS_TRUNCATED;
-    s.data_bit_offset = br.bitpos;
+    const int e = parse_slice_remainder(&s, &br, sps, pps);
+    if (e != PS_OK) return e;
     *out = s;
     return PS_OK;
 }

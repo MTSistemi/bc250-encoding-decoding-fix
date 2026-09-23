@@ -139,17 +139,9 @@ VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEn
                 if (entrypoint == VAEntrypointVLD) {
                     attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
                 } else {
-                    /* Default to CBR and VBR. This allows standard encoders (e.g. FFmpeg)
-                     * to automatically negotiate VBR with standard target bitrates
-                     * (e.g. ~4 Mbps H.264 / ~2.2 Mbps HEVC on 1080p), matching Intel/AMD
-                     * hardware encoder behavior and preventing multi-gigabyte file blowups from
-                     * unconstrained CQP defaults. Explicit CQP can be enabled via
-                     * BC250_ENABLE_CQP=1 or direct bc250_CreateConfig calls. */
-                    unsigned int rc_modes = VA_RC_CBR | VA_RC_VBR;
-                    if (getenv("BC250_ENABLE_CQP")) {
-                        rc_modes |= VA_RC_CQP;
-                    }
-                    attrib_list[i].value = rc_modes;
+                    /* Advertise CBR, VBR, and CQP. Allows encoders to negotiate
+                     * requested bitrates via VBR/CBR or constant QP via CQP. */
+                    attrib_list[i].value = VA_RC_CBR | VA_RC_VBR | VA_RC_CQP;
                 }
                 break;
             case VAConfigAttribEncPackedHeaders:
@@ -1089,6 +1081,9 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                         } else if (c->hevc_enc) {
                             if (rc->bits_per_second > 0) {
                                 hevc_encoder_set_bitrate(c->hevc_enc, target_bps);
+                                bool cbr_intent = (rc->target_percentage == 100) &&
+                                                  !rc->rc_flags.bits.disable_bit_stuffing;
+                                hevc_encoder_set_cbr_intent(c->hevc_enc, cbr_intent);
                             }
                             if (rc->initial_qp > 0) {
                                 hevc_encoder_set_qp(c->hevc_enc, rc->initial_qp);
