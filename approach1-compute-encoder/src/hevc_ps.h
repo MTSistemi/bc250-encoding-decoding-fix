@@ -59,6 +59,16 @@ typedef struct {
     bool used[HEVC_MAX_RPS * 2];
 } hevc_st_rps_t;
 
+/* Quantisation matrices, 7.3.4, as they are sent: coefficient i of each
+ * list in up-right diagonal order, plus the separate DC value of the
+ * 16x16 and 32x32 ones. Indexed [sizeId][matrixId]; the 32x32 lists live
+ * at matrixId 0 and 3, as the later editions of the standard number them.
+ * VA-API hands them over in exactly this order too. */
+typedef struct {
+    uint8_t list[4][6][64];
+    uint8_t dc[4][6];
+} hevc_scaling_t;
+
 /* Only what the decoder or the harness actually reads. profile_tier_level
  * is parsed to get past it, not to act on it. */
 typedef struct {
@@ -78,6 +88,7 @@ typedef struct {
     int max_transform_hierarchy_depth_inter, max_transform_hierarchy_depth_intra;
 
     bool scaling_list_enabled, sps_scaling_list_present;
+    hevc_scaling_t scaling;             /* the defaults unless sent */
     bool amp_enabled, sao_enabled;
     bool pcm_enabled;
     int pcm_bit_depth_luma, pcm_bit_depth_chroma;
@@ -123,6 +134,7 @@ typedef struct {
     bool deblocking_filter_disabled;
     int beta_offset, tc_offset;          /* already doubled */
     bool pps_scaling_list_present;
+    hevc_scaling_t scaling;             /* replaces the SPS's when present */
     bool lists_modification_present;
     int log2_parallel_merge_level;
     bool slice_segment_header_extension_present;
@@ -199,6 +211,9 @@ typedef struct {
     bool explicit_lt[2][16];             /* which entries are long-term */
     const void *explicit_col;
 } hevc_slice_t;
+
+/* Table 7-6, for a caller that is handed the lists some other way. */
+void hevc_scaling_defaults(hevc_scaling_t *s);
 
 /* Returns 0, or a negative code naming what was refused. */
 int hevc_ps_read_sps(hevc_sps_t *out, const uint8_t *rbsp, size_t n);
