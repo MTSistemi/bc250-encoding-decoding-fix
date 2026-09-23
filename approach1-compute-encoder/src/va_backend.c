@@ -22,6 +22,25 @@
 #define BC250_MAX_WIDTH 4096
 #define BC250_MAX_HEIGHT 4096
 
+/* ⚠️ Decoding goes further than encoding. The limits above are the
+ * encoder's and post-processing's; the decoder works in system memory and
+ * only hands a finished picture to the GPU, so what bounds it is the
+ * largest Vulkan image (16384 on either side here) and the largest
+ * picture the stream is allowed to be - MaxLumaPs at level 6.2. Shapes
+ * like 1056x8440 are legal and in the conformance suite; declaring 4096
+ * made ffmpeg refuse to set up the hardware path for them at all. */
+#define BC250_MAX_DECODE_SIDE 16384
+#define BC250_MAX_DECODE_SAMPLES 35651584
+
+/* Only the HEVC decoder has been taken there - the conformance suite has
+ * pictures up to 8440 samples on a side. The H.264 one has not, so it
+ * keeps the old limit until something proves it. */
+static int big_decode(VAProfile profile, VAEntrypoint entrypoint)
+{
+    return entrypoint == VAEntrypointVLD
+        && (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10);
+}
+
 static bc250_driver_data* get_driver_data(VADriverContextP ctx) {
     return (bc250_driver_data*)ctx->pDriverData;
 }
@@ -155,10 +174,12 @@ VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEn
                 attrib_list[i].value = 1;
                 break;
             case VAConfigAttribMaxPictureWidth:
-                attrib_list[i].value = BC250_MAX_WIDTH;
+                attrib_list[i].value = big_decode(profile, entrypoint)
+                                     ? BC250_MAX_DECODE_SIDE : BC250_MAX_WIDTH;
                 break;
             case VAConfigAttribMaxPictureHeight:
-                attrib_list[i].value = BC250_MAX_HEIGHT;
+                attrib_list[i].value = big_decode(profile, entrypoint)
+                                     ? BC250_MAX_DECODE_SIDE : BC250_MAX_HEIGHT;
                 break;
             case VAConfigAttribEncMaxSlices:
                 /* Up to 16 slices per picture supported via multi-threaded OpenMP
@@ -278,13 +299,14 @@ VAStatus bc250_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config, V
      * ignore it the way it used to. An unknown config answers NV12,
      * which is what every caller got before. */
     bc250_driver_data *data = get_driver_data(ctx);
-    int ten_bit = 0, both = 0;
+    int ten_bit = 0, both = 0, decode = 0;
     if (data && VALID_ID(config, MAX_CONFIGS)
         && data->configs[config].allocated) {
         const VAProfile prof = data->configs[config].profile;
         ten_bit = prof == VAProfileHEVCMain10;
         /* Post-processing works at either depth, so it says so. */
         both = prof == VAProfileNone;
+        decode = big_decode(prof, data->configs[config].entrypoint);
     }
 
     if (!attrib_list) {
@@ -310,13 +332,15 @@ VAStatus bc250_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config, V
     attrib_list[i].type = VASurfaceAttribMaxWidth;
     attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
     attrib_list[i].value.type = VAGenericValueTypeInteger;
-    attrib_list[i].value.value.i = BC250_MAX_WIDTH;
+    attrib_list[i].value.value.i = decode ? BC250_MAX_DECODE_SIDE
+                                          : BC250_MAX_WIDTH;
     i++;
 
     attrib_list[i].type = VASurfaceAttribMaxHeight;
     attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
     attrib_list[i].value.type = VAGenericValueTypeInteger;
-    attrib_list[i].value.value.i = BC250_MAX_HEIGHT;
+    attrib_list[i].value.value.i = decode ? BC250_MAX_DECODE_SIDE
+                                          : BC250_MAX_HEIGHT;
     i++;
 
     *num_attribs = i;
@@ -465,6 +489,17 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data || !VALID_ID(config_id, MAX_CONFIGS) || !data->configs[config_id].allocated || !context) {
         return VA_STATUS_ERROR_INVALID_CONFIG;
+    }
+    /* Surfaces are allowed up to the decoder's limit, since a surface does
+     * not know what it will be used for; the context does, and the encoder
+     * and post-processing stay at their own. */
+    if (big_decode(data->configs[config_id].profile,
+                   data->configs[config_id].entrypoint)) {
+        if ((long)picture_width * picture_height > BC250_MAX_DECODE_SAMPLES)
+            return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
+    } else if (picture_width > BC250_MAX_WIDTH
+               || picture_height > BC250_MAX_HEIGHT) {
+        return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
     }
 
     DRIVER_LOCK(data);
@@ -2056,8 +2091,8 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    data->max_width = BC250_MAX_WIDTH;
-    data->max_height = BC250_MAX_HEIGHT;
+    data->max_width = BC250_MAX_DECODE_SIDE;
+    data->max_height = BC250_MAX_DECODE_SIDE;
     ctx->pDriverData = data;
     ctx->str_vendor = "AMD BC-250 RDNA2 Compute VA-API Driver";
 

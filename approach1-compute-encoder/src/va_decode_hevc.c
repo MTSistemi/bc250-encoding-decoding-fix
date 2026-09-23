@@ -22,6 +22,7 @@
 #include "va_backend.h"
 #include "decoder_h265.h"
 #include "bitreader.h"
+#include "hevc_dec_tables.h"   /* the diagonal scans, for the matrices */
 
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,7 @@
 void bc250_hevc_dec_reset(bc250_context *c)
 {
     c->hevc_dec_state.has_pic = 0;
+    c->hevc_dec_state.has_iq = 0;
     c->hevc_dec_state.n_slices = 0;
     c->hevc_dec_state.n_data = 0;
 }
@@ -87,9 +89,14 @@ VAStatus bc250_hevc_dec_render(bc250_context *c, bc250_buffer *b)
         return VA_STATUS_SUCCESS;
 
     case VAIQMatrixBufferType:
-        /* ⚠️ Quantisation matrices are refused at the parameter set, so a
-         * stream that sends them is refused rather than decoded with the
-         * flat ones and quietly wrong. */
+        /* The quantisation matrices, already resolved: defaults, copies
+         * and the PPS overriding the SPS are the application's business,
+         * and what arrives is the list each block uses. See
+         * scaling_from_va() for the order they arrive in. */
+        if (b->size < sizeof(VAIQMatrixBufferHEVC))
+            return VA_STATUS_ERROR_INVALID_PARAMETER;
+        memcpy(&c->hevc_dec_state.iq, b->data, sizeof(VAIQMatrixBufferHEVC));
+        c->hevc_dec_state.has_iq = 1;
         return VA_STATUS_SUCCESS;
 
     case VASliceParameterBufferType: {
@@ -185,10 +192,17 @@ static void fill_sps(const VAPictureParameterBufferHEVC *p, hevc_sps_t *s)
     s->min_cb_width = s->width >> s->log2_min_cb;
     s->min_cb_height = s->height >> s->log2_min_cb;
 
-    /* The short term sets live in the slice header for a VLD decoder: the
-     * application does not pass the sequence's own copies, and every slice
-     * that uses one sends it inline. */
-    s->num_st_rps = 0;
+    /* ⚠️ The short-term sets are NOT always inline in the slice header.
+     * HM - and most MP4 and MKV files - keep them in the SPS and send only
+     * an index. The header is still re-read here for its entry points and
+     * its exact data offset, and with zero sets declared that read failed
+     * on every such slice. VA does not pass the sets' contents, but it
+     * passes how many there are, which is what the index needs, and
+     * st_rps_bits, which is how long an inline set is, so the parser can
+     * step over it. Neither is needed for anything else: the reference
+     * lists arrive finished. */
+    s->num_st_rps = p->num_short_term_ref_pic_sets;
+    s->st_rps_bits = (int)p->st_rps_bits;
 }
 
 static void fill_pps(const VAPictureParameterBufferHEVC *p, hevc_pps_t *q)
@@ -261,6 +275,34 @@ static bool is_valid(const VAPictureHEVC *p)
         && p->picture_id != VA_INVALID_SURFACE;
 }
 
+/* VA's matrices into the parser's layout: the 32x32 ones moved to
+ * matrixId 0 and 3, and every list put back into the up-right diagonal
+ * order the bitstream sends.
+ *
+ * ⚠️ VA holds them in RASTER order - row after row of the 4x4 or 8x8 base
+ * matrix, as the comment above the structure in va_dec_hevc.h says, and as
+ * a dump of what ffmpeg sends for SLIST_A shows (6 9 13 18 25 35 36 37,
+ * then 9 10 15 21 ...). Taken as if they were already diagonal, every
+ * factor but the first lands on the wrong frequency. */
+static void scaling_from_va(const VAIQMatrixBufferHEVC *q, hevc_scaling_t *s)
+{
+    hevc_scaling_defaults(s);
+    for (int m = 0; m < 6; m++) {
+        for (int i = 0; i < 16; i++)
+            s->list[0][m][i] =
+                q->ScalingList4x4[m][hevcd_diag4_y[i] * 4 + hevcd_diag4_x[i]];
+        for (int i = 0; i < 64; i++) {
+            const int r = hevcd_diag8_y[i] * 8 + hevcd_diag8_x[i];
+            s->list[1][m][i] = q->ScalingList8x8[m][r];
+            s->list[2][m][i] = q->ScalingList16x16[m][r];
+            if (m < 2) s->list[3][3 * m][i] = q->ScalingList32x32[m][r];
+        }
+        s->dc[2][m] = q->ScalingListDC16x16[m];
+    }
+    for (int k = 0; k < 2; k++)
+        s->dc[3][3 * k] = q->ScalingListDC32x32[k];
+}
+
 static void fill_slice(const VAPictureParameterBufferHEVC *pp,
                        const VASliceParameterBufferHEVC *sp,
                        const hevc_pps_t *pps,
@@ -294,8 +336,12 @@ static void fill_slice(const VAPictureParameterBufferHEVC *pp,
     sl->five_minus_max_num_merge_cand = sp->five_minus_max_num_merge_cand;
 
     sl->qp = pps->init_qp + sp->slice_qp_delta;
-    sl->cb_qp_offset = pps->cb_qp_offset + sp->slice_cb_qp_offset;
-    sl->cr_qp_offset = pps->cr_qp_offset + sp->slice_cr_qp_offset;
+    /* ⚠️ The slice's own offset only. block_qp() adds the PPS's to it, as
+     * 8.6.1 does; adding it here as well counted it twice, which is
+     * invisible whenever the PPS offset is zero - x265's default - and a
+     * wrong chroma quantiser whenever it is not. */
+    sl->cb_qp_offset = sp->slice_cb_qp_offset;
+    sl->cr_qp_offset = sp->slice_cr_qp_offset;
     sl->deblocking_filter_disabled = sp->LongSliceFlags.fields.slice_deblocking_filter_disabled_flag != 0;
     sl->beta_offset = 2 * sp->slice_beta_offset_div2;
     sl->tc_offset = 2 * sp->slice_tc_offset_div2;
@@ -345,6 +391,11 @@ static void fill_slice(const VAPictureParameterBufferHEVC *pp,
                 int ref_poc = pp->ReferenceFrames[ref_idx].pic_order_cnt;
                 const void *img = hevc_decoder_find_ref(dec, ref_surf, ref_poc);
                 if (img) {
+                    /* Long-term or not decides whether a motion vector
+                     * pointing at it may be scaled, 8.5.3.2.7. */
+                    sl->explicit_lt[l][sl->explicit_n_refs[l]] =
+                        (pp->ReferenceFrames[ref_idx].flags
+                         & VA_PICTURE_HEVC_LONG_TERM_REFERENCE) != 0;
                     sl->explicit_ref_pic[l][sl->explicit_n_refs[l]++] = img;
                 }
             }
@@ -360,6 +411,8 @@ static void fill_slice(const VAPictureParameterBufferHEVC *pp,
             while (sl->explicit_n_refs[l] < want && sl->explicit_n_refs[l] > 0) {
                 sl->explicit_ref_pic[l][sl->explicit_n_refs[l]] =
                     sl->explicit_ref_pic[l][sl->explicit_n_refs[l] - 1];
+                sl->explicit_lt[l][sl->explicit_n_refs[l]] =
+                    sl->explicit_lt[l][sl->explicit_n_refs[l] - 1];
                 sl->explicit_n_refs[l]++;
             }
         }
@@ -408,19 +461,32 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
     if (pp->pic_fields.bits.tiles_enabled_flag
         && pp->pic_fields.bits.entropy_coding_sync_enabled_flag)
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-    if (pp->pic_fields.bits.scaling_list_enabled_flag)
-        return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-    if (pp->pic_fields.bits.pcm_enabled_flag)
-        return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-    if (pp->slice_parsing_fields.bits.long_term_ref_pics_present_flag)
-        return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-
     hevc_sps_t sps;
     hevc_pps_t pps;
     fill_sps(pp, &sps);
     fill_pps(pp, &pps);
     if (sps.width != c->width || sps.height != c->height)
         return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
+    /* Enabled with no matrix buffer means the defaults, as it does in a
+     * bitstream. */
+    if (sps.scaling_list_enabled) {
+        if (c->hevc_dec_state.has_iq)
+            scaling_from_va(&c->hevc_dec_state.iq, &sps.scaling);
+        else
+            hevc_scaling_defaults(&sps.scaling);
+    }
+    /* ⚠️ NumPicTotalCurr sets the width of every list_entry in the slice
+     * header the fallback parse below reads, and it counts long-term
+     * pictures the SPS marks as used - flags VA does not pass on. VA does
+     * say which reference is in which current subset, and those three
+     * counted together ARE the number, as va.h itself puts it. */
+    for (int i = 0; i < 15; i++)
+        if (is_valid(&pp->ReferenceFrames[i])
+            && (pp->ReferenceFrames[i].flags
+                & (VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE
+                   | VA_PICTURE_HEVC_RPS_ST_CURR_AFTER
+                   | VA_PICTURE_HEVC_RPS_LT_CURR)))
+            pps.num_pic_total_curr++;
 
     /* Which surfaces are still references. This runs before the picture is
      * opened, so that the one about to be decoded cannot be handed a slot
@@ -478,15 +544,26 @@ VAStatus bc250_hevc_dec_decode(bc250_context *c, gpu_image_t out,
         hevc_slice_t sl;
         fill_slice(pp, sp, &pps, kind, dec, &sl);
 
-        /* If entry points are needed for WPP/tiles and bitstream parser can parse them,
-         * supplement entry points */
-        if (sp->num_entry_point_offsets > 0) {
+        /* The header re-read, for what VA does not carry in the form the
+         * decoder wants. ⚠️ Always tried, and when it reads cleanly it
+         * decides two things:
+         *   - the entry points, which VA counts but does not list;
+         *   - where the slice data begins. The decoder reads the payload
+         *     with its emulation prevention bytes removed, and an offset
+         *     measured on the NAL unit as sent is past the right place by
+         *     however many of them the header held. The parser's offset is
+         *     on the same payload the decoder reads.
+         * When it does not read, VA's figures stand. */
+        {
             hevc_slice_t parsed;
             if (hevc_ps_read_slice(&parsed, c->hevc_dec_state.rbsp, n, kind,
                                    sps_store, pps_store) == 0) {
+                sl.data_bit_offset = parsed.data_bit_offset;
                 sl.num_entry_point_offsets = parsed.num_entry_point_offsets;
                 memcpy(sl.entry_point, parsed.entry_point, sizeof(sl.entry_point));
-                hevc_decoder_shift_entry_points(&sl, nal, len, sl.data_bit_offset >> 3);
+                if (sl.num_entry_point_offsets > 0)
+                    hevc_decoder_shift_entry_points(&sl, nal, len,
+                                                    sl.data_bit_offset >> 3);
             }
         }
 
