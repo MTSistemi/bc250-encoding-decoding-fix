@@ -49,12 +49,46 @@ static hevcd_img_t *find_img(const hevcd_t *d, int poc)
     return NULL;
 }
 
-/* Everything the reference picture set no longer names can go. */
+/* 8.3.2: which picture a long-term entry names.
+ *
+ * ⚠️ Without its most significant bits the entry is only the low bits of
+ * a count, and it names whichever reference picture has those low bits -
+ * the standard forbids there being two. With them it is the whole count,
+ * worked out from the current picture's. `skip` is the picture being
+ * decoded, which is in the buffer but is nobody's reference yet. */
+static const hevcd_img_t *find_lt(const hevcd_t *d, const hevc_slice_t *sl,
+                                  int i, const hevcd_img_t *skip)
+{
+    const int max = 1 << sl->log2_max_poc_lsb;
+    int poc = sl->lt_poc_lsb[i];
+    if (sl->lt_msb_present[i])
+        poc += sl->poc - sl->lt_msb_cycle[i] * max - (sl->poc & (max - 1));
+    for (int k = 0; k < d->n_buf; k++) {
+        const hevcd_img_t *g = &d->buf[k];
+        if (!g->is_valid || g == skip) continue;
+        if (sl->lt_msb_present[i] ? g->poc == poc
+                                  : (g->poc & (max - 1)) == poc)
+            return g;
+    }
+    return NULL;
+}
+
+/* Everything the reference picture set no longer names can go - short-term
+ * or long-term, used now or kept for later. */
 static void unescape(hevcd_t *d, const hevc_slice_t *sl)
 {
     if (sl->nal_type == HEVC_NAL_IDR_W_RADL || sl->nal_type == HEVC_NAL_IDR_N_LP) {
         for (int i = 0; i < d->n_buf; i++) d->buf[i].is_valid = false;
         return;
+    }
+    /* ⚠️ Resolved before anything is dropped: a long-term entry without
+     * its high bits matches on the low ones, and dropping first could
+     * leave it matching a different picture. */
+    const hevcd_img_t *keep[32];
+    int n_keep = 0;
+    for (int k = 0; k < sl->num_lt && n_keep < 32; k++) {
+        const hevcd_img_t *g = find_lt(d, sl, k, NULL);
+        if (g) keep[n_keep++] = g;
     }
     const hevc_st_rps_t *r = &sl->st_rps;
     const int count = r->num_negative + r->num_positive;
@@ -63,6 +97,8 @@ static void unescape(hevcd_t *d, const hevc_slice_t *sl)
         bool serve = false;
         for (int k = 0; k < count && !serve; k++)
             if (d->buf[i].poc == sl->poc + r->delta_poc[k]) serve = true;
+        for (int k = 0; k < n_keep && !serve; k++)
+            if (keep[k] == &d->buf[i]) serve = true;
         if (!serve) d->buf[i].is_valid = false;
     }
 }
@@ -116,24 +152,32 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
 }
 
 /* 8.3.4: the lists are the pictures before this one, then the ones after,
- * repeated until the list is as long as the slice header asked for.
+ * then the long-term ones, repeated into a temporary list at least as long
+ * as the slice header asked for. Each list is then either that, in order,
+ * or whatever list_entry picks out of it.
  *
  * ⚠️ List one starts from the other end. That is the whole point of having
  * two: a B picture with one reference each way sends the shorter index
- * for whichever direction it meant. */
+ * for whichever direction it meant. The long-term pictures come last in
+ * both.
+ *
+ * A caller that has the finished lists already - the VA-API bridge -
+ * passes them instead, with which entries are long-term. */
 static void build_lists(hevcd_t *d, const hevc_slice_t *sl)
 {
     if (sl->has_explicit_rpl) {
         for (int l = 0; l < 2; l++) {
             d->n_refs[l] = sl->explicit_n_refs[l];
-            for (int i = 0; i < d->n_refs[l]; i++)
+            for (int i = 0; i < d->n_refs[l]; i++) {
                 d->ref_pic[l][i] = (const hevcd_img_t *)sl->explicit_ref_pic[l][i];
+                d->ref_is_lt[l][i] = sl->explicit_lt[l][i];
+            }
         }
         d->col = (const hevcd_img_t *)sl->explicit_col;
     } else {
         const hevc_st_rps_t *r = &sl->st_rps;
-        const hevcd_img_t *before[16], *after[16];
-        int np = 0, nd = 0;
+        const hevcd_img_t *before[16], *after[16], *lt[32];
+        int np = 0, nd = 0, nl = 0;
 
         for (int i = 0; i < r->num_negative && np < 16; i++) {
             if (!r->used[i]) continue;
@@ -146,6 +190,11 @@ static void build_lists(hevcd_t *d, const hevc_slice_t *sl)
             const hevcd_img_t *g = find_img(d, sl->poc + r->delta_poc[i]);
             if (g) after[nd++] = g;
         }
+        for (int i = 0; i < sl->num_lt && nl < 32; i++) {
+            if (!sl->lt_used[i]) continue;
+            const hevcd_img_t *g = find_lt(d, sl, i, d->current);
+            if (g) lt[nl++] = g;
+        }
 
         for (int l = 0; l < 2; l++) {
             d->n_refs[l] = 0;
@@ -153,13 +202,32 @@ static void build_lists(hevcd_t *d, const hevc_slice_t *sl)
             const hevcd_img_t **a = l ? after : before;
             const hevcd_img_t **b = l ? before : after;
             const int na = l ? nd : np, nb = l ? np : nd;
-            if (!na && !nb) continue;
-            while (d->n_refs[l] < how_many) {
-                for (int i = 0; i < na && d->n_refs[l] < how_many; i++)
-                    d->ref_pic[l][d->n_refs[l]++] = a[i];
-                for (int i = 0; i < nb && d->n_refs[l] < how_many; i++)
-                    d->ref_pic[l][d->n_refs[l]++] = b[i];
+            const int total = na + nb + nl;
+            if (!total || !how_many) continue;
+
+            /* RefPicListTemp, NumRpsCurrTempList entries long. */
+            const hevcd_img_t *temp[64];
+            bool temp_lt[64];
+            const int want = how_many > total ? how_many : total;
+            int n = 0;
+            while (n < want) {
+                for (int i = 0; i < na && n < want; i++, n++) {
+                    temp[n] = a[i]; temp_lt[n] = false;
+                }
+                for (int i = 0; i < nb && n < want; i++, n++) {
+                    temp[n] = b[i]; temp_lt[n] = false;
+                }
+                for (int i = 0; i < nl && n < want; i++, n++) {
+                    temp[n] = lt[i]; temp_lt[n] = true;
+                }
             }
+            for (int i = 0; i < how_many; i++) {
+                int k = sl->list_mod[l] ? sl->list_entry[l][i] : i;
+                if (k >= n) k = n - 1;
+                d->ref_pic[l][i] = temp[k];
+                d->ref_is_lt[l][i] = temp_lt[k];
+            }
+            d->n_refs[l] = how_many;
         }
 
         d->col = NULL;
@@ -187,9 +255,12 @@ static void build_lists(hevcd_t *d, const hevc_slice_t *sl)
         if ((size_t)d->slice_now < g->n_lists) {
             for (int l = 0; l < 2; l++) {
                 g->lists[d->slice_now].n_list[l] = d->n_refs[l];
-                for (int i = 0; i < d->n_refs[l]; i++)
+                for (int i = 0; i < d->n_refs[l]; i++) {
                     g->lists[d->slice_now].poc_list[l][i] =
                         d->ref_pic[l][i] ? d->ref_pic[l][i]->poc : 0;
+                    g->lists[d->slice_now].is_lt[l][i] =
+                        d->ref_is_lt[l][i];
+                }
             }
         }
     }

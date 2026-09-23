@@ -283,9 +283,11 @@ int hevc_ps_read_sps(hevc_sps_t *out, const uint8_t *rbsp, size_t n)
     s.long_term_ref_pics_present = br_read1(&br) != 0;
     if (s.long_term_ref_pics_present) {
         s.num_long_term_sps = (int)br_read_ue(&br);
+        if (s.num_long_term_sps > 32) return PS_NONSENSE;
         for (int i = 0; i < s.num_long_term_sps; i++) {
-            br_skip(&br, s.log2_max_poc_lsb);   /* lt_ref_pic_poc_lsb_sps */
-            br_read1(&br);                      /* used_by_curr_pic_lt_sps */
+            s.lt_ref_pic_poc_lsb_sps[i] =
+                (int)br_read(&br, s.log2_max_poc_lsb);
+            s.used_by_curr_pic_lt_sps[i] = br_read1(&br) != 0;
         }
     }
 
@@ -513,6 +515,7 @@ int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
 
     if (!hevc_nal_e_idr(nal_type)) {
         s.poc_lsb = (int)br_read(&br, sps->log2_max_poc_lsb);
+        s.log2_max_poc_lsb = sps->log2_max_poc_lsb;
         s.short_term_ref_pic_set_sps_flag = br_read1(&br) != 0;
         if (!s.short_term_ref_pic_set_sps_flag) {
             const int e = read_st_rps(&br, &s.st_rps, sps->st_rps,
@@ -529,8 +532,40 @@ int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
             s.st_rps = sps->st_rps[0];
         }
 
-        if (sps->long_term_ref_pics_present)
-            return PS_UNSUPPORTED;   /* long-term references */
+        /* ⚠️ HM sets long_term_ref_pics_present_flag in the SPS even
+         * for streams that never name a long-term picture. Declining on
+         * the flag declined every one of them. */
+        if (sps->long_term_ref_pics_present) {
+            int n_sps = 0;
+            if (sps->num_long_term_sps > 0)
+                n_sps = (int)br_read_ue(&br);
+            const int n_pics = (int)br_read_ue(&br);
+            if (n_sps > sps->num_long_term_sps || n_sps + n_pics > 32)
+                return PS_NONSENSE;
+            s.num_lt = n_sps + n_pics;
+            int bits = 0;
+            while ((1 << bits) < sps->num_long_term_sps) bits++;
+            int cycle = 0;
+            for (int i = 0; i < s.num_lt; i++) {
+                if (i < n_sps) {
+                    const int idx = bits ? (int)br_read(&br, bits) : 0;
+                    if (idx >= sps->num_long_term_sps) return PS_NONSENSE;
+                    s.lt_poc_lsb[i] = sps->lt_ref_pic_poc_lsb_sps[idx];
+                    s.lt_used[i] = sps->used_by_curr_pic_lt_sps[idx];
+                } else {
+                    s.lt_poc_lsb[i] = (int)br_read(&br, sps->log2_max_poc_lsb);
+                    s.lt_used[i] = br_read1(&br) != 0;
+                }
+                s.lt_msb_present[i] = br_read1(&br) != 0;
+                const int delta = s.lt_msb_present[i]
+                                  ? (int)br_read_ue(&br) : 0;
+                /* 7-52: the cycles accumulate, except at the first entry
+                 * and at the first one sent in the header rather than
+                 * taken from the SPS - each group starts over. */
+                cycle = (i == 0 || i == n_sps) ? delta : delta + cycle;
+                s.lt_msb_cycle[i] = cycle;
+            }
+        }
 
         if (sps->temporal_mvp_enabled)
             s.temporal_mvp_enabled = br_read1(&br) != 0;
@@ -562,8 +597,22 @@ int hevc_ps_read_slice(hevc_slice_t *out, const uint8_t *rbsp, size_t n,
             int count = 0;
             for (int i = 0; i < s.st_rps.num_negative + s.st_rps.num_positive; i++)
                 if (s.st_rps.used[i]) count++;
-            if (count > 1)
-                return PS_UNSUPPORTED;    /* reference list modification */
+            for (int i = 0; i < s.num_lt; i++)
+                if (s.lt_used[i]) count++;
+            if (count > 1) {
+                /* 7.3.6.2: list one only for a B slice, and each entry
+                 * Ceil(Log2(NumPicTotalCurr)) bits wide. */
+                int bits = 0;
+                while ((1 << bits) < count) bits++;
+                for (int l = 0; l < (s.type == 0 ? 2 : 1); l++) {
+                    s.list_mod[l] = br_read1(&br) != 0;
+                    if (!s.list_mod[l]) continue;
+                    for (int i = 0; i < s.num_ref_idx[l]; i++) {
+                        s.list_entry[l][i] = (int)br_read(&br, bits);
+                        if (s.list_entry[l][i] >= count) return PS_NONSENSE;
+                    }
+                }
+            }
         }
 
         if (s.type == 0)

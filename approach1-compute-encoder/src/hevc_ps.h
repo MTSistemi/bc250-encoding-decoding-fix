@@ -87,6 +87,8 @@ typedef struct {
     hevc_st_rps_t st_rps[65];
     bool long_term_ref_pics_present;
     int num_long_term_sps;
+    int lt_ref_pic_poc_lsb_sps[33];
+    bool used_by_curr_pic_lt_sps[33];
 
     bool temporal_mvp_enabled, strong_intra_smoothing;
 
@@ -143,10 +145,25 @@ typedef struct {
     int short_term_ref_pic_set_idx;
     hevc_st_rps_t st_rps;                /* the one this slice uses */
 
+    /* Long-term references, 7.4.7.1. The count is only the least
+     * significant bits unless msb_present says a cycle count goes with
+     * it; either way the whole count is resolved against the picture's,
+     * which the parser does not know - see find_lt() in decoder_h265.c. */
+    int log2_max_poc_lsb;
+    int num_lt;
+    int lt_poc_lsb[32];
+    bool lt_used[32];
+    bool lt_msb_present[32];
+    int lt_msb_cycle[32];                /* DeltaPocMsbCycleLt, accumulated */
+
     bool temporal_mvp_enabled;
     bool sao_luma, sao_chroma;
 
     int num_ref_idx[2];
+    /* Reference list modification, 7.3.6.2: when set, entry i of list l
+     * is picked from the temporary list rather than taken in order. */
+    bool list_mod[2];
+    int list_entry[2][16];
     bool mvd_l1_zero, cabac_init_flag;
     bool collocated_from_l0;
     int collocated_ref_idx;
@@ -174,6 +191,7 @@ typedef struct {
     bool has_explicit_rpl;
     const void *explicit_ref_pic[2][16];
     int explicit_n_refs[2];
+    bool explicit_lt[2][16];             /* which entries are long-term */
     const void *explicit_col;
 } hevc_slice_t;
 
