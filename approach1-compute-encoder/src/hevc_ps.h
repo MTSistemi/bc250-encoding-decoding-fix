@@ -97,6 +97,10 @@ typedef struct {
 
     int num_st_rps;
     hevc_st_rps_t st_rps[65];
+    /* Set only by a caller that knows it and cannot provide the sets
+     * themselves - VA-API: the length in bits of a slice header's inline
+     * short-term set, so the parser can step over it. Zero means parse. */
+    int st_rps_bits;
     bool long_term_ref_pics_present;
     int num_long_term_sps;
     int lt_ref_pic_poc_lsb_sps[33];
@@ -138,6 +142,10 @@ typedef struct {
     bool lists_modification_present;
     int log2_parallel_merge_level;
     bool slice_segment_header_extension_present;
+    /* NumPicTotalCurr when a caller knows it and the parser could not work
+     * it out - the VA-API path, which does not see the SPS's long-term
+     * flags. Zero means derive it from the slice header. */
+    int num_pic_total_curr;
 } hevc_pps_t;
 
 /* What one slice segment header says. */
