@@ -256,6 +256,24 @@ static const char *slice_reason(int e)
  * read correctly ends with end_of_slice_segment_flag set exactly after the
  * last coding tree unit, and with the arithmetic decoder at the end of the
  * NAL. One bin read against the wrong context almost never lands there. */
+/* 6.4.1, for the one unit the wavefront synchronisation reads: the one
+ * above and to the right of where a row starts.
+ *
+ * ⚠️ It has to belong to the same SLICE, which is stronger than the same
+ * segment: a dependent segment continues its slice, but the row above it
+ * may have been decoded by a different one. And a picture one unit wide
+ * has no such neighbour at all, anywhere.
+ */
+static bool wpp_above_right(const hevcd_t *d, const hevc_sps_t *sps, int addr)
+{
+    const int col = addr % sps->ctb_width;
+    const int row = addr / sps->ctb_width;
+    if (row == 0 || col + 1 >= sps->ctb_width) return false;
+    const int nb = (row - 1) * sps->ctb_width + col + 1;
+    return d->slice_of_ctb && nb < sps->ctb_count
+        && d->slice_of_ctb[nb] == d->slice_now;
+}
+
 /* Everything one picture needs before any of its slices is read.
  *
  * ⚠️ Called once per PICTURE. It used to run at the top of walk_slice(),
@@ -440,13 +458,16 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
 
         if (starts_tile) {
             /* already initialised above */
-        } else if (starts_row && dependent && d->have_wpp_snapshot
-                   && sps->ctb_width >= 2) {
-            /* ⚠️ `dependent` is not decoration. The synchronisation is
-             * conditional on the unit above right being available, and
-             * 6.4.1 availability wants the same slice - which an
-             * independent segment, by starting a new slice, never has. */
-            memcpy(d->cabac.state, d->wpp_snapshot, HEVCD_CTX);
+        } else if (starts_row) {
+            /* ⚠️ The decision is made INSIDE this branch and never falls
+             * out of it. When the unit above right is not available the
+             * clause says to initialise, which is what the header did
+             * already - it does not say to go on to the next rule. A
+             * dependent segment that starts a row therefore does NOT
+             * continue from the segment before it. */
+            if (d->have_wpp_snapshot
+                && wpp_above_right(d, sps, sl->segment_address))
+                memcpy(d->cabac.state, d->wpp_snapshot, HEVCD_CTX);
         } else if (dependent) {
             memcpy(d->cabac.state, d->ctx_at_segment_end, HEVCD_CTX);
         }
@@ -551,7 +572,8 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
              * cases cannot share this line. */
             if (tile_break)
                 hevcd_cabac_ctx_init(d->cabac.state, init_type, sl->qp);
-            else if (d->have_wpp_snapshot && sps->ctb_width >= 2)
+            else if (d->have_wpp_snapshot
+                     && wpp_above_right(d, sps, d->ts_to_rs[ts + 1]))
                 memcpy(d->cabac.state, d->wpp_snapshot, HEVCD_CTX);
             else
                 hevcd_cabac_ctx_init(d->cabac.state, init_type, sl->qp);
