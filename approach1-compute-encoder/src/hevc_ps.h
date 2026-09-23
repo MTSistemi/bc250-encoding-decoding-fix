@@ -169,6 +169,12 @@ typedef struct {
      * that works on the un-escaped payload has to take them out again. */
     uint32_t entry_point[600];
     size_t data_bit_offset;              /* where slice_segment_data starts */
+
+    /* Explicit reference picture lists, when provided by the caller (VA-API) */
+    bool has_explicit_rpl;
+    const void *explicit_ref_pic[2][16];
+    int explicit_n_refs[2];
+    const void *explicit_col;
 } hevc_slice_t;
 
 /* Returns 0, or a negative code naming what was refused. */

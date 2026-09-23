@@ -123,34 +123,50 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
  * for whichever direction it meant. */
 static void build_lists(hevcd_t *d, const hevc_slice_t *sl)
 {
-    const hevc_st_rps_t *r = &sl->st_rps;
-    const hevcd_img_t *before[16], *after[16];
-    int np = 0, nd = 0;
+    if (sl->has_explicit_rpl) {
+        for (int l = 0; l < 2; l++) {
+            d->n_refs[l] = sl->explicit_n_refs[l];
+            for (int i = 0; i < d->n_refs[l]; i++)
+                d->ref_pic[l][i] = (const hevcd_img_t *)sl->explicit_ref_pic[l][i];
+        }
+        d->col = (const hevcd_img_t *)sl->explicit_col;
+    } else {
+        const hevc_st_rps_t *r = &sl->st_rps;
+        const hevcd_img_t *before[16], *after[16];
+        int np = 0, nd = 0;
 
-    for (int i = 0; i < r->num_negative && np < 16; i++) {
-        if (!r->used[i]) continue;
-        const hevcd_img_t *g = find_img(d, sl->poc + r->delta_poc[i]);
-        if (g) before[np++] = g;
-    }
-    for (int i = r->num_negative; i < r->num_negative + r->num_positive
-             && nd < 16; i++) {
-        if (!r->used[i]) continue;
-        const hevcd_img_t *g = find_img(d, sl->poc + r->delta_poc[i]);
-        if (g) after[nd++] = g;
-    }
+        for (int i = 0; i < r->num_negative && np < 16; i++) {
+            if (!r->used[i]) continue;
+            const hevcd_img_t *g = find_img(d, sl->poc + r->delta_poc[i]);
+            if (g) before[np++] = g;
+        }
+        for (int i = r->num_negative; i < r->num_negative + r->num_positive
+                 && nd < 16; i++) {
+            if (!r->used[i]) continue;
+            const hevcd_img_t *g = find_img(d, sl->poc + r->delta_poc[i]);
+            if (g) after[nd++] = g;
+        }
 
-    for (int l = 0; l < 2; l++) {
-        d->n_refs[l] = 0;
-        const int how_many = sl->num_ref_idx[l];
-        const hevcd_img_t **a = l ? after : before;
-        const hevcd_img_t **b = l ? before : after;
-        const int na = l ? nd : np, nb = l ? np : nd;
-        if (!na && !nb) continue;
-        while (d->n_refs[l] < how_many) {
-            for (int i = 0; i < na && d->n_refs[l] < how_many; i++)
-                d->ref_pic[l][d->n_refs[l]++] = a[i];
-            for (int i = 0; i < nb && d->n_refs[l] < how_many; i++)
-                d->ref_pic[l][d->n_refs[l]++] = b[i];
+        for (int l = 0; l < 2; l++) {
+            d->n_refs[l] = 0;
+            const int how_many = sl->num_ref_idx[l];
+            const hevcd_img_t **a = l ? after : before;
+            const hevcd_img_t **b = l ? before : after;
+            const int na = l ? nd : np, nb = l ? np : nd;
+            if (!na && !nb) continue;
+            while (d->n_refs[l] < how_many) {
+                for (int i = 0; i < na && d->n_refs[l] < how_many; i++)
+                    d->ref_pic[l][d->n_refs[l]++] = a[i];
+                for (int i = 0; i < nb && d->n_refs[l] < how_many; i++)
+                    d->ref_pic[l][d->n_refs[l]++] = b[i];
+            }
+        }
+
+        d->col = NULL;
+        if (sl->temporal_mvp_enabled) {
+            const int l = sl->collocated_from_l0 ? 0 : 1;
+            if (sl->collocated_ref_idx < d->n_refs[l])
+                d->col = d->ref_pic[l][sl->collocated_ref_idx];
         }
     }
 
@@ -173,16 +189,9 @@ static void build_lists(hevcd_t *d, const hevc_slice_t *sl)
                 g->lists[d->slice_now].n_list[l] = d->n_refs[l];
                 for (int i = 0; i < d->n_refs[l]; i++)
                     g->lists[d->slice_now].poc_list[l][i] =
-                        d->ref_pic[l][i]->poc;
+                        d->ref_pic[l][i] ? d->ref_pic[l][i]->poc : 0;
             }
         }
-    }
-
-    d->col = NULL;
-    if (sl->temporal_mvp_enabled) {
-        const int l = sl->collocated_from_l0 ? 0 : 1;
-        if (sl->collocated_ref_idx < d->n_refs[l])
-            d->col = d->ref_pic[l][sl->collocated_ref_idx];
     }
 }
 
@@ -618,10 +627,50 @@ void hevc_decoder_set_references(hevc_decoder_t *h, const uintptr_t *id,
     for (int i = 0; i < IMG_SLOTS; i++) {
         if (!h->buffer[i].is_valid) continue;
         bool serve = false;
-        for (int k = 0; k < n && !serve; k++)
-            if (h->surface_id[i] == id[k] && h->buffer[i].poc == poc[k]) serve = true;
+        for (int k = 0; k < n && !serve; k++) {
+            if ((h->surface_id[i] == id[k] && h->buffer[i].poc == poc[k])
+                || (h->buffer[i].poc == poc[k])) {
+                serve = true;
+                h->surface_id[i] = id[k];
+            }
+        }
         if (!serve) h->buffer[i].is_valid = false;
     }
+}
+
+const void *hevc_decoder_find_ref(const hevc_decoder_t *h, uintptr_t id, int poc)
+{
+    /* 1. Exact match on both surface ID and POC */
+    for (int i = 0; i < IMG_SLOTS; i++) {
+        if (h->buffer[i].is_valid && h->surface_id[i] == id && h->buffer[i].poc == poc)
+            return &h->buffer[i];
+    }
+    /* 2. Match on POC (surface ID may have been rebound by player) */
+    for (int i = 0; i < IMG_SLOTS; i++) {
+        if (h->buffer[i].is_valid && h->buffer[i].poc == poc)
+            return &h->buffer[i];
+    }
+    /* 3. Match on surface ID */
+    for (int i = 0; i < IMG_SLOTS; i++) {
+        if (h->buffer[i].is_valid && h->surface_id[i] == id)
+            return &h->buffer[i];
+    }
+    return NULL;
+}
+
+const void *hevc_decoder_find_closest(const hevc_decoder_t *h, int poc)
+{
+    const hevcd_img_t *best = NULL;
+    int min_diff = 0x7fffffff;
+    for (int i = 0; i < IMG_SLOTS; i++) {
+        if (!h->buffer[i].is_valid) continue;
+        int diff = abs(h->buffer[i].poc - poc);
+        if (diff < min_diff) {
+            min_diff = diff;
+            best = &h->buffer[i];
+        }
+    }
+    return best;
 }
 
 int hevc_decoder_begin_picture(hevc_decoder_t *h, const hevc_sps_t *sps,

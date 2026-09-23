@@ -35,6 +35,12 @@ void hevc_decoder_destroy(hevc_decoder_t *d);
 void hevc_decoder_set_references(hevc_decoder_t *d, const uintptr_t *id,
                                  const int *poc, int n);
 
+/* Find a reference image in the decoder DPB matching surface id and/or poc. */
+const void *hevc_decoder_find_ref(const hevc_decoder_t *d, uintptr_t id, int poc);
+
+/* Find the closest valid image in the decoder DPB by POC (for frame drop concealment). */
+const void *hevc_decoder_find_closest(const hevc_decoder_t *d, int poc);
+
 /* A new picture. Returns 0, or non-zero when the buffer is full. */
 int hevc_decoder_begin_picture(hevc_decoder_t *d, const hevc_sps_t *sps,
                                const hevc_pps_t *pps, uintptr_t id, int poc);

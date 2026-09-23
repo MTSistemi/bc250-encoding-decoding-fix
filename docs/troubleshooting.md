@@ -240,3 +240,22 @@ sudo ./tools/bc250_uninstall.sh
 # Remove the DKMS audio fix:
 cd audio-fix && sudo ./uninstall_dkms.sh
 ```
+
+---
+
+## 11. HEVC Hardware Decoding Artifacts / Ghosting in mpv or FFmpeg
+
+### Symptoms
+When playing HEVC/H.265 files (such as *Big Buck Bunny* or MP4/MKV video streams) in `mpv --hwdec=vaapi` or FFmpeg (`-hwaccel vaapi`), video playback previously exhibited:
+* Severe macroblock displacements, blocky pixelation, or cross-frame smearing.
+* Previous scenes or title cards "burned into" subsequent frames as ghost images.
+* Audio/video desync and dropped frames reported by player logs.
+
+### Root Cause
+1. **Container SPS RPS vs Slice Headers**: In standard HEVC MP4/MKV containers, sequence parameters and the short-term Reference Picture Set (RPS) table are stored globally in container headers (`hvcC` atom) rather than repeated in-band. In slice headers, `short_term_ref_pic_set_sps_flag` is set to `1` to reference SPS tables.
+2. **Missing In-Band Sets**: When VA-API is invoked, the application does not transmit the raw SPS RPS table. When the driver attempted to re-parse the slice header from raw bits without the SPS table, it failed to parse the RPS and could not synchronize the bitstream reader, leading to dropped slices and zero populated reference frames (`d->n_refs[0] = 0, d->n_refs[1] = 0`). As a result, motion compensation was skipped, leaving older pixels ghosting across the display.
+
+### Resolution in v0.5.1+
+* **Direct VA-API RPL Derivation**: `va_decode_hevc.c` now derives reference picture lists (L0 and L1) and the temporal collocated picture directly from VA-API's pre-resolved `VASliceParameterBufferHEVC.RefPicList[2][15]`, eliminating the fragile dependency on in-band RPS bitstream re-parsing.
+* **Exact Slice Parameter Mapping**: Slice type, QP deltas, SAO, deblocking, and slice data byte offsets are mapped directly from VA-API buffers.
+* **Fault-Tolerant Concealment**: Added DPB closest-POC concealment fallback to smoothly hide any missing reference frames caused by seek operations or network packet drops.
