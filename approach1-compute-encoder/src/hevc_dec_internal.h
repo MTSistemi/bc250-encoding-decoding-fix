@@ -84,6 +84,9 @@ typedef struct {
     struct hevcd_img_lists {
         int poc_list[2][16];
         int n_list[2];
+        /* 8.5.3.2.8 asks whether the collocated block's reference was
+         * long-term when THAT picture was decoded. */
+        uint8_t is_lt[2][16];
     } *lists;
     size_t n_lists;
     int32_t *slice_of_ctb;      /* a copy, taken when the picture ends */
@@ -250,6 +253,7 @@ typedef struct {
     hevcd_mvf_t *mvf;
     const hevcd_img_t *ref_pic[2][16];
     int n_refs[2];
+    bool ref_is_lt[2][16];          /* taken from the long-term set */
     const hevcd_img_t *col;         /* the collocated picture, or NULL */
 
     int ctb_addr;                   /* in the picture's raster order */
