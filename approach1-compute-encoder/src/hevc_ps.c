@@ -50,22 +50,77 @@ static int read_ptl(br_t *br, int max_sub_layers_minus1)
 
 /* ------------------------------------------------------------ scaling lists */
 
-/* Clause 7.3.4. Read to be consumed, not kept: a stream that carries its
- * own quantisation matrices is refused by the caller, and reading them
- * here is what lets the caller see the rest of the parameter set before it
- * does so. */
-static int skip_scaling_list(br_t *br)
+/* Table 7-6: the default 8x8 lists, in the order they are sent. Intra
+ * and inter differ because an inter residual is noisier at the high
+ * frequencies and can afford to lose more of them. The 4x4 default is
+ * flat, and the 16x16 and 32x32 ones are these, upsampled. */
+static const uint8_t default_intra[64] = {
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 16, 17, 16, 17, 18,
+    17, 18, 18, 17, 18, 21, 19, 20, 21, 20, 19, 21, 24, 22, 22, 24,
+    24, 22, 22, 24, 25, 25, 27, 30, 27, 25, 25, 29, 31, 35, 35, 31,
+    29, 36, 41, 44, 41, 36, 47, 54, 54, 47, 65, 70, 65, 88, 88, 115,
+};
+static const uint8_t default_inter[64] = {
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 18,
+    18, 18, 18, 18, 18, 20, 20, 20, 20, 20, 20, 20, 24, 24, 24, 24,
+    24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 28, 28, 28, 28, 28,
+    28, 33, 33, 33, 33, 33, 41, 41, 41, 41, 54, 54, 54, 71, 71, 91,
+};
+
+static void default_list(hevc_scaling_t *s, int size, int mat)
 {
+    if (size == 0)
+        memset(s->list[0][mat], 16, 64);
+    else
+        memcpy(s->list[size][mat], mat < 3 ? default_intra : default_inter, 64);
+    s->dc[size][mat] = 16;
+}
+
+void hevc_scaling_defaults(hevc_scaling_t *s)
+{
+    for (int size = 0; size < 4; size++)
+        for (int mat = 0; mat < 6; mat++)
+            default_list(s, size, mat);
+}
+
+/* Clause 7.3.4. Each list is sent outright, or copied from an earlier one
+ * of the same size - where a distance of zero means the default.
+ *
+ * ⚠️ At 32x32 there are only two lists and the distance counts in steps
+ * of three, because they sit at matrixId 0 and 3. The DC value is copied
+ * along with the list, 7.4.5. */
+static int read_scaling_list(br_t *br, hevc_scaling_t *s)
+{
+    hevc_scaling_defaults(s);
     for (int size = 0; size < 4; size++) {
-        for (int mat = 0; mat < 6; mat += (size == 3) ? 3 : 1) {
-            if (!br_read1(br)) {
-                br_read_ue(br);           /* pred_matrix_id_delta */
+        const int step = (size == 3) ? 3 : 1;
+        const int count = (size == 0) ? 16 : 64;
+        for (int mat = 0; mat < 6; mat += step) {
+            if (!br_read1(br)) {                 /* pred_mode_flag */
+                const int delta = (int)br_read_ue(br);
+                const int ref = mat - delta * step;
+                if (ref < 0) return PS_NONSENSE;
+                if (!delta) {
+                    default_list(s, size, mat);
+                } else {
+                    memcpy(s->list[size][mat], s->list[size][ref], 64);
+                    s->dc[size][mat] = s->dc[size][ref];
+                }
                 continue;
             }
-            const int count = (size == 0) ? 16 : 64;
-            if (size > 1) br_read_se(br); /* dc_coef_minus8 */
-            for (int i = 0; i < count; i++)
-                br_read_se(br);           /* delta_coef */
+            int next = 8;
+            if (size > 1) {
+                const int dc = br_read_se(br) + 8;
+                if (dc < 1 || dc > 255) return PS_NONSENSE;
+                s->dc[size][mat] = (uint8_t)dc;
+                next = dc;
+            }
+            for (int i = 0; i < count; i++) {
+                next = (next + br_read_se(br) + 256) % 256;
+                if (!next) return PS_NONSENSE;   /* 7.4.5: greater than 0 */
+                s->list[size][mat][i] = (uint8_t)next;
+            }
+            if (size < 2) s->dc[size][mat] = s->list[size][mat][0];
         }
     }
     return br_overrun(br) ? PS_TRUNCATED : PS_OK;
@@ -254,9 +309,12 @@ int hevc_ps_read_sps(hevc_sps_t *out, const uint8_t *rbsp, size_t n)
 
     s.scaling_list_enabled = br_read1(&br) != 0;
     if (s.scaling_list_enabled) {
+        /* ⚠️ Enabled and not sent means the DEFAULTS, which are not
+         * flat above 4x4. */
+        hevc_scaling_defaults(&s.scaling);
         s.sps_scaling_list_present = br_read1(&br) != 0;
         if (s.sps_scaling_list_present) {
-            const int e = skip_scaling_list(&br);
+            const int e = read_scaling_list(&br, &s.scaling);
             if (e) return e;
         }
     }
@@ -388,7 +446,7 @@ int hevc_ps_read_pps(hevc_pps_t *out, const uint8_t *rbsp, size_t n)
 
     p.pps_scaling_list_present = br_read1(&br) != 0;
     if (p.pps_scaling_list_present) {
-        const int e = skip_scaling_list(&br);
+        const int e = read_scaling_list(&br, &p.scaling);
         if (e) return e;
     }
 

@@ -440,6 +440,35 @@ static int prepare_picture(hevcd_t *d, const hevc_sps_t *sps,
     d->sps = sps;
     d->pps = pps;
     if (!d->current) return 5;
+
+    /* 7.4.5, once per picture: the PPS's lists when it sends them, the
+     * SPS's otherwise - which are the defaults unless it sent its own. The
+     * 16x16 and 32x32 factors are the 8x8 list upsampled, with the DC
+     * position taken from its own value. */
+    d->scaling_on = sps->scaling_list_enabled;
+    if (d->scaling_on) {
+        const hevc_scaling_t *sl = pps->pps_scaling_list_present
+                                   ? &pps->scaling : &sps->scaling;
+        for (int m = 0; m < 6; m++) {
+            for (int i = 0; i < 16; i++)
+                d->sf4[m][hevcd_diag4_y[i] * 4 + hevcd_diag4_x[i]] =
+                    sl->list[0][m][i];
+            for (int i = 0; i < 64; i++) {
+                const int x = hevcd_diag8_x[i], y = hevcd_diag8_y[i];
+                d->sf8[m][y * 8 + x] = sl->list[1][m][i];
+                for (int j = 0; j < 2; j++)
+                    for (int k = 0; k < 2; k++)
+                        d->sf16[m][(y * 2 + j) * 16 + x * 2 + k] =
+                            sl->list[2][m][i];
+                for (int j = 0; j < 4; j++)
+                    for (int k = 0; k < 4; k++)
+                        d->sf32[m][(y * 4 + j) * 32 + x * 4 + k] =
+                            sl->list[3][m][i];
+            }
+            d->sf16[m][0] = sl->dc[2][m];
+            d->sf32[m][0] = sl->dc[3][m];
+        }
+    }
     /* ⚠️ Before the z-scan, which is built out of these. */
     if (hevcd_prepare_tiles(d)) return 5;
     if (hevcd_prepare_zscan(d)) return 5;

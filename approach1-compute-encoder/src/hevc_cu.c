@@ -705,7 +705,23 @@ static void reconstruct_tb(hevcd_t *d, int c_idx, int x, int y,
         return;
     }
 
-    hevcd_dequantize(d->coeff, log2_size, block_qp(d, c_idx), bd);
+    /* 8.6.4.2: the matrix for the block's size, prediction mode and
+     * component. ⚠️ Not for a transform-skipped block above 4x4, as the
+     * later editions of the standard and every reference decoder have it.
+     * The 32x32 lists exist for luma only. */
+    const uint8_t *m = NULL;
+    if (d->scaling_on && !(d->transform_skip && log2_size > 2)) {
+        const int mat = (d->cu.pred_mode == HEVCD_MODE_INTRA ? 0 : 3)
+                        + (log2_size == 5 ? 0 : c_idx);
+        m = log2_size == 2 ? d->sf4[mat]
+          : log2_size == 3 ? d->sf8[mat]
+          : log2_size == 4 ? d->sf16[mat] : d->sf32[mat];
+    }
+    if (m)
+        hevcd_dequantize_scaled(d->coeff, log2_size, block_qp(d, c_idx),
+                                bd, m);
+    else
+        hevcd_dequantize(d->coeff, log2_size, block_qp(d, c_idx), bd);
     if (d->transform_skip)
         hevcd_skip_transform(d->coeff, log2_size, bd);
     else
