@@ -1937,6 +1937,8 @@ void h264_encoder_set_rc_mode(h264_encoder_t *encoder, rc_mode_t mode) {
         encoder->rc.buffer_fullness = encoder->rc.buffer_size / 2;
         encoder->rc.error_integral = 0;
     }
+}
+
 rc_mode_t h264_encoder_get_rc_mode(const h264_encoder_t *encoder) {
     return encoder ? encoder->rc.mode : RC_LOW_LATENCY;
 }
