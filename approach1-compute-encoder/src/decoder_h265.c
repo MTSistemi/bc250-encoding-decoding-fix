@@ -321,6 +321,12 @@ static int prepare_picture(hevcd_t *d, const hevc_sps_t *sps,
     memset(d->no_filter, 0, serve_cb);
     memset(d->skip, 0, serve_cb);
     memset(d->intra_mode, HEVCD_INTRA_DC, serve_pu);
+    /* ⚠️ A slice that switches SAO off for both planes sends no
+     * parameters at all, and read_sao() - which clears the entry it is
+     * about to fill - is never called for its coding tree units. Without
+     * this the previous picture's offsets stay in the map and 8.7.3
+     * applies them to a picture whose slice header said not to. */
+    memset(d->sao, 0, (size_t)sps->ctb_count * sizeof *d->sao);
 
     d->sps = sps;
     d->pps = pps;
