@@ -1287,11 +1287,19 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
         }
     }
 
-    /* Intra, tried for real: it has to be reconstructed to be judged.
-     * ⚠️ Every time. Skipping it when the motion search looked good enough
-     * - better than a flat block, or than an 8x8 intra guess - saved 7 to
-     * 15% of the time and cost 4 to 16% more bits on ducks_take_off, where
-     * the water is exactly what 4x4 intra wins. */
+    /* Intra, tried for real: it has to be reconstructed to be judged -
+     * unless the best inter candidate has no residual at all.
+     *
+     * ⚠️ Not on a guess about the motion search. Skipping intra when the
+     * search looked good enough - better than a flat block, or than an 8x8
+     * intra guess - saved 7 to 15% of the time and cost 4 to 16% more bits
+     * on ducks_take_off, where the water is exactly what 4x4 intra wins;
+     * never trying intra in a P picture costs 6%. But when inter predicts
+     * the CU so well that nothing is left to code, an intra CU that wins
+     * here wins on this CU's bits alone and leaves no motion for the next
+     * CUs and pictures to merge with: not trying it saved 4.6% of the time
+     * on the BC-250 and 0.5% of bits (park_joy 1.9%). */
+    if (d->kind == CU_SKIP || !FUNC(inter_any_cbf)(&d->res)) goto decided;
     FUNC(intra_trial)(enc, cu_x, cu_y, y_min, &cd.intra);
     const int64_t dist_intra =
           FUNC(sse)(src, cw, (const pixel *)enc->recon_y + (size_t)cu_y * cw + cu_x, cw, 8, 8)
