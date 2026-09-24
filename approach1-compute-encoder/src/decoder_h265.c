@@ -742,6 +742,7 @@ void hevc_decoder_destroy(hevc_decoder_t *h)
     hevcd_free_tiles(d);
     free(d->slice_filter);
     free(d->ct_depth); free(d->intra_mode); free(d->min_tb_addr_zs);
+    free(d->zs_rs_to_ts);
     free(d->qp_y_map); free(d->edges); free(d->no_filter);
     free(d->skip); free(d->cbf_map);
     hevcd_free_filters(d);

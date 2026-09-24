@@ -383,8 +383,67 @@ static int FUNC(sign)(int v)
 static const int8_t FUNC(sao_dx)[4][2] = { { -1, 1 }, { 0, 0 }, { -1, 1 }, { 1, -1 } };
 static const int8_t FUNC(sao_dy)[4][2] = { { 0, 0 }, { -1, 1 }, { -1, 1 }, { -1, 1 } };
 
+/* Does anything in this coding tree block have to be left exactly as it
+ * is? Lossless coding units are marked per smallest coding block, so the
+ * question is a few dozen bytes per block rather than one per sample. */
+static bool FUNC(sao_lossy_only)(const hevcd_t *d, int rx, int ry)
+{
+    if (!d->no_filter) return true;
+    const hevc_sps_t *sps = d->sps;
+    const int l = sps->log2_min_cb;
+    const int stride = sps->min_cb_width;
+    const int x0 = (rx << sps->log2_ctb) >> l, y0 = (ry << sps->log2_ctb) >> l;
+    int x1 = ((rx + 1) << sps->log2_ctb) >> l;
+    int y1 = ((ry + 1) << sps->log2_ctb) >> l;
+    if (x1 > stride) x1 = stride;
+    if (y1 > sps->min_cb_height) y1 = sps->min_cb_height;
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++)
+            if (d->no_filter[y * stride + x]) return false;
+    return true;
+}
+
+/* May the edge offset of this coding tree block read every neighbour it
+ * has? Tiles and slices are laid out in whole coding tree blocks, so the
+ * per-sample questions of sao_block() all have the same answer inside one
+ * block: yes, whenever the eight blocks around it are in the same tile and
+ * slice, or the parameter set and the slice let the filter cross.
+ *
+ * ⚠️ All eight, whichever direction the class compares along. Asking only
+ * about the two it uses would be exact too, but this answers "no" on a
+ * handful of blocks at the slice and tile boundaries, and those still go
+ * the slow way, which is the reference. */
+static bool FUNC(sao_neighbours_free)(const hevcd_t *d, int rx, int ry)
+{
+    const hevc_sps_t *sps = d->sps;
+    const int l = sps->log2_ctb;
+    const int x = rx << l, y = ry << l;
+    const bool tiles = !d->pps->loop_filter_across_tiles;
+    const hevcd_slice_filter_t *f = FUNC(filter_of)(d, x, y);
+    const bool slices = f && !f->across_slices;
+    if (!tiles && !slices) return true;
+
+    const int tile = hevcd_tile_at(d, x, y);
+    const int slice = hevcd_slice_at(d, x, y);
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            const int nx = rx + i, ny = ry + j;
+            if ((!i && !j) || nx < 0 || ny < 0
+                || nx >= sps->ctb_width || ny >= sps->ctb_height)
+                continue;
+            if (tiles && hevcd_tile_at(d, nx << l, ny << l) != tile)
+                return false;
+            if (slices && hevcd_slice_at(d, nx << l, ny << l) != slice)
+                return false;
+        }
+    return true;
+}
+
+/* `plain` says sao_lossy_only() held, `open` that sao_neighbours_free()
+ * did too. With them the loops below ask nothing per sample but the
+ * picture border, and that is worked out once as the loop bounds. */
 static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
-                       const hevcd_sao_t *s)
+                       const hevcd_sao_t *s, bool plain, bool open)
 {
     if (!s->kind[c]) return;
 
@@ -405,6 +464,19 @@ static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
          * four consecutive ones get an offset each. An encoder reaches for
          * this where the error is a shift of level rather than a step -
          * a flat area that came out slightly too dark, say. */
+        if (plain) {
+            /* One offset per band, zero for the twenty-eight that have
+             * none: the same answer as the test below, without a branch. */
+            int band[32] = { 0 };
+            for (int k = 0; k < 4; k++)
+                band[(s->position[c] + k) & 31] = s->off[c][k];
+            for (int y = y0; y < y1; y++) {
+                pixel *p = plane + (size_t)y * stride;
+                for (int x = x0; x < x1; x++)
+                    p[x] = (pixel)FUNC(clip_pixel)(p[x] + band[p[x] >> (bd - 5)]);
+            }
+            return;
+        }
         for (int y = y0; y < y1; y++)
             for (int x = x0; x < x1; x++) {
                 if (FUNC(untouchable)(d, x << giu, y << giu)) continue;
@@ -423,6 +495,43 @@ static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
     const int cl = s->category[c];
     const int ax = FUNC(sao_dx)[cl][0], ay = FUNC(sao_dy)[cl][0];
     const int bx = FUNC(sao_dx)[cl][1], by = FUNC(sao_dy)[cl][1];
+
+    if (plain && open) {
+        /* A sample whose neighbour would be outside the picture is left
+         * alone, and the neighbours are one sample away: that is the first
+         * or last column or row of the picture, nothing else. */
+        int xs = x0, xe = x1, ys = y0, ye = y1;
+        if ((ax < 0 || bx < 0) && xs == 0) xs = 1;
+        if ((ax > 0 || bx > 0) && xe == w) xe = w - 1;
+        if ((ay < 0 || by < 0) && ys == 0) ys = 1;
+        if ((ay > 0 || by > 0) && ye == h) ye = h - 1;
+        if (xs >= xe) return;
+
+        /* Indexed by 2 + the two signs, before Table 8-x renumbers them:
+         * a valley, a half valley, flat, a half peak, a peak. Flat gets
+         * nothing, which rewrites the sample with the value it had. */
+        const int8_t table[16] = { s->off[c][0], s->off[c][1], 0,
+                                   s->off[c][2], s->off[c][3] };
+        for (int y = ys; y < ye; y++) {
+            const pixel *cur = before + (size_t)y * stride;
+            const pixel *pa = before + (size_t)(y + ay) * stride + ax;
+            const pixel *pb = before + (size_t)(y + by) * stride + bx;
+            pixel *out = plane + (size_t)y * stride;
+#if BIT_DEPTH == 8 && (defined(__x86_64__) || defined(_M_X64))
+            if (sao_vector()) {
+                sao_edge_row_ssse3(out + xs, cur + xs, pa + xs, pb + xs,
+                                   xe - xs, table);
+                continue;
+            }
+#endif
+            for (int x = xs; x < xe; x++) {
+                const int v = cur[x];
+                const int idx = 2 + FUNC(sign)(v - pa[x]) + FUNC(sign)(v - pb[x]);
+                out[x] = (pixel)FUNC(clip_pixel)(v + table[idx]);
+            }
+        }
+        return;
+    }
 
     for (int y = y0; y < y1; y++)
         for (int x = x0; x < x1; x++) {
@@ -490,6 +599,13 @@ static void FUNC(sao)(hevcd_t *d)
     for (int ry = 0; ry < d->sps->ctb_height; ry++)
         for (int rx = 0; rx < d->sps->ctb_width; rx++) {
             const hevcd_sao_t *s = &d->sao[ry * d->sps->ctb_width + rx];
-            for (int c = 0; c < 3; c++) FUNC(sao_block)(d, c, rx, ry, s);
+            if (!s->kind[0] && !s->kind[1] && !s->kind[2]) continue;
+            /* ⚠️ Asked once per block. Asked per sample, three lookups of
+             * which slice a neighbour is in made this filter a quarter of
+             * a 4K decode. */
+            const bool plain = FUNC(sao_lossy_only)(d, rx, ry);
+            const bool open = plain && FUNC(sao_neighbours_free)(d, rx, ry);
+            for (int c = 0; c < 3; c++)
+                FUNC(sao_block)(d, c, rx, ry, s, plain, open);
         }
 }

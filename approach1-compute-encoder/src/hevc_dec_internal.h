@@ -141,6 +141,11 @@ typedef struct {
      * unit is a quadtree, so the block above right of a transform block
      * may or may not have come first. */
     int32_t *min_tb_addr_zs;
+    /* What that table was built for - it depends on nothing else - so a
+     * picture like the one before does not build it again. */
+    int zs_w, zs_h, zs_log2_min_tb, zs_log2_ctb;
+    int32_t *zs_rs_to_ts;
+    size_t n_zs_rs;
     /* 6.5.1. The picture in tile scan and back again, and which tile each
      * unit belongs to - that one indexed by TILE-SCAN address, because
      * the walk asks "has the tile changed since the last unit" and the
@@ -317,8 +322,8 @@ void hevcd_add(uint8_t *plane, int stride, int x, int y,
                const int16_t *res, int log2_size,
                int bd);
 
-/* 6.5.2: the z-scan address of every smallest transform block. Built once
- * per sequence parameter set. */
+/* 6.5.2: the z-scan address of every smallest transform block. Rebuilt
+ * only when the picture size, the block sizes or the tiles change. */
 int hevcd_prepare_zscan(hevcd_t *d);
 int hevcd_prepare_tiles(hevcd_t *d);
 void hevcd_free_tiles(hevcd_t *d);

@@ -23,6 +23,66 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The edge offset at eight bits, sixteen samples at a time. SSSE3 for
+ * _mm_shuffle_epi8, which looks the five cases up in one instruction; the
+ * decoder asks for it at run time, as hevc_mc.c does, and BC250_HEVC_NOSIMD
+ * turns it off to compare with the scalar loop beside it.
+ *
+ * ⚠️ The samples are compared as signed bytes after flipping the top bit,
+ * which orders them the same way as unsigned ones: SSE has no unsigned
+ * byte comparison. */
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+
+static int sao_vector(void)
+{
+    static int answer = -1;
+    if (answer < 0)
+        answer = !getenv("BC250_HEVC_NOSIMD")
+                 && __builtin_cpu_supports("ssse3") ? 1 : 0;
+    return answer;
+}
+
+__attribute__((target("ssse3")))
+static void sao_edge_row_ssse3(uint8_t *out, const uint8_t *cur,
+                               const uint8_t *a, const uint8_t *b, int n,
+                               const int8_t table[16])
+{
+    const __m128i flip = _mm_set1_epi8((char)0x80);
+    const __m128i two = _mm_set1_epi8(2);
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i lut = _mm_loadu_si128((const __m128i *)table);
+    int x = 0;
+    for (; x + 16 <= n; x += 16) {
+        const __m128i v = _mm_loadu_si128((const __m128i *)(cur + x));
+        const __m128i vs = _mm_xor_si128(v, flip);
+        const __m128i as = _mm_xor_si128(
+            _mm_loadu_si128((const __m128i *)(a + x)), flip);
+        const __m128i bs = _mm_xor_si128(
+            _mm_loadu_si128((const __m128i *)(b + x)), flip);
+        /* sign(v - a): the two comparisons are all ones where true. */
+        const __m128i sa = _mm_sub_epi8(_mm_cmpgt_epi8(as, vs),
+                                        _mm_cmpgt_epi8(vs, as));
+        const __m128i sb = _mm_sub_epi8(_mm_cmpgt_epi8(bs, vs),
+                                        _mm_cmpgt_epi8(vs, bs));
+        const __m128i idx = _mm_add_epi8(_mm_add_epi8(sa, sb), two);
+        const __m128i off = _mm_shuffle_epi8(lut, idx);
+        const __m128i neg = _mm_cmpgt_epi8(zero, off);
+        const __m128i lo = _mm_add_epi16(_mm_unpacklo_epi8(v, zero),
+                                         _mm_unpacklo_epi8(off, neg));
+        const __m128i hi = _mm_add_epi16(_mm_unpackhi_epi8(v, zero),
+                                         _mm_unpackhi_epi8(off, neg));
+        _mm_storeu_si128((__m128i *)(out + x), _mm_packus_epi16(lo, hi));
+    }
+    for (; x < n; x++) {
+        const int v = cur[x];
+        const int idx = 2 + (v > a[x]) - (v < a[x]) + (v > b[x]) - (v < b[x]);
+        const int r = v + table[idx];
+        out[x] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+    }
+}
+#endif
+
 #define BIT_DEPTH 8
 #include "hevc_pixel.h"
 #include "hevc_filter_template.c"
