@@ -239,31 +239,32 @@ static void FUNC(build_hpel)(hevc_encoder_t *enc)
         /* ext[c] is picture column c - M - 3: the taps for output column c
          * start there. */
         for (int c = 0; c < cols; c++) o[c] = TAPS(ext + c, 1);
+        /* The whole-sample plane is this same row, from column -M. */
+        if (r >= 3 && r < rows + 3) memcpy(I + (size_t)(r - 3) * ps, ext + 3, (size_t)cols * sizeof(pixel));
     }
 
-    /* Pass 2: whole, right half, lower half, both. */
+    /* Pass 2: right half, lower half, both. */
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
     for (int r = 0; r < rows; r++) {
-        const int y = r - M;
-        const int32_t *t8 = T + (size_t)r * ps;   /* row r of T is picture row y - 3 */
-        pixel *Ir = I + (size_t)r * ps, *Hr = H + (size_t)r * ps;
+        const int32_t *t8 = T + (size_t)r * ps;   /* row r of T is picture row r - M - 3 */
+        pixel *Hr = H + (size_t)r * ps;
         pixel *Vr = V + (size_t)r * ps, *HVr = HV + (size_t)r * ps;
-        /* The eight source rows the vertical filter reads, edge-extended the
-         * same way. */
-        pixel ext[8][w + 2 * M];
+        /* The eight source rows the vertical filter reads are rows of the
+         * whole-sample plane, its first and last repeated beyond it: row k
+         * of that plane is picture row CLAMPY(k - M), and clamping k first
+         * gives the same row. Pass 1 wrote them; building them again here
+         * extended every source row eight times over. */
+        const pixel *e[8];
         for (int k = 0; k < 8; k++) {
-            const pixel *row = ref + (size_t)CLAMPY(y - 3 + k) * w;
-            for (int i = 0; i < M; i++) ext[k][i] = row[0];
-            memcpy(ext[k] + M, row, (size_t)w * sizeof(pixel));
-            for (int i = M + w; i < w + 2 * M; i++) ext[k][i] = row[w - 1];
+            const int rr = r - 3 + k;
+            e[k] = I + (size_t)(rr < 0 ? 0 : (rr >= rows ? rows - 1 : rr)) * ps;
         }
         for (int c = 0; c < cols; c++) {
-            Ir[c] = ext[3][c];
             Hr[c] = FUNC(clip_sample)((t8[(size_t)3 * ps + c] + 32) >> 6);
-            const int v = -ext[0][c] + 4 * ext[1][c] - 11 * ext[2][c] + 40 * ext[3][c]
-                        + 40 * ext[4][c] - 11 * ext[5][c] + 4 * ext[6][c] - ext[7][c];
+            const int v = -e[0][c] + 4 * e[1][c] - 11 * e[2][c] + 40 * e[3][c]
+                        + 40 * e[4][c] - 11 * e[5][c] + 4 * e[6][c] - e[7][c];
             Vr[c] = FUNC(clip_sample)((v + 32) >> 6);
             const int hv = TAPS(t8 + c, ps);
             HVr[c] = FUNC(clip_sample)((hv + 2048) >> 12);
@@ -1014,7 +1015,12 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
     int64_t best_j = INT64_MAX;
     hevc_mv_t best_mv = cand[best_merge];
 
+/* A candidate costs its distortion plus lambda times bits that are never
+ * negative: when the distortion alone reaches the best cost so far, it
+ * cannot win, and its syntax is not counted. The decision is the same. */
 #define TRY(kind_, dist_, mv_) do {                                              \
+        const int64_t dj_ = (int64_t)(dist_) * 256;                                \
+        if (dj_ >= best_j) break;                                                  \
         cd.kind = (kind_);                                                         \
         const int64_t j_ = FUNC(rd_cost)(enc, chain, cu_x, cu_y, y_min, &cd, (dist_), &after); \
         if (j_ < best_j) { best_j = j_; *d = cd; d->j = j_; best_after = after; best_mv = (mv_); } \
