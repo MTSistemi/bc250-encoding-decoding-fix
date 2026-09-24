@@ -17,6 +17,7 @@
  */
 #include "hevc_dec_internal.h"
 
+#include <stdatomic.h>
 #include <string.h>
 
 #define MAX_SIDE 64
@@ -46,11 +47,17 @@ static inline int clip_pixel(int v, int bd)
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 
+/* ⚠️ Atomic: the first inter block of a stream is usually decoded by
+ * several wavefront rows at once, and each of them asks. */
 static int ha_ssse3(void)
 {
-    static int answer = -1;
-    if (answer < 0) answer = __builtin_cpu_supports("ssse3") ? 1 : 0;
-    return answer;
+    static _Atomic int answer = -1;
+    int a = atomic_load_explicit(&answer, memory_order_relaxed);
+    if (a < 0) {
+        a = __builtin_cpu_supports("ssse3") ? 1 : 0;
+        atomic_store_explicit(&answer, a, memory_order_relaxed);
+    }
+    return a;
 }
 
 /* Two consecutive taps, broadcast: the shape _mm_maddubs_epi16 wants,
@@ -414,9 +421,13 @@ static void two_weighted_v(uint8_t *dst, int stride, int w, int h,
 static bool use_vectors(int bd)
 {
 #if defined(__x86_64__) || defined(_M_X64)
-    static int allowed = -1;
-    if (allowed < 0) allowed = getenv("BC250_HEVC_NOSIMD") ? 0 : 1;
-    return allowed && ha_ssse3() && bd == 8;
+    static _Atomic int allowed = -1;
+    int a = atomic_load_explicit(&allowed, memory_order_relaxed);
+    if (a < 0) {
+        a = getenv("BC250_HEVC_NOSIMD") ? 0 : 1;
+        atomic_store_explicit(&allowed, a, memory_order_relaxed);
+    }
+    return a && ha_ssse3() && bd == 8;
 #else
     (void)bd;
     return false;

@@ -283,9 +283,9 @@ int hevcd_wavefront(hevcd_t *d, const hevc_sps_t *sps, const hevc_pps_t *pps,
                     const hevc_slice_t *sl, const uint8_t *base, size_t rest,
                     int init_type);
 
-/* 8.7.2 and 8.7.3, over the whole finished picture, in that order. */
-void hevcd_deblock(hevcd_t *d);
-void hevcd_sao(hevcd_t *d);
+/* 8.7.2 and 8.7.3, over the whole finished picture, in that order, on as
+ * many threads as BC250_HEVC_THREAD or the processor count allows. */
+void hevcd_loop_filters(hevcd_t *d);
 void hevcd_free_filters(hevcd_t *d);
 
 /* 8.5.3.2: what motion one prediction unit ended up with, and 8.5.3.3:

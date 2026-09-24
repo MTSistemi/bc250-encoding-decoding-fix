@@ -885,7 +885,7 @@ void hevc_decoder_end_picture(hevc_decoder_t *h)
                    n * sizeof *g->slice_of_ctb);
     }
 
-    if (h->d.slice) { hevcd_deblock(&h->d); hevcd_sao(&h->d); }
+    if (h->d.slice) hevcd_loop_filters(&h->d);
     h->is_open = false;
 }
 

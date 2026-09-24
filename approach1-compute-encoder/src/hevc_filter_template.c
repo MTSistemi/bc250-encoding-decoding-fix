@@ -266,17 +266,25 @@ static int FUNC(strength)(const hevcd_t *d, int xp, int yp, int xq, int yq,
 #undef DIFFER
 }
 
-/* One direction over the whole picture. `vertical` says which edges are
- * looked at, not which way the filter reads: a vertical edge is filtered
- * along x and stepped along y. */
-static void FUNC(one_direction)(hevcd_t *d, bool vertical)
+/* One direction over the luma rows [y0, y1). `vertical` says which edges
+ * are looked at, not which way the filter reads: a vertical edge is
+ * filtered along x and stepped along y.
+ *
+ * ⚠️ The rows are whole coding tree block rows, so y0 is a multiple of
+ * sixteen at least. That is what lets two bands run at once: a horizontal
+ * luma edge writes three rows either side of itself and reads four, and
+ * the next edge is eight rows on, so no two edges in different bands
+ * touch the same row - and the chroma edges, sixteen luma rows apart,
+ * keep the same distance on their own grid. */
+static void FUNC(one_direction)(hevcd_t *d, bool vertical, int y0, int y1)
 {
     const hevc_sps_t *sps = d->sps;
     const int forward_l = vertical ? 1 : d->stride[0];
     const int giu_l = vertical ? d->stride[0] : 1;
     const int which = vertical ? 1 : 2;
+    if (y1 > sps->height) y1 = sps->height;
 
-    for (int y = 0; y < sps->height; y += vertical ? 4 : 8)
+    for (int y = y0; y < y1; y += vertical ? 4 : 8)
         for (int x = 0; x < sps->width; x += vertical ? 8 : 4) {
             /* The picture's own border is never an edge, and neither is a
              * position the coding tree never put a block boundary at. */
@@ -348,17 +356,16 @@ static void FUNC(one_direction)(hevcd_t *d, bool vertical)
         }
 }
 
-/* 8.7.2 over the finished picture.
+/* 8.7.2 over one coding tree block row, one direction.
  *
  * The offsets and the on/off switch come from the slice holding each
  * edge, looked up through slice_of_ctb - so a picture whose slices
  * disagree about deblocking gets what each of them asked for.
  */
-static void FUNC(deblock)(hevcd_t *d)
+static void FUNC(deblock_row)(hevcd_t *d, bool vertical, int ry)
 {
-    if (!d->edges) return;
-    FUNC(one_direction)(d, true);
-    FUNC(one_direction)(d, false);
+    const int l = d->sps->log2_ctb;
+    FUNC(one_direction)(d, vertical, ry << l, (ry + 1) << l);
 }
 
 /* ------------------------------------------------- sample adaptive offset */
@@ -576,36 +583,65 @@ static void FUNC(sao_block)(hevcd_t *d, int c, int rx, int ry,
         }
 }
 
-static void FUNC(sao)(hevcd_t *d)
+/* Is there any offset to apply in this picture, and somewhere to keep
+ * the picture as the deblocking filter left it. The copy itself is made
+ * a row at a time by sao_copy_row(), so that it is split up too. */
+static bool FUNC(sao_prepare)(hevcd_t *d)
 {
-    if (!d->sao || !d->plane[0]) return;
+    if (!d->sao || !d->plane[0]) return false;
 
     bool serve = false;
     for (int i = 0; i < d->sps->ctb_count && !serve; i++)
         serve = d->sao[i].kind[0] || d->sao[i].kind[1] || d->sao[i].kind[2];
-    if (!serve) return;
+    if (!serve) return false;
 
     const size_t measure[3] = { d->n_planes, d->n_planes / 4, d->n_planes / 4 };
     for (int c = 0; c < 3; c++) {
         if (!d->copy_of[c] || d->n_copy < d->n_planes) {
             free(d->copy_of[c]);
             d->copy_of[c] = malloc(measure[c]);
-            if (!d->copy_of[c]) return;
+            if (!d->copy_of[c]) { d->n_copy = 0; return false; }
         }
-        memcpy(d->copy_of[c], d->plane[c], measure[c]);
     }
     d->n_copy = d->n_planes;
+    return true;
+}
 
-    for (int ry = 0; ry < d->sps->ctb_height; ry++)
-        for (int rx = 0; rx < d->sps->ctb_width; rx++) {
-            const hevcd_sao_t *s = &d->sao[ry * d->sps->ctb_width + rx];
-            if (!s->kind[0] && !s->kind[1] && !s->kind[2]) continue;
-            /* ⚠️ Asked once per block. Asked per sample, three lookups of
-             * which slice a neighbour is in made this filter a quarter of
-             * a 4K decode. */
-            const bool plain = FUNC(sao_lossy_only)(d, rx, ry);
-            const bool open = plain && FUNC(sao_neighbours_free)(d, rx, ry);
-            for (int c = 0; c < 3; c++)
-                FUNC(sao_block)(d, c, rx, ry, s, plain, open);
-        }
+/* The rows of one coding tree block row, in all three planes, into the
+ * copy the edge offset reads. */
+static void FUNC(sao_copy_row)(hevcd_t *d, int ry)
+{
+    const size_t measure[3] = { d->n_planes, d->n_planes / 4, d->n_planes / 4 };
+    const int l = d->sps->log2_ctb;
+    for (int c = 0; c < 3; c++) {
+        const int giu = c ? 1 : 0;
+        const int h = d->sps->height >> giu;
+        const int y0 = (ry << l) >> giu;
+        int y1 = ((ry + 1) << l) >> giu;
+        if (y1 > h) y1 = h;
+        if (y0 >= y1) continue;
+        const size_t row = (size_t)d->stride[c] * sizeof(pixel);
+        size_t end = (size_t)y1 * row;
+        if (end > measure[c]) end = measure[c];
+        const size_t begin = (size_t)y0 * row;
+        if (begin < end)
+            memcpy(d->copy_of[c] + begin, d->plane[c] + begin, end - begin);
+    }
+}
+
+/* 8.7.3 over one coding tree block row. It reads only the copy and writes
+ * only its own blocks, so rows run in any order once the copy is whole. */
+static void FUNC(sao_row)(hevcd_t *d, int ry)
+{
+    for (int rx = 0; rx < d->sps->ctb_width; rx++) {
+        const hevcd_sao_t *s = &d->sao[ry * d->sps->ctb_width + rx];
+        if (!s->kind[0] && !s->kind[1] && !s->kind[2]) continue;
+        /* ⚠️ Asked once per block. Asked per sample, three lookups of
+         * which slice a neighbour is in made this filter a quarter of
+         * a 4K decode. */
+        const bool plain = FUNC(sao_lossy_only)(d, rx, ry);
+        const bool open = plain && FUNC(sao_neighbours_free)(d, rx, ry);
+        for (int c = 0; c < 3; c++)
+            FUNC(sao_block)(d, c, rx, ry, s, plain, open);
+    }
 }
