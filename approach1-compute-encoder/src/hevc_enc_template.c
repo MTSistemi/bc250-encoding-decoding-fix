@@ -207,6 +207,112 @@ static inline uint32_t FUNC(compute_sad_4x4_chroma)(const pixel *src_cb,
  * goes into the picture is always built by hevc_mc_uni(), the decoder's own
  * interpolation, from the vector chosen. Interpolating every candidate the
  * exact way was a quarter of the encoder's time. */
+#if BIT_DEPTH == 8 && defined(__SSE2__)
+/* build_hpel() with SSE2, eight samples at a time, giving the numbers the
+ * plain version below gives - ten bits still use that one. At eight bits
+ * every sum the filter makes, partial ones included, stays within int16:
+ * its positive taps add to 88 and its negative ones to 24, so 88 * 255 =
+ * 22440 and -24 * 255 = -6120 are the ends. So the horizontal pass is kept
+ * as int16 (in the int32 buffer, half of it used), and only the vertical
+ * filter over it, for the corner phase, needs 32 bits, which PMADDWD gives
+ * two rows at a time. */
+static void FUNC(build_hpel)(hevc_encoder_t *enc)
+{
+    const int w = (int)enc->coded_width, h = (int)enc->coded_height;
+    const int M = HPEL_MARGIN, ps = enc->hpel_stride;
+    const pixel *ref = enc->prev_recon_y;
+    pixel *I = (pixel *)enc->hpel[0], *H = (pixel *)enc->hpel[1];
+    pixel *V = (pixel *)enc->hpel[2], *HV = (pixel *)enc->hpel[3];
+    int16_t *T = (int16_t *)enc->hpel_tmp;
+    const int rows = h + 2 * M, cols = w + 2 * M;
+    static const int8_t tap[8] = { -1, 4, -11, 40, 40, -11, 4, -1 };
+
+    /* Pass 1: every source row, edge-extended, through the horizontal
+     * filter; and the whole-sample plane, which is the same row. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows + 7; r++) {
+        int sy = r - M - 3;
+        sy = sy < 0 ? 0 : (sy >= h ? h - 1 : sy);
+        const pixel *row = ref + (size_t)sy * w;
+        pixel ext[w + 2 * M + 8];
+        memset(ext, row[0], (size_t)(M + 3));
+        memcpy(ext + M + 3, row, (size_t)w);
+        memset(ext + M + 3 + w, row[w - 1], (size_t)(M + 5));
+        int16_t *o = T + (size_t)r * ps;
+        int c = 0;
+        for (; c + 8 <= cols; c += 8) {
+            __m128i acc = _mm_setzero_si128();
+            for (int k = 0; k < 8; k++) {
+                const __m128i x = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(ext + c + k)),
+                                                    _mm_setzero_si128());
+                acc = _mm_add_epi16(acc, _mm_mullo_epi16(x, _mm_set1_epi16(tap[k])));
+            }
+            _mm_storeu_si128((__m128i *)(o + c), acc);
+        }
+        for (; c < cols; c++) {
+            int s = 0;
+            for (int k = 0; k < 8; k++) s += tap[k] * ext[c + k];
+            o[c] = (int16_t)s;
+        }
+        if (r >= 3 && r < rows + 3) memcpy(I + (size_t)(r - 3) * ps, ext + 3, (size_t)cols);
+    }
+
+    /* Pass 2: right half, lower half, both. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows; r++) {
+        const int16_t *t8 = T + (size_t)r * ps;
+        pixel *Hr = H + (size_t)r * ps, *Vr = V + (size_t)r * ps, *HVr = HV + (size_t)r * ps;
+        const pixel *e[8];
+        for (int k = 0; k < 8; k++) {
+            const int rr = r - 3 + k;
+            e[k] = I + (size_t)(rr < 0 ? 0 : (rr >= rows ? rows - 1 : rr)) * ps;
+        }
+        const __m128i z = _mm_setzero_si128(), c32 = _mm_set1_epi16(32), c2048 = _mm_set1_epi32(2048);
+        __m128i tp[4];
+        for (int j = 0; j < 4; j++)
+            tp[j] = _mm_set1_epi32((int)(uint16_t)tap[2 * j] | (int)((uint32_t)(uint16_t)tap[2 * j + 1] << 16));
+        int c = 0;
+        for (; c + 8 <= cols; c += 8) {
+            const __m128i th = _mm_loadu_si128((const __m128i *)(t8 + (size_t)3 * ps + c));
+            const __m128i hh = _mm_srai_epi16(_mm_add_epi16(th, c32), 6);
+            _mm_storel_epi64((__m128i *)(Hr + c), _mm_packus_epi16(hh, hh));
+
+            __m128i v = z;
+            for (int k = 0; k < 8; k++)
+                v = _mm_add_epi16(v, _mm_mullo_epi16(_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(e[k] + c)), z),
+                                                     _mm_set1_epi16(tap[k])));
+            v = _mm_srai_epi16(_mm_add_epi16(v, c32), 6);
+            _mm_storel_epi64((__m128i *)(Vr + c), _mm_packus_epi16(v, v));
+
+            __m128i lo = _mm_setzero_si128(), hi = _mm_setzero_si128();
+            for (int j = 0; j < 4; j++) {
+                const __m128i a = _mm_loadu_si128((const __m128i *)(t8 + (size_t)(2 * j) * ps + c));
+                const __m128i b = _mm_loadu_si128((const __m128i *)(t8 + (size_t)(2 * j + 1) * ps + c));
+                lo = _mm_add_epi32(lo, _mm_madd_epi16(_mm_unpacklo_epi16(a, b), tp[j]));
+                hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(a, b), tp[j]));
+            }
+            lo = _mm_srai_epi32(_mm_add_epi32(lo, c2048), 12);
+            hi = _mm_srai_epi32(_mm_add_epi32(hi, c2048), 12);
+            const __m128i hv = _mm_packs_epi32(lo, hi);
+            _mm_storel_epi64((__m128i *)(HVr + c), _mm_packus_epi16(hv, hv));
+        }
+        for (; c < cols; c++) {
+            Hr[c] = FUNC(clip_sample)((t8[(size_t)3 * ps + c] + 32) >> 6);
+            int v = 0, hv = 0;
+            for (int k = 0; k < 8; k++) {
+                v += tap[k] * e[k][c];
+                hv += tap[k] * t8[(size_t)k * ps + c];
+            }
+            Vr[c] = FUNC(clip_sample)((v + 32) >> 6);
+            HVr[c] = FUNC(clip_sample)((hv + 2048) >> 12);
+        }
+    }
+}
+#else
 static void FUNC(build_hpel)(hevc_encoder_t *enc)
 {
     const int w = (int)enc->coded_width, h = (int)enc->coded_height;
@@ -274,6 +380,7 @@ static void FUNC(build_hpel)(hevc_encoder_t *enc)
 #undef CLAMPX
 #undef CLAMPY
 }
+#endif
 
 /* 8x8 SAD between the source and a block of a half plane, and between the
  * source and the average of two such blocks - both in the plane's own
