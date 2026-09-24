@@ -359,6 +359,93 @@ static void test_planar_bottom_left(void) {
     printf("[test_hevc_encode] Planar's bottom-left reference sample OK.\n");
 }
 
+/* Ten bits: the transform pair's shifts and the QP offset.
+ *
+ * A constant residual four times the eight-bit one, at Qp' = 4 + 12, has
+ * to come back within the same couple of eight-bit levels - four ten-bit
+ * ones. A shift off by one anywhere is off by a factor of two here. */
+static void test_transform_round_trip_10(void) {
+    printf("[test_hevc_encode] Ten-bit transform round-trip (DST + DCT, QP'=16)...\n");
+    for (int use_dst = 0; use_dst <= 1; use_dst++) {
+        int16_t residual[16], coeff[16], recon[16];
+        for (int i = 0; i < 16; i++) residual[i] = 80;
+        hevc_transform_quant_4x4_10(residual, 4 + 12, use_dst, coeff);
+        hevc_dequant_itransform_4x4_10(coeff, 4 + 12, use_dst, recon);
+        for (int i = 0; i < 16; i++) {
+            int diff = recon[i] - 80;
+            if (diff < 0) diff = -diff;
+            assert(diff <= 12 && "ten-bit transform/quant round trip drifted - shift/scale bug");
+        }
+        /* The same QP gives the same levels at either depth: that is what
+         * the extra shifts are for. */
+        int16_t residual8[16], coeff8[16];
+        for (int i = 0; i < 16; i++) residual8[i] = 20;
+        hevc_transform_quant_4x4(residual8, 4, use_dst, coeff8);
+        assert(memcmp(coeff, coeff8, sizeof(coeff)) == 0 && "ten-bit levels differ from eight-bit ones at the same QP");
+    }
+    printf("[test_hevc_encode] Ten-bit transform round-trip OK.\n");
+}
+
+/* Main 10: P010 in, a stream that says Main 10 and ten bits out. */
+static void test_main10_stream(void) {
+    printf("[test_hevc_encode] Main 10 stream...\n");
+    assert(hevc_encoder_create_depth(NULL, 64, 64, 30, 2000000, 9) == NULL);
+    assert(hevc_encoder_create_depth(NULL, 64, 64, 30, 2000000, 12) == NULL);
+
+    const uint32_t width = 128, height = 96;
+    hevc_encoder_t *enc = hevc_encoder_create_depth(NULL, width, height, 30, 2000000, 10);
+    assert(enc != NULL);
+    assert(hevc_encoder_get_bit_depth(enc) == 10);
+
+    /* A gradient that uses the two bits eight-bit video does not have. */
+    uint16_t *y_plane = malloc((size_t)width * height * 2);
+    uint16_t *uv_plane = malloc((size_t)width * (height / 2) * 2);
+    assert(y_plane && uv_plane);
+    for (uint32_t r = 0; r < height; r++)
+        for (uint32_t c = 0; c < width; c++)
+            y_plane[r * width + c] = (uint16_t)(((c * 1023) / width) ^ ((r * 7) & 3)) << 6;
+    for (uint32_t r = 0; r < height / 2; r++)
+        for (uint32_t c = 0; c < width / 2; c++) {
+            uv_plane[r * width + c * 2 + 0] = (uint16_t)(400 + c * 3) << 6;
+            uv_plane[r * width + c * 2 + 1] = (uint16_t)(600 + r) << 6;
+        }
+
+    const size_t out_cap = (size_t)width * height * 4 + 65536;
+    uint8_t *out_buf = malloc(out_cap);
+    assert(out_buf);
+
+    for (int frame = 0; frame < 3; frame++) {
+        int written = hevc_encoder_encode_raw(enc, (const uint8_t *)y_plane, (int)width * 2,
+                                              (const uint8_t *)uv_plane, (int)width * 2,
+                                              out_buf, out_cap);
+        assert(written > 0);
+        if (frame == 0) {
+            int expected[] = { 35, 32, 33, 34, 19 };
+            assert(check_nal_sequence(out_buf, (size_t)written, expected, 5));
+            /* The SPS: two bytes of NAL header, then a byte of ids and
+             * flags, then profile_space(2) tier(1) profile_idc(5). */
+            size_t sps = 0;
+            for (size_t i = 0; i + 5 < (size_t)written; i++)
+                if (out_buf[i] == 0 && out_buf[i + 1] == 0 && out_buf[i + 2] == 1 &&
+                    ((out_buf[i + 3] >> 1) & 0x3f) == 33) { sps = i + 3; break; }
+            assert(sps && "no SPS");
+            assert((out_buf[sps + 3] & 0x1f) == 2 && "general_profile_idc is not Main 10");
+        } else {
+            int expected[] = { 35, 1 };
+            assert(check_nal_sequence(out_buf, (size_t)written, expected, 2));
+        }
+    }
+
+    /* The eight-bit profile is still Main. */
+    hevc_encoder_t *enc8 = hevc_encoder_create(NULL, width, height, 30, 2000000);
+    assert(hevc_encoder_get_bit_depth(enc8) == 8);
+    hevc_encoder_destroy(enc8);
+
+    free(y_plane); free(uv_plane); free(out_buf);
+    hevc_encoder_destroy(enc);
+    printf("[test_hevc_encode] Main 10 stream OK.\n");
+}
+
 int main(void) {
     test_transform_round_trip();
     test_mpm_derivation();
@@ -366,6 +453,8 @@ int main(void) {
     test_multi_frame_gop();
     test_dynamic_qp_and_rate_control();
     test_hevc_governor();
+    test_transform_round_trip_10();
+    test_main10_stream();
 
     printf("[test_hevc_encode] ALL HEVC BITSTREAM STRUCTURE TESTS PASSED!\n");
     return 0;
