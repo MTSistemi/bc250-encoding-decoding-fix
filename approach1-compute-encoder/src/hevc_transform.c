@@ -37,39 +37,22 @@ static inline int clip_pixel(int v, int bd)
     return v < 0 ? 0 : (v > max ? max : v);
 }
 
-/* 8.6.3. m[x][y] is 16 throughout: a stream with its own quantisation
- * matrices is refused at the parameter set. */
-void hevcd_dequantize(int16_t *coeff, int log2_size, int qp, int bd)
-{
-    const int shift = bd + log2_size - 5;      /* BitDepth + Log2(nTbS) - 5 */
-    const int add = 1 << (shift - 1);
-    const int64_t scale_of = (int64_t)hevcd_level_scale[qp % 6] << (qp / 6);
-    const int count = 1 << (2 * log2_size);
-
-    for (int i = 0; i < count; i++) {
-        if (!coeff[i]) continue;
-        const int64_t v = ((int64_t)coeff[i] * scale_of * 16 + add) >> shift;
-        coeff[i] = (int16_t)clip16((int)(v < -32768 ? -32768
-                                             : (v > 32767 ? 32767 : v)));
-    }
-}
-
-/* The same with a quantisation matrix: m holds the factor of every
- * position, in the block's raster order. A matrix of sixteens is the flat
- * case above, sample for sample. */
-void hevcd_dequantize_scaled(int16_t *coeff, int log2_size, int qp, int bd,
-                             const uint8_t *m)
+/* 8.6.3, over the positions the residual reader wrote and nothing else:
+ * the zeros between them stay zero either way. m holds the factor of every
+ * position in the block's raster order, or is NULL for the flat matrix of
+ * sixteens. */
+void hevcd_dequantize_at(int16_t *coeff, const uint16_t *pos, int n,
+                         int log2_size, int qp, int bd, const uint8_t *m)
 {
     const int shift = bd + log2_size - 5;
     const int add = 1 << (shift - 1);
     const int64_t scale_of = (int64_t)hevcd_level_scale[qp % 6] << (qp / 6);
-    const int count = 1 << (2 * log2_size);
 
-    for (int i = 0; i < count; i++) {
-        if (!coeff[i]) continue;
-        const int64_t v = ((int64_t)coeff[i] * scale_of * m[i] + add) >> shift;
-        coeff[i] = (int16_t)clip16((int)(v < -32768 ? -32768
-                                             : (v > 32767 ? 32767 : v)));
+    for (int i = 0; i < n; i++) {
+        const int p = pos[i];
+        const int64_t v = ((int64_t)coeff[p] * scale_of * (m ? m[p] : 16)
+                           + add) >> shift;
+        coeff[p] = (int16_t)(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
     }
 }
 
@@ -90,11 +73,12 @@ static void line_transform(const int16_t *src, int stride, int32_t *out,
     int val[32];
     int count = 0;
     for (int k = 0; k < n_in; k++) {
+        /* Written every time and kept only when not zero: a branch here
+         * is taken or not at random, which costs more than the stores. */
         const int c = src[k * stride];
-        if (!c) continue;
         val[count] = c;
         row_m[count] = hevcd_dct[k * step];
-        count++;
+        count += (c != 0);
     }
     if (!count) {
         memset(out, 0, (size_t)n * sizeof *out);
@@ -289,6 +273,14 @@ static void store_line(int16_t *o, const int32_t *v, int n, int add, int shift)
  * transposed, one column per row, so the first stage writes it in order. */
 void hevcd_transform(int16_t *coeff, int log2_size, bool dst, int bd)
 {
+    hevcd_transform_box(coeff, log2_size, dst, bd, -2, -2);
+}
+
+/* max_x and max_y bound the coefficients, or are -2 when the caller does
+ * not know and they are to be found here. */
+void hevcd_transform_box(int16_t *coeff, int log2_size, bool dst, int bd,
+                         int max_x, int max_y)
+{
     const int n = 1 << log2_size;
     int16_t tmp[32 * 32];
     int32_t row[32];
@@ -323,14 +315,16 @@ void hevcd_transform(int16_t *coeff, int log2_size, bool dst, int bd)
         return;
     }
 
-    int max_x = -1, max_y = -1;
-    for (int y = 0; y < n; y++) {
-        const int16_t *r = coeff + y * n;
-        int x = n - 1;
-        while (x >= 0 && !r[x]) x--;
-        if (x >= 0) {
-            max_y = y;
-            if (x > max_x) max_x = x;
+    if (max_x < -1 || max_y < -1) {
+        max_x = max_y = -1;
+        for (int y = 0; y < n; y++) {
+            const int16_t *r = coeff + y * n;
+            int x = n - 1;
+            while (x >= 0 && !r[x]) x--;
+            if (x >= 0) {
+                max_y = y;
+                if (x > max_x) max_x = x;
+            }
         }
     }
     if (max_x < 0) {                    /* nothing at all: zero out */

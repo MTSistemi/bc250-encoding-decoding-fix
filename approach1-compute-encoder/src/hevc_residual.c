@@ -44,6 +44,9 @@ void hevcd_read_residual(hevcd_t *d, int x0, int y0, int log2_size, int c_idx)
 
     const int side = 1 << log2_size;
     memset(d->coeff, 0, (size_t)side * side * sizeof(int16_t));
+    d->n_nz = 0;
+    d->nz_max_x = -1;
+    d->nz_max_y = -1;
 
     d->transform_skip = false;
     if (pps->transform_skip_enabled && !d->cu.transquant_bypass
@@ -272,6 +275,9 @@ void hevcd_read_residual(hevcd_t *d, int x0, int y0, int log2_size, int c_idx)
             const int xc = (x_cg << 2) + sx[n], yc = (y_cg << 2) + sy[n];
             d->coeff[yc * side + xc] =
                 (int16_t)(negative ? -levels[k] : levels[k]);
+            d->nz_pos[d->n_nz++] = (uint16_t)(yc * side + xc);
+            d->nz_max_x = xc > d->nz_max_x ? xc : d->nz_max_x;
+            d->nz_max_y = yc > d->nz_max_y ? yc : d->nz_max_y;
         }
     }
 }
