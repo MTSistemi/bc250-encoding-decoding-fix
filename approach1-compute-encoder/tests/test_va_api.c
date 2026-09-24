@@ -353,6 +353,8 @@ int main(void) {
     seq_hevc.bits_per_second = 8000000;
     seq_hevc.pic_width_in_luma_samples = 1920;
     seq_hevc.pic_height_in_luma_samples = 1080;
+    seq_hevc.vui_time_scale = 60;
+    seq_hevc.vui_num_units_in_tick = 1;
 
     VABufferID seq_buf_id = VA_INVALID_ID;
     status = ctx.vtable->vaCreateBuffer(&ctx, hevc_context_id, VAEncSequenceParameterBufferType,
@@ -401,6 +403,7 @@ int main(void) {
 
     /* Verify that sequence, picture, and rate control parameters propagated into hevc_enc */
     assert(hevc_encoder_get_gop_size(hevc_c->hevc_enc) == 60);
+    assert(hevc_encoder_get_fps(hevc_c->hevc_enc) == 60);
     assert(hevc_encoder_get_qp(hevc_c->hevc_enc) == 22);
     assert(hevc_encoder_get_bitrate(hevc_c->hevc_enc) == 10000000);
     assert(hevc_c->coded_buf_id == hevc_coded_buf_id);

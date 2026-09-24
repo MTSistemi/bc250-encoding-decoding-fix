@@ -569,7 +569,18 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                                 if (rc_attrib == VA_RC_CQP) {
                                     hevc_encoder_set_rc_mode(c->hevc_enc, RC_CQP);
                                 } else if (rc_attrib & VA_RC_CBR) {
-                                    hevc_encoder_set_rc_mode(c->hevc_enc, RC_LOW_LATENCY);
+#if defined(__linux__)
+                                    if (program_invocation_short_name &&
+                                        (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+                                         strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+                                         strcmp(program_invocation_short_name, "wivrn") == 0)) {
+                                        hevc_encoder_set_rc_mode(c->hevc_enc, RC_LOW_LATENCY);
+                                    } else {
+                                        hevc_encoder_set_rc_mode(c->hevc_enc, RC_CBR);
+                                    }
+#else
+                                    hevc_encoder_set_rc_mode(c->hevc_enc, RC_CBR);
+#endif
                                 } else if (rc_attrib & (VA_RC_VBR | VA_RC_ICQ)) {
 #if defined(__linux__)
                                     if (program_invocation_short_name &&
@@ -599,7 +610,18 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                                 } else if (rc_attrib & (VA_RC_VBR | VA_RC_ICQ)) {
                                     h264_encoder_set_rc_mode(c->h264_enc, RC_VBR);
                                 } else if (rc_attrib & VA_RC_CBR) {
-                                    h264_encoder_set_rc_mode(c->h264_enc, RC_LOW_LATENCY);
+#if defined(__linux__)
+                                    if (program_invocation_short_name &&
+                                        (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+                                         strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+                                         strcmp(program_invocation_short_name, "wivrn") == 0)) {
+                                        h264_encoder_set_rc_mode(c->h264_enc, RC_LOW_LATENCY);
+                                    } else {
+                                        h264_encoder_set_rc_mode(c->h264_enc, RC_CBR);
+                                    }
+#else
+                                    h264_encoder_set_rc_mode(c->h264_enc, RC_CBR);
+#endif
                                 }
                                 break;
                             }
@@ -1045,6 +1067,12 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                     if (seq->intra_period > 0) {
                         h264_encoder_set_gop_size(c->h264_enc, seq->intra_period);
                     }
+                    if (seq->time_scale > 0 && seq->num_units_in_tick > 0) {
+                        uint32_t fps = seq->time_scale / (2 * seq->num_units_in_tick);
+                        if (fps > 0) {
+                            h264_encoder_set_fps(c->h264_enc, fps);
+                        }
+                    }
                     /* SPS frame-cropping window: ffmpeg aligns context height to 16 (1080->1088).
                      * Pass sequence crop offsets so the stream carries true display dimensions. */
                     h264_encoder_set_cropping(c->h264_enc,
@@ -1080,6 +1108,12 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                     VAEncSequenceParameterBufferHEVC *seq = &c->hevc_state.seq_param;
                     if (seq->intra_period > 0) {
                         hevc_encoder_set_gop_size(c->hevc_enc, seq->intra_period);
+                    }
+                    if (seq->vui_time_scale > 0 && seq->vui_num_units_in_tick > 0) {
+                        uint32_t fps = seq->vui_time_scale / seq->vui_num_units_in_tick;
+                        if (fps > 0) {
+                            hevc_encoder_set_fps(c->hevc_enc, fps);
+                        }
                     }
                     if (seq->bits_per_second > 0) {
                         unsigned int pct = c->h264_state.rc_target_percentage;
