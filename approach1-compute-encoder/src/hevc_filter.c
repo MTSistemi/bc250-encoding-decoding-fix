@@ -461,18 +461,26 @@ void hevcd_loop_filters(hevcd_t *d)
     pthread_cond_init(&j.c, NULL);
 
     const int want = filter_threads(j.rows);
-    pthread_t t[FILTER_MAX_THREAD];
-    int alive = 0;
-    for (int i = 1; i < want; i++)
-        if (pthread_create(&t[alive], NULL, filter_worker, &j) == 0) alive++;
+    hevcd_pool_t *pool = want > 1 ? hevcd_pool_for(d) : NULL;
+    if (pool) {
+        /* The pool says beforehand how many it will use, which is what
+         * the waits between stages have to know. */
+        j.taking_part = hevcd_pool_helpers(pool, want) + 1;
+        hevcd_pool_run(pool, filter_worker, &j, want);
+    } else {
+        pthread_t t[FILTER_MAX_THREAD];
+        int alive = 0;
+        for (int i = 1; i < want; i++)
+            if (pthread_create(&t[alive], NULL, filter_worker, &j) == 0) alive++;
 
-    pthread_mutex_lock(&j.m);
-    j.taking_part = alive + 1;
-    pthread_cond_broadcast(&j.c);
-    pthread_mutex_unlock(&j.m);
+        pthread_mutex_lock(&j.m);
+        j.taking_part = alive + 1;
+        pthread_cond_broadcast(&j.c);
+        pthread_mutex_unlock(&j.m);
 
-    filter_worker(&j);                  /* this thread works too */
-    for (int i = 0; i < alive; i++) pthread_join(t[i], NULL);
+        filter_worker(&j);              /* this thread works too */
+        for (int i = 0; i < alive; i++) pthread_join(t[i], NULL);
+    }
 
     pthread_mutex_destroy(&j.m);
     pthread_cond_destroy(&j.c);

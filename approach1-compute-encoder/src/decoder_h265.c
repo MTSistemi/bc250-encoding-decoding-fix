@@ -750,6 +750,7 @@ void hevc_decoder_destroy(hevc_decoder_t *h)
     free(d->qp_y_map); free(d->edges); free(d->no_filter);
     free(d->skip); free(d->cbf_map);
     hevcd_free_filters(d);
+    hevcd_pool_destroy(d->pool);
     free(h);
 }
 
@@ -1067,12 +1068,17 @@ int hevc_decoder_load(hevc_decoder_t *h, gpu_image_t out, gpu_memory_t mem)
     if (want > LOAD_MAX_THREAD) want = LOAD_MAX_THREAD;
     if (want > j.bands) want = j.bands;
 
-    pthread_t t[LOAD_MAX_THREAD];
-    int alive = 0;
-    for (int i = 1; i < want; i++)
-        if (pthread_create(&t[alive], NULL, load_worker, &j) == 0) alive++;
-    load_worker(&j);
-    for (int i = 0; i < alive; i++) pthread_join(t[i], NULL);
+    hevcd_pool_t *pool = want > 1 ? hevcd_pool_for(&h->d) : NULL;
+    if (pool) {
+        hevcd_pool_run(pool, load_worker, &j, want);
+    } else {
+        pthread_t t[LOAD_MAX_THREAD];
+        int alive = 0;
+        for (int i = 1; i < want; i++)
+            if (pthread_create(&t[alive], NULL, load_worker, &j) == 0) alive++;
+        load_worker(&j);
+        for (int i = 0; i < alive; i++) pthread_join(t[i], NULL);
+    }
 
     gpu_compute_unmap_surface(gpu, mem, unmap);
     return 0;
