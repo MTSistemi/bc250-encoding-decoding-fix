@@ -26,6 +26,7 @@
 
 struct hevc_decoder {
     hevcd_t d;
+    hevcd_progress_t progress;
     hevcd_img_t buffer[IMG_SLOTS];
     uintptr_t surface_id[IMG_SLOTS];  /* what the caller calls each picture */
     void *gpu;
@@ -153,13 +154,34 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
      * block at a time, as each is decoded - see hevcd_clear_ctb_motion().
      * Cleared here it was ten megabytes of memset on one thread before
      * every 4K picture, the largest part of what opening a picture cost. */
+    /* ⚠️ Sized once for the most slices a picture can have, one per
+     * coding tree block, and never grown while it is being decoded: a
+     * later picture decoding at the same time reads these, and a realloc
+     * would move them from under it. */
+    const size_t ctbs = (size_t)sps->ctb_count;
+    if (g->n_lists < ctbs) {
+        void *p = realloc(g->lists, ctbs * sizeof *g->lists);
+        if (!p) return -1;
+        g->lists = p;
+        g->n_lists = ctbs;
+    }
+    if (g->n_slice_map < ctbs) {
+        free(g->slice_of_ctb);
+        g->slice_of_ctb = malloc(ctbs * sizeof *g->slice_of_ctb);
+        g->n_slice_map = g->slice_of_ctb ? ctbs : 0;
+        if (!g->slice_of_ctb) return -1;
+    }
+
     g->stride[0] = w;
     g->stride[1] = g->stride[2] = w / 2;
     g->poc = poc;
     g->is_valid = true;
-    g->n_lists = 0;   /* filled as each slice is read */
+    g->progress = d->progress;
+    atomic_store_explicit(&g->rows_ready, 0, memory_order_relaxed);
 
     d->current = g;
+    d->slice_of_ctb = g->slice_of_ctb;
+    d->n_slice_map = g->n_slice_map;
     d->mvf = g->mvf;
     for (int i = 0; i < 3; i++) { d->plane[i] = g->plane[i]; d->stride[i] = g->stride[i]; }
     d->n_planes = g->n_planes;
@@ -493,13 +515,8 @@ static int prepare_picture(hevcd_t *d, const hevc_sps_t *sps,
     if (hevcd_prepare_tiles(d)) return 5;
     if (hevcd_prepare_zscan(d)) return 5;
 
-    if (!d->slice_of_ctb || d->n_slice_map < (size_t)sps->ctb_count) {
-        free(d->slice_of_ctb);
-        d->slice_of_ctb = malloc((size_t)sps->ctb_count
-                                 * sizeof *d->slice_of_ctb);
-        d->n_slice_map = (size_t)sps->ctb_count;
-        if (!d->slice_of_ctb) { d->n_slice_map = 0; return 5; }
-    }
+    /* The picture's own map, allocated when it was opened. */
+    if (!d->slice_of_ctb || d->n_slice_map < (size_t)sps->ctb_count) return 5;
     /* ⚠️ Minus one, not zero: zero is a real slice number. A unit still
      * holding minus one when the picture ends is one no slice ever
      * covered. */
@@ -738,6 +755,9 @@ hevc_decoder_t *hevc_decoder_create(void *gpu, int width, int height)
     h->height = height;
     h->d.buf = h->buffer;
     h->d.n_buf = IMG_SLOTS;
+    pthread_mutex_init(&h->progress.m, NULL);
+    pthread_cond_init(&h->progress.cv, NULL);
+    h->d.progress = &h->progress;
     return h;
 }
 
@@ -754,6 +774,8 @@ void hevc_decoder_destroy(hevc_decoder_t *h)
     free(d->skip); free(d->cbf_map);
     hevcd_free_filters(d);
     hevcd_pool_destroy(d->pool);
+    pthread_mutex_destroy(&h->progress.m);
+    pthread_cond_destroy(&h->progress.cv);
     free(h);
 }
 
@@ -887,23 +909,11 @@ void hevc_decoder_end_picture(hevc_decoder_t *h)
                 hevcd_clear_ctb_motion(&h->d, rs % sps->ctb_width,
                                        rs / sps->ctb_width);
     }
-    /* ⚠️ Before the filters or after makes no difference to them, but
-     * it has to happen while the map is still this picture's: the next
-     * begin_picture() clears it. */
-    if (h->d.slice_of_ctb && h->d.current) {
-        hevcd_img_t *g = h->d.current;
-        const size_t n = (size_t)h->sps.ctb_count;
-        if (g->n_slice_map < n) {
-            free(g->slice_of_ctb);
-            g->slice_of_ctb = malloc(n * sizeof *g->slice_of_ctb);
-            g->n_slice_map = g->slice_of_ctb ? n : 0;
-        }
-        if (g->slice_of_ctb)
-            memcpy(g->slice_of_ctb, h->d.slice_of_ctb,
-                   n * sizeof *g->slice_of_ctb);
-    }
-
     if (h->d.slice && !h->d.filters_done) hevcd_loop_filters(&h->d);
+    /* ⚠️ Every row final now, whatever happened on the way - a picture
+     * that failed half way is still a picture someone may be waiting to
+     * read, and a wait that is never answered is a hang. */
+    hevcd_rows_ready(h->d.current, h->sps.ctb_height);
     h->is_open = false;
 }
 
