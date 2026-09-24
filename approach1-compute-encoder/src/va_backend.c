@@ -18,6 +18,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <math.h>
+
+#ifndef VA_RC_ICQ
+#define VA_RC_ICQ 0x00000040
+#endif
 
 #define BC250_MAX_WIDTH 4096
 #define BC250_MAX_HEIGHT 4096
@@ -66,7 +71,7 @@ VAStatus bc250_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list
     profile_list[i++] = VAProfileH264Main;
     profile_list[i++] = VAProfileH264High;
     profile_list[i++] = VAProfileHEVCMain;
-    /* Decode only: the encoder here is eight bit. */
+    /* Decoded, and encoded from P010 surfaces. */
     profile_list[i++] = VAProfileHEVCMain10;
     /* Post-processing hangs off no codec at all. */
     profile_list[i++] = VAProfileNone;
@@ -96,9 +101,9 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
 
-    /* H.264 and H.265 can be both encoded and decoded. Main 10 can only
-     * be decoded: the encoder writes eight-bit streams and says so in its
-     * own sequence parameter set. */
+    /* H.264 and H.265 can be both encoded and decoded, Main 10 included:
+     * the HEVC encoder has a ten-bit path that reads P010 surfaces and
+     * writes a Main 10 stream. */
     /* VAProfileNone is post-processing and nothing else. */
     if (profile == VAProfileNone) {
         if (!entrypoint_list) {
@@ -116,7 +121,7 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
                             profile == VAProfileH264High ||
                             profile == VAProfileHEVCMain ||
                             profile == VAProfileHEVCMain10);
-    const int can_encode = (profile != VAProfileHEVCMain10);
+    const int can_encode = 1;
     const int count = (can_decode ? 1 : 0) + (can_encode ? 1 : 0);
 
     if (!entrypoint_list) {
@@ -158,17 +163,13 @@ VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEn
                 if (entrypoint == VAEntrypointVLD) {
                     attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
                 } else {
-                    /* Default to CBR and VBR. This allows standard encoders (e.g. FFmpeg)
-                     * to automatically negotiate VBR with standard target bitrates
-                     * (e.g. ~4 Mbps H.264 / ~2.2 Mbps HEVC on 1080p), matching Intel/AMD
-                     * hardware encoder behavior and preventing multi-gigabyte file blowups from
-                     * unconstrained CQP defaults. Explicit CQP can be enabled via
-                     * BC250_ENABLE_CQP=1 or direct vaCreateConfig calls. */
-                    unsigned int rc_modes = VA_RC_CBR | VA_RC_VBR;
-                    if (getenv("BC250_ENABLE_CQP")) {
-                        rc_modes |= VA_RC_CQP;
-                    }
-                    attrib_list[i].value = rc_modes;
+                    /* Advertise CBR, VBR, CQP, and ICQ.
+                     * FFmpeg defaults to ICQ (Intelligent Constant Quality) when no
+                     * bitrate is specified, matching Intel iGPU behavior (~4 Mbps H.264 /
+                     * ~2.2 Mbps HEVC on 1080p) and preventing multi-gigabyte file blowups from
+                     * unconstrained CQP defaults. Explicit CQP remains available when
+                     * requested via -rc_mode CQP or -qp. */
+                    attrib_list[i].value = VA_RC_CBR | VA_RC_VBR | VA_RC_CQP | VA_RC_ICQ;
                 }
                 break;
             case VAConfigAttribEncPackedHeaders:
@@ -558,8 +559,9 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
             VAEntrypoint entry = data->configs[config_id].entrypoint;
 
             if (entry == VAEntrypointEncSlice) {
-                if (prof == VAProfileHEVCMain) {
-                    c->hevc_enc = hevc_encoder_create(&data->gpu, picture_width, picture_height, 30, 4000000);
+                if (prof == VAProfileHEVCMain || prof == VAProfileHEVCMain10) {
+                    c->hevc_enc = hevc_encoder_create_depth(&data->gpu, picture_width, picture_height, 30, 2200000,
+                                                            prof == VAProfileHEVCMain10 ? 10 : 8);
                     if (c->hevc_enc) {
                         for (int a = 0; a < data->configs[config_id].num_attribs; a++) {
                             if (data->configs[config_id].attribs[a].type == VAConfigAttribRateControl) {
@@ -568,7 +570,7 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                                     hevc_encoder_set_rc_mode(c->hevc_enc, RC_CQP);
                                 } else if (rc_attrib & VA_RC_CBR) {
                                     hevc_encoder_set_rc_mode(c->hevc_enc, RC_LOW_LATENCY);
-                                } else if (rc_attrib & VA_RC_VBR) {
+                                } else if (rc_attrib & (VA_RC_VBR | VA_RC_ICQ)) {
 #if defined(__linux__)
                                     if (program_invocation_short_name &&
                                         (strcmp(program_invocation_short_name, "sunshine") == 0 ||
@@ -594,12 +596,10 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                                 unsigned int rc_attrib = data->configs[config_id].attribs[a].value;
                                 if (rc_attrib == VA_RC_CQP) {
                                     h264_encoder_set_rc_mode(c->h264_enc, RC_CQP);
-                                } else if (rc_attrib & VA_RC_VBR) {
+                                } else if (rc_attrib & (VA_RC_VBR | VA_RC_ICQ)) {
                                     h264_encoder_set_rc_mode(c->h264_enc, RC_VBR);
                                 } else if (rc_attrib & VA_RC_CBR) {
                                     h264_encoder_set_rc_mode(c->h264_enc, RC_LOW_LATENCY);
-                                } else if (rc_attrib & VA_RC_CQP) {
-                                    h264_encoder_set_rc_mode(c->h264_enc, RC_CQP);
                                 }
                                 break;
                             }
@@ -1157,10 +1157,39 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                         uint32_t target_bps = (uint32_t)(((uint64_t)rc->bits_per_second * pct) / 100);
                         if (target_bps == 0) target_bps = rc->bits_per_second;
 
+                        /* ICQ mode: bits_per_second is 0 in VAEncMiscParameterRateControl.
+                         * Compute standard target bitrate from resolution and ICQ quality factor
+                         * (~4.0 Mbps H.264 / ~2.2 Mbps HEVC at 1080p, matching Intel iGPU). */
+                        if (target_bps == 0) {
+                            uint32_t w = c->width > 0 ? (uint32_t)c->width : 1920;
+                            uint32_t h = c->height > 0 ? (uint32_t)c->height : 1080;
+                            double pixel_rate = (double)w * (double)h * 30.0;
+                            if (c->h264_enc) {
+                                double base_bps = pixel_rate * 0.0643004;
+                                uint32_t q = 20;
+#if defined(VA_CHECK_VERSION) && VA_CHECK_VERSION(1, 1, 0)
+                                if (rc->ICQ_quality_factor >= 1 && rc->ICQ_quality_factor <= 51) {
+                                    q = rc->ICQ_quality_factor;
+                                }
+#endif
+                                target_bps = (uint32_t)(base_bps * pow(2.0, (20.0 - (double)q) / 6.0));
+                            } else if (c->hevc_enc) {
+                                double base_bps = pixel_rate * 0.0353652;
+                                uint32_t q = 25;
+#if defined(VA_CHECK_VERSION) && VA_CHECK_VERSION(1, 1, 0)
+                                if (rc->ICQ_quality_factor >= 1 && rc->ICQ_quality_factor <= 51) {
+                                    q = rc->ICQ_quality_factor;
+                                }
+#endif
+                                target_bps = (uint32_t)(base_bps * pow(2.0, (25.0 - (double)q) / 6.0));
+                            }
+                        }
+
                         if (c->h264_enc) {
-                            if (rc->bits_per_second > 0) {
+                            if (target_bps > 0) {
                                 h264_encoder_set_bitrate(c->h264_enc, target_bps);
-                                bool cbr_intent = (rc->target_percentage == 100) &&
+                                bool cbr_intent = (rc->bits_per_second > 0) &&
+                                                  (rc->target_percentage == 100) &&
                                                   !rc->rc_flags.bits.disable_bit_stuffing;
                                 h264_encoder_set_cbr_intent(c->h264_enc, cbr_intent);
                             }
@@ -1168,9 +1197,10 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                                 h264_encoder_set_qp(c->h264_enc, rc->initial_qp);
                             }
                         } else if (c->hevc_enc) {
-                            if (rc->bits_per_second > 0) {
+                            if (target_bps > 0) {
                                 hevc_encoder_set_bitrate(c->hevc_enc, target_bps);
-                                bool cbr_intent = (rc->target_percentage == 100) &&
+                                bool cbr_intent = (rc->bits_per_second > 0) &&
+                                                  (rc->target_percentage == 100) &&
                                                   !rc->rc_flags.bits.disable_bit_stuffing;
                                 hevc_encoder_set_cbr_intent(c->hevc_enc, cbr_intent);
                             }
