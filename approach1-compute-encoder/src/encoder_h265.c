@@ -325,7 +325,8 @@ static size_t write_pps(uint8_t *buf, size_t buf_size, int init_qp) {
 
 struct hevc_encoder {
     bc250_gpu_context_t *gpu;
-    uint32_t width, height;               /* real (as requested by libva) */
+    uint32_t width, height;               /* real: the picture being coded */
+    uint32_t ctx_width, ctx_height;       /* what the context was opened for */
     uint32_t coded_width, coded_height;   /* rounded up to a 16px CTU multiple */
     uint32_t width_ctu, height_ctu;
     uint32_t fps, bitrate;
@@ -432,6 +433,8 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
     if (!enc) return NULL;
 
     enc->gpu = gpu_ctx;
+    enc->ctx_width = width;
+    enc->ctx_height = height;
     enc->bit_depth = bit_depth;
     {
         const char *env = getenv("BC250_HEVC_SKIP_THRESHOLD");
@@ -1187,6 +1190,35 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     return (int)total;
 }
 
+/* The picture is as big as the surface it arrives in, not as big as the
+ * context was opened for.
+ *
+ * ⚠️ They differ, and not by accident: ffmpeg opens a Main 10 context at
+ * 1920x1088, the height rounded up to a whole CTB, and then hands it
+ * 1920x1080 surfaces. Taking the context's word for it, this encoder read
+ * 1088 rows out of a 1080-row surface - past the end of its memory at two
+ * bytes a sample, which crashed. At one byte a sample the same mistake
+ * reads whatever follows the plane instead, and codes it, with no cropping
+ * window to hide it. So each frame is the smaller of the two in each
+ * direction.
+ *
+ * The buffers and the maps are sized for the context's CTB grid, so a size
+ * that needs another grid is refused. One that fits it is taken on, with an
+ * IDR, whose SPS carries the new conformance window. */
+static int fit_to_surface(hevc_encoder_t *encoder, uint32_t surface_w, uint32_t surface_h)
+{
+    if (!surface_w || !surface_h) return 0;
+    uint32_t w = surface_w < encoder->ctx_width ? surface_w : encoder->ctx_width;
+    uint32_t h = surface_h < encoder->ctx_height ? surface_h : encoder->ctx_height;
+    if (w == encoder->width && h == encoder->height) return 0;
+    if (round_up16(w) != encoder->coded_width || round_up16(h) != encoder->coded_height)
+        return -1;
+    encoder->width = w;
+    encoder->height = h;
+    encoder->force_idr = true;
+    return 0;
+}
+
 int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
                               bc250_gpu_context_t *gpu_ctx,
                               gpu_image_t input_surface,
@@ -1203,6 +1235,7 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
         /* An eight-bit encoder reading a P010 surface, or the reverse,
          * would encode half a picture of garbage without a complaint. */
         if ((input_surface.format == GPU_IMAGE_P010) != ten_bit) return -1;
+        if (fit_to_surface(encoder, input_surface.width, input_surface.height) != 0) return -1;
 
         /* ⚠️ The governor's tiers mean something narrower here than in the
          * H.264 encoder. The GPU's only job in this one is the motion
