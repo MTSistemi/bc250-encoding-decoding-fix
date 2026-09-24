@@ -79,6 +79,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <immintrin.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -100,6 +102,8 @@
 #define HEVC_PU_SIZE   4
 /* Samples of repeated edge around the search planes - see build_hpel(). */
 #define HPEL_MARGIN   16
+/* Rows a slice's entry point list is sized for: 8192 samples of CTU rows. */
+#define HEVC_WPP_MAX_ROWS 512
 
 /* ============================================================================
  * Level selection (Annex A.3 MaxLumaPs table, picture-size-only heuristic -
@@ -275,7 +279,7 @@ static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_
     return off + bs_rbsp_to_ebsp(buf + off, buf_size - off, rbsp, bs_bytes_written(&bs));
 }
 
-static size_t write_pps(uint8_t *buf, size_t buf_size, int init_qp) {
+static size_t write_pps(uint8_t *buf, size_t buf_size, int init_qp, int wpp) {
     uint8_t rbsp[64];
     bitstream_t bs;
     bs_init(&bs, rbsp, sizeof(rbsp));
@@ -300,7 +304,7 @@ static size_t write_pps(uint8_t *buf, size_t buf_size, int init_qp) {
     bs_write1(&bs, 0);   /* weighted_bipred_flag */
     bs_write1(&bs, 0);   /* transquant_bypass_enable_flag */
     bs_write1(&bs, 0);   /* tiles_enabled_flag */
-    bs_write1(&bs, 0);   /* entropy_coding_sync_enabled_flag */
+    bs_write1(&bs, wpp ? 1 : 0); /* entropy_coding_sync_enabled_flag */
     bs_write1(&bs, 0);   /* pps_loop_filter_across_slices_enabled_flag = 0 */
     bs_write1(&bs, 1);   /* deblocking_filter_control_present_flag = 1 (we need to disable deblock) */
     bs_write1(&bs, 0);   /* deblocking_filter_override_enabled_flag = 0 */
@@ -388,6 +392,16 @@ struct hevc_encoder {
     void *hpel[4];
     int32_t *hpel_tmp;
     int hpel_stride;
+
+    /* Wavefront parallel processing: one substream per CTU row, see
+     * encode_wpp_row(). On unless BC250_HEVC_WPP=0. */
+    bool wpp;
+    uint8_t **row_buf;
+    size_t row_buf_cap;
+    size_t *row_len;
+    uint32_t *row_sad;
+    uint8_t (*row_ctx)[HEVC_NUM_CTX];
+    atomic_int *row_progress;
 
     /* This frame's Lagrange multipliers - see lambda_sse_q8(). */
     int64_t lambda_sse_q8;
@@ -543,6 +557,14 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
     enc->mode_map_stride = enc->coded_width / HEVC_PU_SIZE;
     enc->luma_mode_map = malloc((size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE));
 
+    enc->row_buf_cap = (size_t)enc->coded_width * HEVC_CTU_SIZE * bps * 3 + 65536;
+    enc->row_buf = calloc(enc->height_ctu, sizeof(*enc->row_buf));
+    enc->row_len = calloc(enc->height_ctu, sizeof(*enc->row_len));
+    enc->row_sad = calloc(enc->height_ctu, sizeof(*enc->row_sad));
+    enc->row_ctx = calloc(enc->height_ctu, sizeof(*enc->row_ctx));
+    enc->row_progress = calloc(enc->height_ctu, sizeof(*enc->row_progress));
+    if (enc->row_buf)
+        for (uint32_t r = 0; r < enc->height_ctu; r++) enc->row_buf[r] = malloc(enc->row_buf_cap);
     enc->hpel_stride = (int)enc->coded_width + 2 * HPEL_MARGIN;
     {
         const size_t rows = enc->coded_height + 2 * HPEL_MARGIN;
@@ -567,7 +589,13 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
      * job is streaming a game while the game is running is a trade worth
      * making; sixteen gives up too much for the rest. BC250_HEVC_SLICES
      * overrides it, and 1 restores exactly the old single-slice bitstream. */
-    enc->num_slices = 4;
+    {
+        const char *e = getenv("BC250_HEVC_WPP");
+        enc->wpp = !(e && strcmp(e, "0") == 0);
+    }
+    /* With the wavefront the rows run in parallel without cutting the
+     * picture into slices, and every slice boundary is prediction lost. */
+    enc->num_slices = enc->wpp ? 1 : 4;
     if (enc->num_slices > (int)enc->height_ctu) enc->num_slices = (int)enc->height_ctu;
     {
         const char *s = getenv("BC250_HEVC_SLICES");
@@ -595,7 +623,9 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
         !enc->cu_skip_map || !enc->cu_is_inter || !enc->mv_x_map || !enc->mv_y_map ||
         !enc->luma_mode_map || !enc->dl_y || !enc->dl_uv ||
         !enc->slice_rbsp || !enc->scratch_out || !enc->gpu_mvs ||
-        !enc->hpel[0] || !enc->hpel[1] || !enc->hpel[2] || !enc->hpel[3] || !enc->hpel_tmp) {
+        !enc->hpel[0] || !enc->hpel[1] || !enc->hpel[2] || !enc->hpel[3] || !enc->hpel_tmp ||
+        !enc->row_buf || !enc->row_len || !enc->row_sad || !enc->row_ctx || !enc->row_progress ||
+        !enc->row_buf[enc->height_ctu - 1]) {
         hevc_encoder_destroy(enc);
         return NULL;
     }
@@ -763,6 +793,10 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
     free(encoder->scratch_out);
     free(encoder->gpu_mvs);
     for (int i = 0; i < 4; i++) free(encoder->hpel[i]);
+    if (encoder->row_buf)
+        for (uint32_t r = 0; r < encoder->height_ctu; r++) free(encoder->row_buf[r]);
+    free(encoder->row_buf); free(encoder->row_len); free(encoder->row_sad);
+    free(encoder->row_ctx); free((void *)encoder->row_progress);
     free(encoder->hpel_tmp);
     free(encoder);
 }
@@ -1071,6 +1105,91 @@ static inline int lambda_sad_q8(int qp)
 #include "hevc_enc_template.c"
 #undef BIT_DEPTH
 
+/* Waiting for the row above: spin briefly, then give the core away - on a
+ * machine also running the game being streamed, a spinning thread is a
+ * stolen one. */
+static inline void wpp_pause(unsigned *spins)
+{
+    if (++*spins < 64) _mm_pause();
+    else sched_yield();
+}
+#define WPP_PAUSE() wpp_pause(&spins_)
+
+/* ============================================================================
+ * Wavefront parallel processing
+ * ==========================================================================*/
+
+/* Emulation prevention over a run of RBSP bytes, continuing the zero count
+ * across calls, so that a slice's data can be escaped row by row and each
+ * row's escaped size known - the entry points count escaped bytes (7.4.7.1).
+ * `out` may be NULL to count only. Returns the bytes written. */
+static size_t ebsp_escape(const uint8_t *in, size_t n, uint8_t *out, int *zeros)
+{
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint8_t b = in[i];
+        if (*zeros >= 2 && b <= 3) {
+            if (out) out[o] = 0x03;
+            o++;
+            *zeros = 0;
+        }
+        if (out) out[o] = b;
+        o++;
+        *zeros = b == 0 ? *zeros + 1 : 0;
+    }
+    return o;
+}
+
+/* One CTU row of a WPP picture, into its own substream.
+ *
+ * The row waits for the one above to be two CTUs ahead: a CTU reads the
+ * CTU above and to the right of it - intra reference samples, the B0 merge
+ * and AMVP candidates. Its CABAC contexts start from those the row above had
+ * after its second CTU (9.3.1: the synchronization), or fresh on the first
+ * row of a slice, where the CTU above-right is in another slice. */
+static void encode_wpp_row(hevc_encoder_t *e, int row, int r0, int r1, bool is_idr, bool ten_bit)
+{
+    const int w = (int)e->width_ctu;
+    const int y_min = r0 * HEVC_CTU_SIZE;
+    bitstream_t bs;
+    bs_init(&bs, e->row_buf[row], e->row_buf_cap);
+    hevc_cabac_t cab;
+    hevc_cabac_init(&cab, &bs);
+    uint32_t sad = 0;
+    unsigned spins_ = 0;
+
+    if (row == r0 || w < 2) {
+        hevc_cabac_reset_contexts(&cab, e->qp, is_idr ? 2 : 1);
+    } else {
+        while (atomic_load_explicit(&e->row_progress[row - 1], memory_order_acquire) < 2)
+            WPP_PAUSE();
+        memcpy(cab.ctx, e->row_ctx[row - 1], sizeof(cab.ctx));
+    }
+    hevc_cabac_start(&cab);
+
+    for (int col = 0; col < w; col++) {
+        if (row > r0) {
+            const int need = col + 2 < w ? col + 2 : w;
+            while (atomic_load_explicit(&e->row_progress[row - 1], memory_order_acquire) < need)
+                WPP_PAUSE();
+        }
+        if (ten_bit) encode_ctu_10(e, &cab, col, row, is_idr, y_min, &sad);
+        else         encode_ctu_8(e, &cab, col, row, is_idr, y_min, &sad);
+        if (col == 1) memcpy(e->row_ctx[row], cab.ctx, sizeof(cab.ctx));
+
+        const bool last_of_slice = row == r1 - 1 && col == w - 1;
+        hevc_cabac_encode_terminate(&cab, last_of_slice ? 1 : 0);   /* end_of_slice_segment_flag */
+        if (!last_of_slice && col == w - 1) {
+            hevc_cabac_encode_terminate(&cab, 1);                   /* end_of_subset_one_bit */
+        }
+        atomic_store_explicit(&e->row_progress[row], col + 1, memory_order_release);
+    }
+    hevc_cabac_finish(&cab);
+    bs_rbsp_trailing_bits(&bs);   /* byte_alignment(), or the slice's trailing bits */
+    e->row_len[row] = bs_bytes_written(&bs);
+    e->row_sad[row] = sad;
+}
+
 static size_t maybe_append_filler_hevc(hevc_encoder_t *encoder, size_t total_written)
 {
     if (!encoder->cbr_intent ||
@@ -1180,6 +1299,26 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
      * planes and the previous reconstruction - are read-only for the whole
      * frame.
      */
+    if (encoder->wpp) {
+        for (uint32_t r = 0; r < ctu_rows; r++)
+            atomic_store_explicit(&encoder->row_progress[r], 0, memory_order_relaxed);
+#ifdef _OPENMP
+        int max_t = omp_get_max_threads();
+        int th = (int)ctu_rows < max_t ? (int)ctu_rows : max_t;
+        /* schedule(static, 1): thread t takes rows t, t + T, ... in order,
+         * so a row only ever waits for one that is already running or
+         * done. */
+#pragma omp parallel for schedule(static, 1) num_threads(th)
+#endif
+        for (int r = 0; r < (int)ctu_rows; r++) {
+            int s = 0;
+            while (s + 1 < ns && (uint32_t)r >= (uint32_t)(((uint64_t)ctu_rows * (uint32_t)(s + 1)) / (uint32_t)ns)) s++;
+            const int r0 = (int)(((uint64_t)ctu_rows * (uint32_t)s) / (uint32_t)ns);
+            const int r1 = (int)(((uint64_t)ctu_rows * (uint32_t)(s + 1)) / (uint32_t)ns);
+            encode_wpp_row(encoder, r, r0, r1, is_idr, ten_bit);
+        }
+        for (uint32_t r = 0; r < ctu_rows; r++) encoder->last_frame_sad += encoder->row_sad[r];
+    } else {
 #ifdef _OPENMP
     int max_t = omp_get_max_threads();
     int slice_threads = (ns < max_t) ? ns : max_t;
@@ -1242,6 +1381,7 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     }
 
     for (int s = 0; s < ns; s++) encoder->last_frame_sad += encoder->slice_sad[s];
+    }
 
     size_t total = 0;
     total += write_aud_hevc(encoder->scratch_out + total, encoder->scratch_out_cap - total, is_idr);
@@ -1253,10 +1393,72 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
                             encoder->width, encoder->height,
                             hevc_pick_level_idc(encoder->coded_width, encoder->coded_height),
                             encoder->bit_depth);
-        total += write_pps(encoder->scratch_out + total, encoder->scratch_out_cap - total, encoder->qp);
+        total += write_pps(encoder->scratch_out + total, encoder->scratch_out_cap - total, encoder->qp,
+                           encoder->wpp);
     }
 
-    for (int s = 0; s < ns; s++) {
+    for (int s = 0; encoder->wpp && s < ns; s++) {
+        const uint32_t r0 = (uint32_t)(((uint64_t)ctu_rows * (uint32_t)s) / (uint32_t)ns);
+        const uint32_t r1 = (uint32_t)(((uint64_t)ctu_rows * (uint32_t)(s + 1)) / (uint32_t)ns);
+
+        /* The rows' sizes once escaped: the entry points count escaped
+         * bytes. The header ends in a non-zero byte - the alignment bit -
+         * so the data's zero count starts from nothing. */
+        size_t sizes[HEVC_WPP_MAX_ROWS], data = 0, max_size = 0;
+        int zeros = 0;
+        for (uint32_t r = r0; r < r1; r++) {
+            sizes[r - r0] = ebsp_escape(encoder->row_buf[r], encoder->row_len[r], NULL, &zeros);
+            data += sizes[r - r0];
+            if (r + 1 < r1 && sizes[r - r0] > max_size) max_size = sizes[r - r0];
+        }
+
+        uint8_t hdr[HEVC_WPP_MAX_ROWS * 5 + 64];
+        bitstream_t hb;
+        bs_init(&hb, hdr, sizeof(hdr));
+        bs_write1(&hb, s == 0 ? 1 : 0);          /* first_slice_segment_in_pic_flag */
+        if (is_idr) bs_write1(&hb, 1);           /* no_output_of_prior_pics_flag */
+        bs_write_ue(&hb, 0);                     /* slice_pic_parameter_set_id */
+        if (s != 0) bs_write_u(&hb, (int)bit_address, r0 * encoder->width_ctu);
+        bs_write_ue(&hb, is_idr ? 2 : 1);        /* slice_type */
+        if (!is_idr) {
+            bs_write_u(&hb, 8, encoder->poc & 0xFF);
+            bs_write1(&hb, 1);
+            bs_write1(&hb, 0);
+            bs_write_ue(&hb, 0);
+        }
+        bs_write_se(&hb, slice_qp_delta);
+        /* 7.3.6.1: the entry points, one per row after the first. */
+        const uint32_t entries = r1 - r0 - 1;
+        bs_write_ue(&hb, entries);               /* num_entry_point_offsets */
+        if (entries > 0) {
+            int len = 1;
+            while (len < 32 && (max_size - 1) >> len) len++;
+            bs_write_ue(&hb, (uint32_t)(len - 1)); /* offset_len_minus1 */
+            for (uint32_t i = 0; i < entries; i++)
+                bs_write_u(&hb, len, (uint32_t)(sizes[i] - 1));
+        }
+        bs_rbsp_trailing_bits(&hb);              /* byte_alignment() */
+
+        size_t needed = total + 64 + sizeof(hdr) * 2 + data;
+        if (needed > encoder->scratch_out_cap) {
+            uint8_t *nb = realloc(encoder->scratch_out, needed + 131072);
+            if (!nb) return -1;
+            encoder->scratch_out = nb;
+            encoder->scratch_out_cap = needed + 131072;
+        }
+        bitstream_t out_bs;
+        bs_init(&out_bs, encoder->scratch_out + total, encoder->scratch_out_cap - total);
+        bs_write_nal_header_hevc(&out_bs, is_idr ? NAL_UNIT_CODED_SLICE_IDR_W_RADL : NAL_UNIT_CODED_SLICE_TRAIL_R);
+        total += bs_bytes_written(&out_bs);
+        total += bs_rbsp_to_ebsp(encoder->scratch_out + total, encoder->scratch_out_cap - total,
+                                 hdr, bs_bytes_written(&hb));
+        zeros = 0;
+        for (uint32_t r = r0; r < r1; r++)
+            total += ebsp_escape(encoder->row_buf[r], encoder->row_len[r],
+                                 encoder->scratch_out + total, &zeros);
+    }
+
+    for (int s = 0; !encoder->wpp && s < ns; s++) {
         size_t needed = total + 32 + encoder->slice_len[s] * 2;
         if (needed > encoder->scratch_out_cap) {
             size_t new_cap = encoder->scratch_out_cap * 2;
