@@ -1081,12 +1081,18 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
     int64_t best_j = INT64_MAX;
     hevc_mv_t best_mv = cand[best_merge];
 
-/* A candidate costs its distortion plus lambda times bits that are never
- * negative: when the distortion alone reaches the best cost so far, it
- * cannot win, and its syntax is not counted. The decision is the same. */
-#define TRY(kind_, dist_, mv_) do {                                              \
+/* A candidate costs its distortion plus lambda times its bits. Counting
+ * the bits exactly is most of what deciding a CU costs, so it is skipped
+ * when the distortion plus the rough count of the coefficients' bits, `rb_`
+ * (coeff_bits(), which leaves out the mode's own syntax), already reaches
+ * the best cost so far. With no coefficients that is exact - the bits are
+ * never negative. With them the rough count can be over, and a candidate
+ * that would have won is lost now and then: 0.1% more bits on the derf
+ * sequences, for 5-7% of the time. Half the rough count saved nothing, and
+ * a quarter more than all of it cost 1.7% of bits. */
+#define TRY(kind_, dist_, mv_, rb_) do {                                         \
         const int64_t dj_ = (int64_t)(dist_) * 256;                                \
-        if (dj_ >= best_j) break;                                                  \
+        if (dj_ + enc->lambda_sse_q8 * (int64_t)(rb_) >= best_j) break;            \
         cd.kind = (kind_);                                                         \
         const int64_t j_ = FUNC(rd_cost)(enc, chain, cu_x, cu_y, y_min, &cd, (dist_), &after); \
         if (j_ < best_j) { best_j = j_; *d = cd; d->j = j_; best_after = after; best_mv = (mv_); } \
@@ -1099,14 +1105,14 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
     memcpy(cd.res.rec_y, py, sizeof(py));
     memcpy(cd.res.rec_cb, pcb, sizeof(pcb));
     memcpy(cd.res.rec_cr, pcr, sizeof(pcr));
-    TRY(CU_SKIP, FUNC(pred_dist)(enc, cu_x, cu_y, py, pcb, pcr), cand[best_merge]);
+    TRY(CU_SKIP, FUNC(pred_dist)(enc, cu_x, cu_y, py, pcb, pcr), cand[best_merge], 0);
 
     /* Merge with its residual - unless there is none, which is the skip -
      * as four 4x4 transforms and as one 8x8. */
     {
         FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, &cd.res);
         if (FUNC(inter_any_cbf)(&cd.res))
-            TRY(CU_MERGE, cd.res.dist, cand[best_merge]);
+            TRY(CU_MERGE, cd.res.dist, cand[best_merge], cd.res.bits);
         else if (enc->early_skip)
             /* The best merge candidate's residual quantizes to nothing: the
              * CU is a skip, and nothing else is tried - HM's and x265's
@@ -1147,7 +1153,7 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
         {
             FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, &cd.res);
             coded = FUNC(inter_any_cbf)(&cd.res) != 0;
-            TRY(CU_AMVP, cd.res.dist, mv);
+            TRY(CU_AMVP, cd.res.dist, mv, cd.res.bits);
         }
         if (coded) {
             /* The same vector with no residual at all. */
@@ -1157,7 +1163,7 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
             memcpy(cd.res.rec_y, py, sizeof(py));
             memcpy(cd.res.rec_cb, pcb, sizeof(pcb));
             memcpy(cd.res.rec_cr, pcr, sizeof(pcr));
-            TRY(CU_AMVP, FUNC(pred_dist)(enc, cu_x, cu_y, py, pcb, pcr), mv);
+            TRY(CU_AMVP, FUNC(pred_dist)(enc, cu_x, cu_y, py, pcb, pcr), mv, 0);
         }
     }
 
@@ -1173,7 +1179,9 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
         + FUNC(sse)((const pixel *)enc->src_cr + co, ccw, (const pixel *)enc->recon_cr + co, ccw, 4, 4);
     {
         const hevc_mv_t zero = { 0, 0 };
-        TRY(CU_INTRA, dist_intra, zero);
+        int rb_intra = coeff_bits(cd.intra.coeff_cb) + coeff_bits(cd.intra.coeff_cr);
+        for (int pu = 0; pu < 4; pu++) rb_intra += coeff_bits(cd.intra.luma_coeff[pu]);
+        TRY(CU_INTRA, dist_intra, zero, rb_intra);
     }
 decided:
 #undef TRY
