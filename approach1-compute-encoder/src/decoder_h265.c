@@ -502,6 +502,7 @@ static int prepare_picture(hevcd_t *d, const hevc_sps_t *sps,
      * covered. */
     for (int i = 0; i < sps->ctb_count; i++) d->slice_of_ctb[i] = -1;
     d->slice_now = -1;
+    d->filters_done = false;
     /* Nothing carries across a picture boundary. */
     d->have_segment_end = false;
     d->have_wpp_snapshot = false;
@@ -887,7 +888,7 @@ void hevc_decoder_end_picture(hevc_decoder_t *h)
                    n * sizeof *g->slice_of_ctb);
     }
 
-    if (h->d.slice) hevcd_loop_filters(&h->d);
+    if (h->d.slice && !h->d.filters_done) hevcd_loop_filters(&h->d);
     h->is_open = false;
 }
 

@@ -27,6 +27,27 @@
  * progress with a plain atomic store, the row below spins on it for a
  * moment before sleeping, and a sleeper is woken by the one row above it
  * and nobody else.
+ *
+ * ⚠️ And the loop filters run in here too, behind the decoding, instead of
+ * after the whole picture on their own. Run afterwards they were a quarter
+ * of a 4K picture's time on sixteen threads that only split them four
+ * ways - and all the while the wavefront's tail had threads with nothing
+ * to decode. A thread that runs out of rows takes filter work instead, a
+ * row and a stage at a time, as soon as that row may be filtered:
+ *
+ *   0. vertical edges of row r    once rows r and r + 1 are decoded - the
+ *                                 row below predicts from r's unfiltered
+ *                                 bottom samples;
+ *   1. horizontal edges of row r  once stage 0 is done for r and r - 1 -
+ *                                 the edge on top of r reaches into r - 1;
+ *   2. SAO's kept borders of r    once stage 1 is done for r and r + 1 -
+ *                                 r + 1's top edge reaches into r;
+ *   3. SAO of row r               once stage 2 is done for r - 1, r, r + 1.
+ *
+ * Each stage is claimed in row order under one mutex. Only a slice that
+ * is the whole picture comes through here, so the picture is complete
+ * when the wavefront ends. BC250_HEVC_LATE_FILTERS keeps the filters after
+ * the picture instead, as before, to compare the two.
  */
 #include "hevc_dec_internal.h"
 
@@ -75,6 +96,16 @@ typedef struct {
     int rows, columns;
     _Atomic int next_row_to_claim;             /* the next row nobody has claimed */
     _Atomic int error;               /* the first reason anything refused */
+
+    /* The loop filters behind the decoding. Everything below `fm` is read
+     * and written under it. */
+    bool filtering;
+    hevcd_t *pic;                   /* the picture's own state, not a copy */
+    pthread_mutex_t fm;
+    pthread_cond_t fc;              /* a row decoded or a stage finished */
+    int next_task[4];               /* the next row of each stage to claim */
+    uint8_t *task_done;             /* [stage * rows + row] */
+    int tasks_left;
 } wave_t;
 
 /* This row has finished `count` units, and whoever is below may go on. */
@@ -110,6 +141,11 @@ static void fail_all(wave_t *o, int fault)
         pthread_mutex_lock(&o->row_state[r].m);
         pthread_cond_broadcast(&o->row_state[r].c);
         pthread_mutex_unlock(&o->row_state[r].m);
+    }
+    if (o->filtering) {
+        pthread_mutex_lock(&o->fm);
+        pthread_cond_broadcast(&o->fc);
+        pthread_mutex_unlock(&o->fm);
     }
 }
 
@@ -199,7 +235,68 @@ static void row(wave_t *o, int r)
         }
         publish(o, r, x + 1);
     }
+
+    /* The whole row is in: a filter stage waiting for it may go. */
+    if (o->filtering) {
+        pthread_mutex_lock(&o->fm);
+        pthread_cond_broadcast(&o->fc);
+        pthread_mutex_unlock(&o->fm);
+    }
 }
+
+/* ------------------------------------------------- the filters behind */
+
+static bool decoded(const wave_t *o, int r)
+{
+    return atomic_load_explicit(&o->row_state[r].progress,
+                                memory_order_acquire) >= o->columns;
+}
+
+#define DONE(s, r) (o->task_done[(s) * o->rows + (r)] != 0)
+
+/* May stage s of row r run now. Under fm. */
+static bool ready(const wave_t *o, int s, int r)
+{
+    const int last = o->rows - 1;
+    switch (s) {
+    case 0: return decoded(o, r) && (r == last || decoded(o, r + 1));
+    case 1: return DONE(0, r) && (r == 0 || DONE(0, r - 1));
+    case 2: return DONE(1, r) && (r == last || DONE(1, r + 1));
+    default:
+        return DONE(2, r) && (r == 0 || DONE(2, r - 1))
+               && (r == last || DONE(2, r + 1));
+    }
+}
+
+/* Take filter work until there is none left in the picture, sleeping
+ * while what remains waits on something still running. */
+static void filter_tasks(wave_t *o)
+{
+    pthread_mutex_lock(&o->fm);
+    for (;;) {
+        if (o->tasks_left == 0
+            || atomic_load_explicit(&o->error, memory_order_relaxed))
+            break;
+        int s = 3, r = -1;
+        for (; s >= 0; s--) {
+            const int c = o->next_task[s];
+            if (c < o->rows && ready(o, s, c)) { r = c; break; }
+        }
+        if (r < 0) {
+            pthread_cond_wait(&o->fc, &o->fm);
+            continue;
+        }
+        o->next_task[s]++;
+        pthread_mutex_unlock(&o->fm);
+        hevcd_filter_stage(o->pic, s, r);
+        pthread_mutex_lock(&o->fm);
+        o->task_done[s * o->rows + r] = 1;
+        o->tasks_left--;
+        pthread_cond_broadcast(&o->fc);
+    }
+    pthread_mutex_unlock(&o->fm);
+}
+#undef DONE
 
 static void *worker(void *arg)
 {
@@ -210,6 +307,7 @@ static void *worker(void *arg)
         if (r >= o->rows) break;
         row(o, r);
     }
+    if (o->filtering) filter_tasks(o);
     return NULL;
 }
 
@@ -284,6 +382,25 @@ int hevcd_wavefront(hevcd_t *d, const hevc_sps_t *sps, const hevc_pps_t *pps,
         pthread_cond_init(&o.row_state[r].c, NULL);
     }
 
+    bool deblock = false, sao = false;
+    if (!getenv("BC250_HEVC_LATE_FILTERS")
+        && hevcd_filters_prepare(d, &deblock, &sao)) {
+        o.task_done = calloc((size_t)4 * rows, 1);
+        if (o.task_done) {
+            o.filtering = true;
+            o.pic = d;
+            pthread_mutex_init(&o.fm, NULL);
+            pthread_cond_init(&o.fc, NULL);
+            /* A stage the picture does not have is done before it starts. */
+            for (int s = 0; s < 4; s++) {
+                const bool on = s < 2 ? deblock : sao;
+                o.next_task[s] = on ? 0 : rows;
+                if (!on) memset(o.task_done + (size_t)s * rows, 1, (size_t)rows);
+                else o.tasks_left += rows;
+            }
+        }
+    }
+
     pthread_t t[MAX_THREAD];
     int alive = 0;
     for (int i = 1; i < n_thread; i++)
@@ -294,6 +411,16 @@ int hevcd_wavefront(hevcd_t *d, const hevc_sps_t *sps, const hevc_pps_t *pps,
     for (int r = 0; r < rows; r++) {
         pthread_mutex_destroy(&o.row_state[r].m);
         pthread_cond_destroy(&o.row_state[r].c);
+    }
+    if (o.filtering) {
+        /* ⚠️ Done even when the slice failed: filtering again at the end
+         * of the picture would run the filters twice over the rows that
+         * were already filtered, and a broken picture is broken either
+         * way. */
+        d->filters_done = true;
+        pthread_mutex_destroy(&o.fm);
+        pthread_cond_destroy(&o.fc);
+        free(o.task_done);
     }
     const int e = atomic_load_explicit(&o.error, memory_order_relaxed);
     free(o.start); free(o.length); free(o.snapshot); free(o.row_state);

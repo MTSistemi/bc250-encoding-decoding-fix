@@ -478,6 +478,35 @@ void hevcd_loop_filters(hevcd_t *d)
     pthread_cond_destroy(&j.c);
 }
 
+/* ------------------------------------------ the stages inside the wavefront
+ *
+ * The same four stages, one coding tree block row at a time, for
+ * hevc_wpp.c to run while later rows are still being decoded. It decides
+ * when each is allowed; see there. */
+bool hevcd_filters_prepare(hevcd_t *d, bool *deblock, bool *sao)
+{
+    const bool ten = d->sps->bit_depth_luma > 8;
+    *deblock = d->edges != NULL;
+    /* Whether this picture's slice asked for SAO at all. The wavefront
+     * only takes a slice that is the whole picture, so it is the only one
+     * that could have. */
+    *sao = d->slice && d->sps->sao_enabled
+           && (d->slice->sao_luma || d->slice->sao_chroma)
+           && (ten ? sao_alloc_10(d) : sao_alloc_8(d));
+    return *deblock || *sao;
+}
+
+void hevcd_filter_stage(hevcd_t *d, int stage, int ry)
+{
+    const bool ten = d->sps->bit_depth_luma > 8;
+    switch (stage) {
+    case 0: if (ten) deblock_row_10(d, true, ry);  else deblock_row_8(d, true, ry);  break;
+    case 1: if (ten) deblock_row_10(d, false, ry); else deblock_row_8(d, false, ry); break;
+    case 2: if (ten) sao_copy_row_10(d, ry);       else sao_copy_row_8(d, ry);       break;
+    default: if (ten) sao_row_10(d, ry);           else sao_row_8(d, ry);            break;
+    }
+}
+
 void hevcd_free_filters(hevcd_t *d)
 {
     free(d->sao);

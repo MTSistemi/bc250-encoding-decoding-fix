@@ -282,6 +282,9 @@ typedef struct {
     const hevcd_img_t *col;         /* the collocated picture, or NULL */
 
     int ctb_addr;                   /* in the picture's raster order */
+    /* The wavefront has already run the loop filters over this picture,
+     * and hevc_decoder_end_picture() must not run them again. */
+    bool filters_done;
     bool slice_end;
 } hevcd_t;
 
@@ -299,6 +302,14 @@ int hevcd_wavefront(hevcd_t *d, const hevc_sps_t *sps, const hevc_pps_t *pps,
 /* 8.7.2 and 8.7.3, over the whole finished picture, in that order, on as
  * many threads as BC250_HEVC_THREAD or the processor count allows. */
 void hevcd_loop_filters(hevcd_t *d);
+
+/* The same, one coding tree block row and one stage at a time: 0 the
+ * vertical edges, 1 the horizontal ones, 2 keeping the borders SAO reads,
+ * 3 SAO. hevcd_filters_prepare() says which of deblocking and SAO the
+ * picture has, and false when neither. For hevc_wpp.c, which runs them
+ * while the wavefront is still decoding. */
+bool hevcd_filters_prepare(hevcd_t *d, bool *deblock, bool *sao);
+void hevcd_filter_stage(hevcd_t *d, int stage, int ry);
 void hevcd_free_filters(hevcd_t *d);
 
 /* 8.5.3.2: what motion one prediction unit ended up with, and 8.5.3.3:
