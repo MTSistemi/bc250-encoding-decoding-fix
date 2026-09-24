@@ -342,6 +342,62 @@ static const int levelScale[6] = { 40, 45, 51, 57, 64, 72 };
 #define HEVC_BDSHIFT 5
 #define HEVC_FLAT_M  16
 
+/* Levels from forward-transform outputs, for every block size and depth:
+ *
+ *     level = floor((|v| << shift + offset) / step),  step = 16 * levelScale[q % 6] << (q / 6)
+ *
+ * with the offset round_q12 twelfths of the step, the sign put back, and
+ * the magnitude capped at 32767. The step is levelScale times a power of
+ * two, 2^p with p = q / 6 + 4, and floor(floor(x / 2^p) / d) is
+ * floor(x / (d * 2^p)); so the division is a shift, then one by d <= 72,
+ * done as a multiplication by m = ceil(2^32 / d) and a shift by 32. That
+ * is exact while x * (m * d - 2^32) < 2^32: x stays under 2^21 (|v| under
+ * 2^16, shifted up by at most 8 and down by at least 4, the offset under
+ * the step) and m * d - 2^32 is under d, so it is. Four at a time with SSE2's 32x32 -> 64 multiplication. `n` is a multiple of
+ * eight. */
+static void quant_levels(const int32_t *v, int n, int shift, int q, int round_q12, int16_t *out)
+{
+    const int p = q / 6 + 4;
+    const uint32_t d = (uint32_t)levelScale[q % 6];
+    const uint32_t offset = (uint32_t)(((uint64_t)d << p) * (uint64_t)round_q12 / 12);
+    const uint32_t m = (uint32_t)((((uint64_t)1 << 32) + d - 1) / d);
+#if defined(__SSE2__)
+    const __m128i vm = _mm_set1_epi32((int)m), voff = _mm_set1_epi32((int)offset);
+    const __m128i sh_in = _mm_cvtsi32_si128(shift), sh_p = _mm_cvtsi32_si128(p);
+    const __m128i odd = _mm_set_epi32(-1, 0, -1, 0);
+    for (int i = 0; i < n; i += 8) {
+        __m128i lv[2], sg[2];
+        for (int h = 0; h < 2; h++) {
+            const __m128i x = _mm_loadu_si128((const __m128i *)(v + i + 4 * h));
+            const __m128i s = _mm_srai_epi32(x, 31);
+            const __m128i mag = _mm_sub_epi32(_mm_xor_si128(x, s), s);
+            const __m128i t = _mm_srl_epi32(_mm_add_epi32(_mm_sll_epi32(mag, sh_in), voff), sh_p);
+            const __m128i pe = _mm_mul_epu32(t, vm);                       /* lanes 0, 2 */
+            const __m128i po = _mm_mul_epu32(_mm_srli_epi64(t, 32), vm);   /* lanes 1, 3 */
+            lv[h] = _mm_or_si128(_mm_srli_epi64(pe, 32), _mm_and_si128(po, odd));
+            sg[h] = s;
+        }
+        /* packs caps the (non-negative) levels at 32767; the sign goes back
+         * on in sixteen bits, where -32767 is the far end, as in the scalar
+         * code. */
+        const __m128i l16 = _mm_packs_epi32(lv[0], lv[1]);
+        const __m128i s16 = _mm_packs_epi32(sg[0], sg[1]);
+        const __m128i r = _mm_sub_epi16(_mm_xor_si128(l16, s16), s16);
+        if (n - i >= 8) _mm_storeu_si128((__m128i *)(out + i), r);
+        else            _mm_storel_epi64((__m128i *)(out + i), r);
+    }
+#else
+    for (int i = 0; i < n; i++) {
+        const int32_t x = v[i];
+        const uint32_t mag = (uint32_t)(x < 0 ? -(int64_t)x : x);
+        const uint32_t t = ((mag << shift) + offset) >> p;
+        uint32_t l = (uint32_t)(((uint64_t)t * m) >> 32);
+        if (l > 32767) l = 32767;
+        out[i] = (int16_t)(x < 0 ? -(int32_t)l : (int32_t)l);
+    }
+#endif
+}
+
 /* Precomputed exact reciprocal division factors for HEVC quantization (Rec. ITU-T H.265 8.6.3).
  * Replaces 16 64-bit hardware integer divisions per 4x4 block with a 1-cycle 64-bit multiply
  * and 40-bit right shift ((num + half_denom) * recip >> 40), verified 100% bit-exact across
@@ -462,23 +518,8 @@ void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst, i
     int32_t raw[16];
     forward_transform_4x4(residual, use_dst ? DST4 : DCT4, raw);
 
-    int clamped_qp = qp < 0 ? 0 : (qp > 51 ? 51 : qp);
-    uint64_t recip = g_hevc_quant_factors[clamped_qp].recip;
-    /* denom * round_q12 / 12. The reciprocal stays exact for any offset
-     * below the step: the numerator is under 2^21 either way. */
-    const uint64_t offset = (uint64_t)g_hevc_quant_factors[clamped_qp].half_denom * (uint64_t)round_q12 / 6;
-
-    for (int i = 0; i < 16; i++) {
-        int32_t coeff_raw = raw[i];
-        int sign = coeff_raw < 0 ? -1 : 1;
-        uint32_t mag = (uint32_t)(coeff_raw < 0 ? -coeff_raw : coeff_raw);
-        uint64_t num = (uint64_t)mag << HEVC_BDSHIFT;
-        int32_t level = (int32_t)(((num + offset) * recip) >> 40);
-        int32_t res = sign * level;
-        if (res > 32767) res = 32767;
-        if (res < -32768) res = -32768;
-        coeff_out[i] = (int16_t)res;
-    }
+    const int clamped_qp = qp < 0 ? 0 : (qp > 51 ? 51 : qp);
+    quant_levels(raw, 16, HEVC_BDSHIFT, clamped_qp, round_q12, coeff_out);
 }
 
 void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
@@ -527,24 +568,6 @@ void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
  * has to be right before it is fast.
  */
 #define HEVC_BDSHIFT_10 7
-
-/* floor((mag << shift + offset) / denom) without a division per
- * coefficient: one reciprocal per block, m = ceil(2^48 / denom), and a
- * 128-bit product. Exact, since the numerator stays below 2^27 and the
- * denominator below 2^21, and 48 >= 27 + 21. */
-static inline uint64_t quant_recip(uint64_t denom)
-{
-    return (((uint64_t)1 << 48) + denom - 1) / denom;
-}
-
-static inline int64_t quant_level(uint64_t num, uint64_t offset, uint64_t denom, uint64_t recip)
-{
-    uint64_t q = (uint64_t)(((unsigned __int128)(num + offset) * recip) >> 48);
-    /* The ceiling can put the product one over at an exact multiple's
-     * edge; one comparison puts it back. */
-    if (q * denom > num + offset) q--;
-    return (int64_t)q;
-}
 
 static void forward_transform_4x4_10(const int16_t residual[16], const int16_t M[4][4],
                                      int32_t out[16]) {
@@ -595,20 +618,10 @@ void hevc_transform_quant_4x4_10(const int16_t residual[16], int qp, int use_dst
     int32_t raw[16];
     forward_transform_4x4_10(residual, use_dst ? DST4 : DCT4, raw);
 
-    const int q = qp < 0 ? 0 : (qp > 63 ? 63 : qp);
     /* The algebraic inverse of the dequantizer below, with the caller's
-     * rounding - the eight-bit path's reciprocal table does the same
-     * division. */
-    const uint64_t denom = (uint64_t)(HEVC_FLAT_M * levelScale[q % 6]) << (q / 6);
-    const uint64_t recip = quant_recip(denom);
-    const uint64_t offset = denom * (uint64_t)round_q12 / 12;
-    for (int i = 0; i < 16; i++) {
-        const int32_t v = raw[i];
-        const uint64_t mag = (uint64_t)(v < 0 ? -(int64_t)v : v);
-        int64_t level = quant_level(mag << HEVC_BDSHIFT_10, offset, denom, recip);
-        if (level > 32767) level = 32767;
-        coeff_out[i] = (int16_t)(v < 0 ? -level : level);
-    }
+     * rounding. */
+    const int q = qp < 0 ? 0 : (qp > 63 ? 63 : qp);
+    quant_levels(raw, 16, HEVC_BDSHIFT_10, q, round_q12, coeff_out);
 }
 
 void hevc_dequant_itransform_4x4_10(const int16_t coeff[16], int qp, int use_dst,
@@ -684,6 +697,63 @@ static inline void dct8_inv(const int32_t *x, int s, int32_t y[8])
     }
 }
 
+/* The same two transforms with SSE2, eight int16 per register.
+ *
+ * One pass is a matrix product over the rows of the block: Y[i] = sum_r
+ * A[i][r] * X[r], each X[r] a row of eight samples. _mm_madd_epi16 takes
+ * two rows at a time, interleaved, against a pair of matrix entries, and
+ * leaves 32-bit sums; the rounding and the shift follow, and _mm_packs_epi32
+ * saturates to int16 exactly as clip_coeff() does. A transpose between the
+ * passes turns the second one into the same product.
+ *
+ * The forward transform keeps its intermediate in int16 here, where the
+ * scalar code keeps int32. It fits by construction - HM's shifts are chosen
+ * for that: a residual of at most 255 at eight bits, or 1023 at ten, gives
+ * at most 64 * 8 * 255 >> 2 = 32640, or 64 * 8 * 1023 >> 4 = 32736, after
+ * the first pass, and the second pass lands under 32768 too. So both give
+ * the same numbers, and the check in the commit that brought this in ran
+ * two million blocks through both. */
+#if defined(__SSE2__)
+static inline void mat8_rows(const int16_t A[8][8], int transposed, const __m128i X[8], int shift,
+                             __m128i Y[8])
+{
+    __m128i lo[4], hi[4];
+    for (int k = 0; k < 4; k++) {
+        lo[k] = _mm_unpacklo_epi16(X[2 * k], X[2 * k + 1]);
+        hi[k] = _mm_unpackhi_epi16(X[2 * k], X[2 * k + 1]);
+    }
+    const __m128i rnd = _mm_set1_epi32(1 << (shift - 1));
+    const __m128i sh = _mm_cvtsi32_si128(shift);
+    for (int i = 0; i < 8; i++) {
+        __m128i al = rnd, ah = rnd;
+        for (int k = 0; k < 4; k++) {
+            const int a0 = transposed ? A[2 * k][i] : A[i][2 * k];
+            const int a1 = transposed ? A[2 * k + 1][i] : A[i][2 * k + 1];
+            const __m128i c = _mm_set1_epi32((int)(uint16_t)a0 | (int)((uint32_t)(uint16_t)a1 << 16));
+            al = _mm_add_epi32(al, _mm_madd_epi16(lo[k], c));
+            ah = _mm_add_epi32(ah, _mm_madd_epi16(hi[k], c));
+        }
+        Y[i] = _mm_packs_epi32(_mm_sra_epi32(al, sh), _mm_sra_epi32(ah, sh));
+    }
+}
+
+static inline void transpose8(__m128i r[8])
+{
+    const __m128i a0 = _mm_unpacklo_epi16(r[0], r[1]), a1 = _mm_unpackhi_epi16(r[0], r[1]);
+    const __m128i a2 = _mm_unpacklo_epi16(r[2], r[3]), a3 = _mm_unpackhi_epi16(r[2], r[3]);
+    const __m128i a4 = _mm_unpacklo_epi16(r[4], r[5]), a5 = _mm_unpackhi_epi16(r[4], r[5]);
+    const __m128i a6 = _mm_unpacklo_epi16(r[6], r[7]), a7 = _mm_unpackhi_epi16(r[6], r[7]);
+    const __m128i b0 = _mm_unpacklo_epi32(a0, a2), b1 = _mm_unpackhi_epi32(a0, a2);
+    const __m128i b2 = _mm_unpacklo_epi32(a1, a3), b3 = _mm_unpackhi_epi32(a1, a3);
+    const __m128i b4 = _mm_unpacklo_epi32(a4, a6), b5 = _mm_unpackhi_epi32(a4, a6);
+    const __m128i b6 = _mm_unpacklo_epi32(a5, a7), b7 = _mm_unpackhi_epi32(a5, a7);
+    r[0] = _mm_unpacklo_epi64(b0, b4); r[1] = _mm_unpackhi_epi64(b0, b4);
+    r[2] = _mm_unpacklo_epi64(b1, b5); r[3] = _mm_unpackhi_epi64(b1, b5);
+    r[4] = _mm_unpacklo_epi64(b2, b6); r[5] = _mm_unpackhi_epi64(b2, b6);
+    r[6] = _mm_unpacklo_epi64(b3, b7); r[7] = _mm_unpackhi_epi64(b3, b7);
+}
+#endif
+
 /* The forward transform is the encoder's to choose. Its shifts are HM's
  * for 8x8 - log2(8) + BitDepth - 9 after the columns, 9 after the rows -
  * so that the quantizer below, the exact inverse of the dequantizer,
@@ -698,28 +768,33 @@ void hevc_transform_quant_8x8(const int16_t residual[64], int qp, int bit_depth,
         return;
     }
     const int s1 = 3 + bit_depth - 9, s2 = 9;
+    const int q = qp < 0 ? 0 : (qp > 63 ? 63 : qp);
+    int32_t v[64];
+#if defined(__SSE2__)
+    __m128i x[8], t[8];
+    for (int r = 0; r < 8; r++) x[r] = _mm_loadu_si128((const __m128i *)(residual + 8 * r));
+    mat8_rows(DCT8, 0, x, s1, t);   /* t[i][c]: column c, frequency i */
+    transpose8(t);
+    mat8_rows(DCT8, 0, t, s2, x);   /* x[j][i]: coefficient (i, j) */
+    transpose8(x);
+    for (int i = 0; i < 8; i++) {
+        _mm_storeu_si128((__m128i *)(v + 8 * i), _mm_srai_epi32(_mm_unpacklo_epi16(x[i], x[i]), 16));
+        _mm_storeu_si128((__m128i *)(v + 8 * i + 4), _mm_srai_epi32(_mm_unpackhi_epi16(x[i], x[i]), 16));
+    }
+#else
     int32_t tmp[8][8], in[64], col[8];
     for (int i = 0; i < 64; i++) in[i] = residual[i];
     for (int c = 0; c < 8; c++) {
         dct8_fwd(in + c, 8, col);
         for (int i = 0; i < 8; i++) tmp[i][c] = (col[i] + (1 << (s1 - 1))) >> s1;
     }
-    const int q = qp < 0 ? 0 : (qp > 63 ? 63 : qp);
-    const int bd_shift = bit_depth + 3 - 5;
-    const uint64_t denom = (uint64_t)(HEVC_FLAT_M * levelScale[q % 6]) << (q / 6);
-    const uint64_t recip = quant_recip(denom);
-    const uint64_t offset = denom * (uint64_t)round_q12 / 12;
     for (int i = 0; i < 8; i++) {
         int32_t row[8];
         dct8_fwd(tmp[i], 1, row);
-        for (int j = 0; j < 8; j++) {
-            const int32_t v = (row[j] + (1 << (s2 - 1))) >> s2;
-            const uint64_t mag = (uint64_t)(v < 0 ? -(int64_t)v : v);
-            int64_t level = quant_level(mag << bd_shift, offset, denom, recip);
-            if (level > 32767) level = 32767;
-            coeff_out[i * 8 + j] = (int16_t)(v < 0 ? -level : level);
-        }
+        for (int j = 0; j < 8; j++) v[i * 8 + j] = (row[j] + (1 << (s2 - 1))) >> s2;
     }
+#endif
+    quant_levels(v, 64, bit_depth + 3 - 5, q, round_q12, coeff_out);
 }
 
 /* The decoder's side, exactly: 8.6.2 scaling with the flat list, then
@@ -741,17 +816,27 @@ void hevc_dequant_itransform_8x8(const int16_t coeff[64], int qp, int bit_depth,
         int64_t v = ((int64_t)coeff[i] * scale + (1 << (bd_shift - 1))) >> bd_shift;
         d[i] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
     }
+    const int s2 = 20 - bit_depth;
+#if defined(__SSE2__)
+    __m128i x[8], g[8];
+    for (int k = 0; k < 8; k++) x[k] = _mm_loadu_si128((const __m128i *)(d + 8 * k));
+    mat8_rows(DCT8, 1, x, 7, g);    /* g[r][c], clipped as 8.6.4.2 wants */
+    transpose8(g);
+    mat8_rows(DCT8, 1, g, s2, x);   /* x[c][r] */
+    transpose8(x);
+    for (int r = 0; r < 8; r++) _mm_storeu_si128((__m128i *)(residual_out + 8 * r), x[r]);
+#else
     int32_t din[64], g[8][8], col[8];
     for (int i = 0; i < 64; i++) din[i] = d[i];
     for (int c = 0; c < 8; c++) {
         dct8_inv(din + c, 8, col);
         for (int r = 0; r < 8; r++) g[r][c] = clip_coeff((col[r] + 64) >> 7);
     }
-    const int s2 = 20 - bit_depth;
     for (int r = 0; r < 8; r++) {
         int32_t row[8];
         dct8_inv(g[r], 1, row);
         for (int c = 0; c < 8; c++)
             residual_out[r * 8 + c] = (int16_t)clip_coeff((row[c] + (1 << (s2 - 1))) >> s2);
     }
+#endif
 }

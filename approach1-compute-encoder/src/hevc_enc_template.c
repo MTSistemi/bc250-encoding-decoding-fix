@@ -557,16 +557,95 @@ static void FUNC(predict_cu)(const hevc_encoder_t *enc, int cu_x, int cu_y, hevc
     }
 }
 
+/* Rows of 4, 8 or 16 samples into sixteen-bit lanes. */
+#if defined(__SSE2__)
+static inline __m128i FUNC(load_row16)(const pixel *p, int w)
+{
+#if BIT_DEPTH == 8
+    if (w == 4) {
+        int32_t v;
+        memcpy(&v, p, 4);
+        return _mm_unpacklo_epi8(_mm_cvtsi32_si128(v), _mm_setzero_si128());
+    }
+    return _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)p), _mm_setzero_si128());
+#else
+    return w == 4 ? _mm_loadl_epi64((const __m128i *)p) : _mm_loadu_si128((const __m128i *)p);
+#endif
+}
+#endif
+
+/* Sum of squared differences, eight-bit units. With SSE2 the differences
+ * fit sixteen bits at either depth and PMADDWD squares and pairs them; a
+ * 16x16 block of ten-bit differences sums to under 2^31. */
 static inline int64_t FUNC(sse)(const pixel *a, uint32_t sa, const pixel *b, uint32_t sb,
                                 int w, int h)
 {
+#if defined(__SSE2__)
+    __m128i acc = _mm_setzero_si128();
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x += 8) {
+            const __m128i d = _mm_sub_epi16(FUNC(load_row16)(a + y * sa + x, w),
+                                            FUNC(load_row16)(b + y * sb + x, w));
+            acc = _mm_add_epi32(acc, _mm_madd_epi16(d, d));
+        }
+    acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(1, 0, 3, 2)));
+    acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(2, 3, 0, 1)));
+    const int64_t s = (uint32_t)_mm_cvtsi128_si32(acc);
+#else
     int64_t s = 0;
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++) {
             int d = (int)a[y * sa + x] - (int)b[y * sb + x];
-            s += d * d;
+            s += (int64_t)d * d;
         }
+#endif
     return s >> (2 * (BIT_DEPTH - 8));
+}
+
+/* res = src - pred over a `w` x `h` block (w 4 or 8), res `w` wide. */
+static inline void FUNC(sub_block)(const pixel *src, int ss, const pixel *pred, int ps,
+                                   int w, int h, int16_t *res)
+{
+    for (int y = 0; y < h; y++) {
+#if defined(__SSE2__)
+        const __m128i d = _mm_sub_epi16(FUNC(load_row16)(src + y * ss, w), FUNC(load_row16)(pred + y * ps, w));
+        if (w == 8) _mm_storeu_si128((__m128i *)(res + y * 8), d);
+        else        _mm_storel_epi64((__m128i *)(res + y * 4), d);
+#else
+        for (int x = 0; x < w; x++) res[y * w + x] = (int16_t)(src[y * ss + x] - pred[y * ps + x]);
+#endif
+    }
+}
+
+/* rec = clip(pred + r) over a `w` x `h` block (w 4 or 8), r `w` wide. The
+ * sixteen-bit sum saturates before the clip, which gives what the int sum
+ * gives even for a residual at the ends of its range. */
+static inline void FUNC(add_block)(const pixel *pred, int ps, const int16_t *r, int w, int h,
+                                   pixel *rec, int rs)
+{
+    for (int y = 0; y < h; y++) {
+#if defined(__SSE2__)
+        const __m128i rv = w == 8 ? _mm_loadu_si128((const __m128i *)(r + y * 8))
+                                  : _mm_loadl_epi64((const __m128i *)(r + y * 4));
+        const __m128i s = _mm_adds_epi16(FUNC(load_row16)(pred + y * ps, w), rv);
+#if BIT_DEPTH == 8
+        const __m128i o = _mm_packus_epi16(s, s);
+        if (w == 8) _mm_storel_epi64((__m128i *)(rec + y * rs), o);
+        else { const int32_t v = _mm_cvtsi128_si32(o); memcpy(rec + y * rs, &v, 4); }
+#else
+        const __m128i o = _mm_min_epi16(_mm_max_epi16(s, _mm_setzero_si128()), _mm_set1_epi16(PIXEL_MAX));
+        if (w == 8) _mm_storeu_si128((__m128i *)(rec + y * rs), o);
+        else        _mm_storel_epi64((__m128i *)(rec + y * rs), o);
+#endif
+#else
+        for (int x = 0; x < w; x++) rec[y * rs + x] = FUNC(clip_sample)(pred[y * ps + x] + r[y * w + x]);
+#endif
+    }
+}
+
+static inline void FUNC(copy_block)(const pixel *src, int ss, int w, int h, pixel *dst, int ds)
+{
+    for (int y = 0; y < h; y++) memcpy(dst + y * ds, src + y * ss, (size_t)w * sizeof(pixel));
 }
 
 /* An inter CU's residual, quantized, and what it reconstructs to. */
@@ -600,9 +679,7 @@ static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
     if (tu8) {
         /* One 8x8 transform over the whole CU. */
         int16_t res[64], rres[64];
-        for (int y = 0; y < 8; y++)
-            for (int x = 0; x < 8; x++)
-                res[y * 8 + x] = (int16_t)(src_y[y * cw + x] - py[y * 8 + x]);
+        FUNC(sub_block)(src_y, (int)cw, py, 8, 8, 8, res);
         hevc_transform_quant_8x8(res, qp + QP_BD_OFFSET, BIT_DEPTH, enc->quant_round_inter, r->coeff_y8);
         for (int i = 0; i < 64; i++) r->cbf_y8 |= r->coeff_y8[i] != 0;
         if (r->cbf_y8) {
@@ -614,29 +691,23 @@ static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
                 r->bits += coeff_bits(c16);
             }
         }
-        for (int i = 0; i < 64; i++)
-            r->rec_y[i] = r->cbf_y8 ? FUNC(clip_sample)(py[i] + rres[i]) : py[i];
+        if (r->cbf_y8) FUNC(add_block)(py, 8, rres, 8, 8, r->rec_y, 8);
+        else           memcpy(r->rec_y, py, 64 * sizeof(pixel));
     }
 
     /* Four 4x4 luma transforms, and inter luma takes the DCT, not the DST. */
     for (int pu = 0; !tu8 && pu < 4; pu++) {
         const int ox = pu_off_x[pu], oy = pu_off_y[pu];
         int16_t res[16], rres[16];
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                res[y * 4 + x] = (int16_t)(src_y[(oy + y) * cw + ox + x] - py[(oy + y) * 8 + ox + x]);
+        FUNC(sub_block)(src_y + oy * cw + ox, (int)cw, py + oy * 8 + ox, 8, 4, 4, res);
         FUNC(hevc_transform_quant_4x4)(res, qp + QP_BD_OFFSET, 0, enc->quant_round_inter, r->coeff_y[pu]);
         r->cbf_y[pu] = any_nonzero16(r->coeff_y[pu]);
         if (r->cbf_y[pu]) {
             FUNC(hevc_dequant_itransform_4x4)(r->coeff_y[pu], qp + QP_BD_OFFSET, 0, rres);
             r->bits += coeff_bits(r->coeff_y[pu]);
         }
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++) {
-                const int p = py[(oy + y) * 8 + ox + x];
-                r->rec_y[(oy + y) * 8 + ox + x] = r->cbf_y[pu]
-                    ? FUNC(clip_sample)(p + rres[y * 4 + x]) : (pixel)p;
-            }
+        if (r->cbf_y[pu]) FUNC(add_block)(py + oy * 8 + ox, 8, rres, 4, 4, r->rec_y + oy * 8 + ox, 8);
+        else              FUNC(copy_block)(py + oy * 8 + ox, 8, 4, 4, r->rec_y + oy * 8 + ox, 8);
     }
 
     const int cqp = hevc_chroma_qp_from_luma(qp) + QP_BD_OFFSET;
@@ -647,17 +718,15 @@ static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
     int *cf[2] = { &r->cbf_cb, &r->cbf_cr };
     for (int c = 0; c < 2; c++) {
         int16_t res[16], rres[16];
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                res[y * 4 + x] = (int16_t)(cs[c][y * ccw + x] - cp[c][y * 4 + x]);
+        FUNC(sub_block)(cs[c], (int)ccw, cp[c], 4, 4, 4, res);
         FUNC(hevc_transform_quant_4x4)(res, cqp, 0, enc->quant_round_inter, cc[c]);
         *cf[c] = any_nonzero16(cc[c]);
         if (*cf[c]) {
             FUNC(hevc_dequant_itransform_4x4)(cc[c], cqp, 0, rres);
             r->bits += coeff_bits(cc[c]);
         }
-        for (int i = 0; i < 16; i++)
-            cr[c][i] = *cf[c] ? FUNC(clip_sample)(cp[c][i] + rres[i]) : cp[c][i];
+        if (*cf[c]) FUNC(add_block)(cp[c], 4, rres, 4, 4, cr[c], 4);
+        else        memcpy(cr[c], cp[c], 16 * sizeof(pixel));
     }
 
     r->dist = FUNC(sse)(src_y, cw, r->rec_y, 8, 8, 8)
