@@ -150,6 +150,12 @@ static void FUNC(filter_luma)(pixel *base, int forward, int giu,
 static void FUNC(filter_chroma)(pixel *base, int forward, int giu, int tc,
                          bool keep_p, bool keep_q)
 {
+#if BIT_DEPTH == 8 && (defined(__x86_64__) || defined(_M_X64))
+    if (sao_vector()) {
+        filter_chroma_ssse3(base, forward, giu, tc, keep_p, keep_q);
+        return;
+    }
+#endif
     for (int i = 0; i < 4; i++) {
         pixel *p1 = base + i * giu - 2 * forward;
         pixel *p0 = base + i * giu - forward;
