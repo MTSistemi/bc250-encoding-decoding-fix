@@ -131,16 +131,13 @@ static int zorder_available(int nx, int ny, int width, int height, int is_luma,
 }
 
 /* Gathers left[0..4] (p[-1][0..4]), top[0..4] (p[0..4][-1]) and the corner
- * (p[-1][-1]), applying the spec's neighbor-substitution scan. Bottom-left
- * (p[-1][5..7], not needed since this encoder only supports Planar/DC/H/V,
- * none of which read past left[4]/top[4]) and positions beyond top[4] are
- * never referenced, so the scan below only covers what those four modes
- * actually need. "Below" and "below-left" are always z-scan-unavailable
- * in this encoder's coding order (nothing below the current row, at any
- * CTU/CU/PU nesting level, is ever decoded first), so those still don't
- * need a rank check - only left/top/corner/top-right do, since those CAN
- * be positionally-plausible but z-scan-unavailable (see zorder_rank()'s
- * comment above). */
+ * (p[-1][-1]), applying the spec's neighbor-substitution scan. p[-1][5..7]
+ * and positions beyond top[4] are never referenced by the four modes this
+ * encoder uses (Planar/DC/H/V), so the scan below only covers what those
+ * modes actually need. Every sample it does read gets a rank check, since
+ * each can be positionally plausible and still z-scan-unavailable (see
+ * zorder_rank()'s comment above) - p[-1][4] included, see the end of the
+ * function. */
 static void gather_neighbors(const uint8_t *plane, int stride, int width, int height,
                               int x0, int y0, int is_luma, int y_min,
                               uint8_t left[5], uint8_t top[5], uint8_t *corner,
@@ -191,20 +188,29 @@ static void gather_neighbors(const uint8_t *plane, int stride, int width, int he
     *corner = sv[4];
     top[0] = sv[5]; top[1] = sv[6]; top[2] = sv[7]; top[3] = sv[8];
     top[4] = sv[9];
-    /* p[-1][4] (bottom-left, one below left[3]): always z-scan-unavailable
-     * in this encoder's coding order (see zorder_rank()'s comment) -
-     * nearest previously-scanned available sample is left[3] itself
-     * (which already carries its own correct substituted value). This
-     * line was accidentally dropped in an earlier edit that reworked this
-     * function for z-scan availability, leaving left[4] reading
-     * uninitialized stack memory for every Planar-mode prediction (the
-     * only one of this encoder's 4 modes that reads it) - found by
-     * dumping this function's actual output for a block ffmpeg decoded
-     * differently from this encoder's own (internally-consistent, since
-     * it used the same garbage value on both the predict and later
-     * reconstruct call for a given block, but NOT consistent with a real
-     * decoder, which correctly derives left[4]=left[3]) reconstruction. */
-    left[4] = left[3];
+    /* p[-1][4], the first sample below the left column, which Planar reads
+     * and nothing else here does.
+     *
+     * ⚠️ It is NOT always unavailable. This said it was, and set it to
+     * left[3] unconditionally - which is right only when the block below
+     * left has not been coded yet. For a block on the left edge of a CTU
+     * that block sits in the CTU to the left, coded long before; for the
+     * first PU of a right-hand CU it is the last PU of the CU to its left.
+     * A decoder reads the real sample there, this encoder used another, and
+     * every Planar block in those places was reconstructed differently on
+     * the two sides - and everything predicted from it after that. Measured
+     * at 1280x720 through hevc_encoder_encode_raw(): the encoder's own
+     * reconstruction at 38-46 dB against the source, ffmpeg's decode of the
+     * same stream at 27-29 dB. Chroma, which only ever uses DC, was exact.
+     *
+     * Same rank test as the other neighbours. When it is not there,
+     * 8.4.4.2.2's substitution walks up from the bottom and fills it from
+     * the nearest sample above, which is left[3] - substituted itself if it
+     * had to be. */
+    if (zorder_available(x0 - 1, y0 + 4, width, height, is_luma, y_min, cur_rank))
+        left[4] = plane[(y0 + 4) * stride + (x0 - 1)];
+    else
+        left[4] = left[3];
 }
 
 /* ===================== prediction (8.4.4.2.5-8.4.4.2.7) ===================== */

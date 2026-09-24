@@ -314,9 +314,55 @@ static void test_hevc_governor(void) {
     printf("[test_hevc_encode] Governor's GPU-free path OK.\n");
 }
 
+/* Planar reads p[-1][4], the sample just below the left column, and a
+ * decoder takes it from the picture whenever the block it sits in has
+ * already been coded. The encoder used left[3] there every time, and its
+ * reconstruction parted from every decoder's.
+ *
+ * The expected values are Rec. ITU-T H.265 8.4.4.2.5 written out with the
+ * real neighbours, not derived from the encoder's own gathering. Two
+ * blocks: one whose bottom-left is in the CTU to its left (coded, so the
+ * real sample), and one whose bottom-left is the next PU of its own CU
+ * (not coded yet, so substituted from left[3]). */
+static void planar_expected(const uint8_t *pl, int stride, int x0, int y0,
+                            int left4, uint8_t out[16]) {
+    int left[4], top[5];
+    for (int i = 0; i < 4; i++) left[i] = pl[(y0 + i) * stride + x0 - 1];
+    for (int i = 0; i < 5; i++) top[i] = pl[(y0 - 1) * stride + x0 + i];
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++)
+            out[y * 4 + x] = (uint8_t)(((3 - x) * left[y] + (x + 1) * top[4] +
+                                        (3 - y) * top[x] + (y + 1) * left4 + 4) >> 3);
+}
+
+static void test_planar_bottom_left(void) {
+    printf("[test_hevc_encode] Planar's bottom-left reference sample...\n");
+    enum { W = 32, H = 32 };
+    uint8_t plane[W * H];
+    unsigned s = 1;
+    for (int i = 0; i < W * H; i++) {
+        s = s * 1103515245u + 12345u;
+        plane[i] = (uint8_t)(s >> 16);
+    }
+
+    /* (16,16): its bottom-left, (15,20), is in the CTU to the left. */
+    uint8_t got[16], want[16];
+    hevc_predict_4x4(plane, W, W, H, 16, 16, HEVC_MODE_PLANAR, 1, 0, got);
+    planar_expected(plane, W, 16, 16, plane[20 * W + 15], want);
+    assert(memcmp(got, want, 16) == 0 && "bottom-left in a coded CTU must be read");
+
+    /* (20,16): its bottom-left, (19,20), is PU 2 of its own CU. */
+    hevc_predict_4x4(plane, W, W, H, 20, 16, HEVC_MODE_PLANAR, 1, 0, got);
+    planar_expected(plane, W, 20, 16, plane[19 * W + 19], want);
+    assert(memcmp(got, want, 16) == 0 && "bottom-left not yet coded must be left[3]");
+
+    printf("[test_hevc_encode] Planar's bottom-left reference sample OK.\n");
+}
+
 int main(void) {
     test_transform_round_trip();
     test_mpm_derivation();
+    test_planar_bottom_left();
     test_multi_frame_gop();
     test_dynamic_qp_and_rate_control();
     test_hevc_governor();
