@@ -293,8 +293,9 @@ static void filter_luma_ssse3(uint8_t *base, int forward, int giu,
  *
  *   0. the vertical edges      - 8.7.2 filters all of them first,
  *   1. the horizontal edges    - and these read what stage 0 wrote,
- *   2. the copy SAO reads      - the whole deblocked picture,
- *   3. SAO                     - which reads the copy around each block.
+ *   2. what SAO reads across   - the deblocked rows and columns at the
+ *                                block borders,
+ *   3. SAO                     - which reads those around each block.
  *
  * Inside a stage the rows are independent (see one_direction() for why
  * the horizontal edges are), so the rows are simply handed out in order.
@@ -425,6 +426,9 @@ void hevcd_free_filters(hevcd_t *d)
     free(d->sao);
     d->sao = NULL;
     d->n_sao = 0;
-    for (int c = 0; c < 3; c++) { free(d->copy_of[c]); d->copy_of[c] = NULL; }
-    d->n_copy = 0;
+    for (int c = 0; c < 3; c++) {
+        free(d->sao_lines[c]);
+        d->sao_lines[c] = NULL;
+        d->n_sao_lines[c] = 0;
+    }
 }
