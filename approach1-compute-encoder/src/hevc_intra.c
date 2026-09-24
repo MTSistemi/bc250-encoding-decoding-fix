@@ -450,7 +450,7 @@ int hevc_chroma_qp_from_luma(int qp_luma) {
     return qpc_30_43[qpi - 30];
 }
 
-void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
+void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst, int round_q12,
                                int16_t coeff_out[16]) {
     /* Fast zero-residual bypass: if residual is all zero, output is all zero */
     const uint64_t *r64 = (const uint64_t *)residual;
@@ -464,14 +464,16 @@ void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
 
     int clamped_qp = qp < 0 ? 0 : (qp > 51 ? 51 : qp);
     uint64_t recip = g_hevc_quant_factors[clamped_qp].recip;
-    uint32_t half_denom = g_hevc_quant_factors[clamped_qp].half_denom;
+    /* denom * round_q12 / 12. The reciprocal stays exact for any offset
+     * below the step: the numerator is under 2^21 either way. */
+    const uint64_t offset = (uint64_t)g_hevc_quant_factors[clamped_qp].half_denom * (uint64_t)round_q12 / 6;
 
     for (int i = 0; i < 16; i++) {
         int32_t coeff_raw = raw[i];
         int sign = coeff_raw < 0 ? -1 : 1;
         uint32_t mag = (uint32_t)(coeff_raw < 0 ? -coeff_raw : coeff_raw);
         uint64_t num = (uint64_t)mag << HEVC_BDSHIFT;
-        int32_t level = (int32_t)(((num + half_denom) * recip) >> 40);
+        int32_t level = (int32_t)(((num + offset) * recip) >> 40);
         int32_t res = sign * level;
         if (res > 32767) res = 32767;
         if (res < -32768) res = -32768;
@@ -526,7 +528,7 @@ void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
  */
 #define HEVC_BDSHIFT_10 7
 
-/* floor((mag << shift + denom / 2) / denom) without a division per
+/* floor((mag << shift + offset) / denom) without a division per
  * coefficient: one reciprocal per block, m = ceil(2^48 / denom), and a
  * 128-bit product. Exact, since the numerator stays below 2^27 and the
  * denominator below 2^21, and 48 >= 27 + 21. */
@@ -535,12 +537,12 @@ static inline uint64_t quant_recip(uint64_t denom)
     return (((uint64_t)1 << 48) + denom - 1) / denom;
 }
 
-static inline int64_t quant_level(uint64_t num, uint64_t denom, uint64_t recip)
+static inline int64_t quant_level(uint64_t num, uint64_t offset, uint64_t denom, uint64_t recip)
 {
-    uint64_t q = (uint64_t)(((unsigned __int128)(num + denom / 2) * recip) >> 48);
+    uint64_t q = (uint64_t)(((unsigned __int128)(num + offset) * recip) >> 48);
     /* The ceiling can put the product one over at an exact multiple's
      * edge; one comparison puts it back. */
-    if (q * denom > num + denom / 2) q--;
+    if (q * denom > num + offset) q--;
     return (int64_t)q;
 }
 
@@ -582,7 +584,7 @@ static void inverse_transform_4x4_10(const int16_t coeff[16], const int16_t M[4]
     }
 }
 
-void hevc_transform_quant_4x4_10(const int16_t residual[16], int qp, int use_dst,
+void hevc_transform_quant_4x4_10(const int16_t residual[16], int qp, int use_dst, int round_q12,
                                   int16_t coeff_out[16]) {
     const uint64_t *r64 = (const uint64_t *)residual;
     if ((r64[0] | r64[1] | r64[2] | r64[3]) == 0ULL) {
@@ -594,14 +596,16 @@ void hevc_transform_quant_4x4_10(const int16_t residual[16], int qp, int use_dst
     forward_transform_4x4_10(residual, use_dst ? DST4 : DCT4, raw);
 
     const int q = qp < 0 ? 0 : (qp > 63 ? 63 : qp);
-    /* The algebraic inverse of the dequantizer below, rounded to nearest -
-     * the eight-bit path's reciprocal table does the same division. */
+    /* The algebraic inverse of the dequantizer below, with the caller's
+     * rounding - the eight-bit path's reciprocal table does the same
+     * division. */
     const uint64_t denom = (uint64_t)(HEVC_FLAT_M * levelScale[q % 6]) << (q / 6);
     const uint64_t recip = quant_recip(denom);
+    const uint64_t offset = denom * (uint64_t)round_q12 / 12;
     for (int i = 0; i < 16; i++) {
         const int32_t v = raw[i];
         const uint64_t mag = (uint64_t)(v < 0 ? -(int64_t)v : v);
-        int64_t level = quant_level(mag << HEVC_BDSHIFT_10, denom, recip);
+        int64_t level = quant_level(mag << HEVC_BDSHIFT_10, offset, denom, recip);
         if (level > 32767) level = 32767;
         coeff_out[i] = (int16_t)(v < 0 ? -level : level);
     }
@@ -685,7 +689,7 @@ static inline void dct8_inv(const int32_t *x, int s, int32_t y[8])
  * so that the quantizer below, the exact inverse of the dequantizer,
  * gives the same levels a residual would get at 4x4. `qp` is Qp', the
  * QP plus QpBdOffset. */
-void hevc_transform_quant_8x8(const int16_t residual[64], int qp, int bit_depth,
+void hevc_transform_quant_8x8(const int16_t residual[64], int qp, int bit_depth, int round_q12,
                                int16_t coeff_out[64]) {
     int any = 0;
     for (int i = 0; i < 64; i++) any |= residual[i];
@@ -704,13 +708,14 @@ void hevc_transform_quant_8x8(const int16_t residual[64], int qp, int bit_depth,
     const int bd_shift = bit_depth + 3 - 5;
     const uint64_t denom = (uint64_t)(HEVC_FLAT_M * levelScale[q % 6]) << (q / 6);
     const uint64_t recip = quant_recip(denom);
+    const uint64_t offset = denom * (uint64_t)round_q12 / 12;
     for (int i = 0; i < 8; i++) {
         int32_t row[8];
         dct8_fwd(tmp[i], 1, row);
         for (int j = 0; j < 8; j++) {
             const int32_t v = (row[j] + (1 << (s2 - 1))) >> s2;
             const uint64_t mag = (uint64_t)(v < 0 ? -(int64_t)v : v);
-            int64_t level = quant_level(mag << bd_shift, denom, recip);
+            int64_t level = quant_level(mag << bd_shift, offset, denom, recip);
             if (level > 32767) level = 32767;
             coeff_out[i * 8 + j] = (int16_t)(v < 0 ? -level : level);
         }

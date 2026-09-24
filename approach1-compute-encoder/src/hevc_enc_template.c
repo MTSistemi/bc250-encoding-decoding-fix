@@ -406,7 +406,8 @@ static void FUNC(intra_trial)(hevc_encoder_t *enc, int cu_x, int cu_y, int y_min
                 residual[y * 4 + x] = (int16_t)(src_y[(py + y) * cw + (px + x)] - pred[y * 4 + x]);
 
         int16_t coeff[16];
-        FUNC(hevc_transform_quant_4x4)(residual, qp + QP_BD_OFFSET, 1 /* DST for 4x4 luma intra */, coeff);
+        FUNC(hevc_transform_quant_4x4)(residual, qp + QP_BD_OFFSET, 1 /* DST for 4x4 luma intra */,
+                                       enc->quant_round_intra, coeff);
         memcpy(r->luma_coeff[pu], coeff, sizeof(coeff));
         r->cbf_luma[pu] = any_nonzero16(coeff);
 
@@ -441,8 +442,8 @@ static void FUNC(intra_trial)(hevc_encoder_t *enc, int cu_x, int cu_y, int y_min
      * Passing luma QP directly causes divergence from the standard when QP >= 30. */
     int cqp = hevc_chroma_qp_from_luma(qp) + QP_BD_OFFSET;
 
-    FUNC(hevc_transform_quant_4x4)(res_cb, cqp, 0, r->coeff_cb);
-    FUNC(hevc_transform_quant_4x4)(res_cr, cqp, 0, r->coeff_cr);
+    FUNC(hevc_transform_quant_4x4)(res_cb, cqp, 0, enc->quant_round_intra, r->coeff_cb);
+    FUNC(hevc_transform_quant_4x4)(res_cr, cqp, 0, enc->quant_round_intra, r->coeff_cr);
     r->cbf_cb = any_nonzero16(r->coeff_cb);
     r->cbf_cr = any_nonzero16(r->coeff_cr);
 
@@ -602,7 +603,7 @@ static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
         for (int y = 0; y < 8; y++)
             for (int x = 0; x < 8; x++)
                 res[y * 8 + x] = (int16_t)(src_y[y * cw + x] - py[y * 8 + x]);
-        hevc_transform_quant_8x8(res, qp + QP_BD_OFFSET, BIT_DEPTH, r->coeff_y8);
+        hevc_transform_quant_8x8(res, qp + QP_BD_OFFSET, BIT_DEPTH, enc->quant_round_inter, r->coeff_y8);
         for (int i = 0; i < 64; i++) r->cbf_y8 |= r->coeff_y8[i] != 0;
         if (r->cbf_y8) {
             hevc_dequant_itransform_8x8(r->coeff_y8, qp + QP_BD_OFFSET, BIT_DEPTH, rres);
@@ -624,7 +625,7 @@ static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
         for (int y = 0; y < 4; y++)
             for (int x = 0; x < 4; x++)
                 res[y * 4 + x] = (int16_t)(src_y[(oy + y) * cw + ox + x] - py[(oy + y) * 8 + ox + x]);
-        FUNC(hevc_transform_quant_4x4)(res, qp + QP_BD_OFFSET, 0, r->coeff_y[pu]);
+        FUNC(hevc_transform_quant_4x4)(res, qp + QP_BD_OFFSET, 0, enc->quant_round_inter, r->coeff_y[pu]);
         r->cbf_y[pu] = any_nonzero16(r->coeff_y[pu]);
         if (r->cbf_y[pu]) {
             FUNC(hevc_dequant_itransform_4x4)(r->coeff_y[pu], qp + QP_BD_OFFSET, 0, rres);
@@ -649,7 +650,7 @@ static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
         for (int y = 0; y < 4; y++)
             for (int x = 0; x < 4; x++)
                 res[y * 4 + x] = (int16_t)(cs[c][y * ccw + x] - cp[c][y * 4 + x]);
-        FUNC(hevc_transform_quant_4x4)(res, cqp, 0, cc[c]);
+        FUNC(hevc_transform_quant_4x4)(res, cqp, 0, enc->quant_round_inter, cc[c]);
         *cf[c] = any_nonzero16(cc[c]);
         if (*cf[c]) {
             FUNC(hevc_dequant_itransform_4x4)(cc[c], cqp, 0, rres);
