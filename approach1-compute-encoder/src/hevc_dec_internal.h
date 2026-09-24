@@ -327,7 +327,35 @@ void hevcd_add(uint8_t *plane, int stride, int x, int y,
 int hevcd_prepare_zscan(hevcd_t *d);
 int hevcd_prepare_tiles(hevcd_t *d);
 void hevcd_free_tiles(hevcd_t *d);
-int hevcd_tile_at(const hevcd_t *d, int x, int y);
-int hevcd_slice_at(const hevcd_t *d, int x, int y);
+
+/* Which tile covers the unit at these LUMA coordinates. Used by the
+ * availability rule and by the loop filters, both of which think in
+ * samples rather than in unit addresses.
+ *
+ * ⚠️ Here and inline, with hevcd_slice_at(): the deblocking filter asks
+ * both for every four-sample edge segment, and as calls into another file
+ * the asking cost more than the lookups. */
+static inline int hevcd_tile_at(const hevcd_t *d, int x, int y)
+{
+    /* The common case by far, and worth one branch: with a single tile
+     * every answer is zero and the two map lookups are waste. */
+    if (d->n_tiles <= 1 || !d->tile_of_ts) return 0;
+    const hevc_sps_t *sps = d->sps;
+    const int rs = (y >> sps->log2_ctb) * sps->ctb_width + (x >> sps->log2_ctb);
+    if (rs < 0 || rs >= sps->ctb_count) return 0;
+    return d->tile_of_ts[d->rs_to_ts[rs]];
+}
+
+/* Which slice covers the unit at these LUMA coordinates, or -1 when
+ * none has yet. Same shape as hevcd_tile_at() and asked in the same
+ * places. */
+static inline int hevcd_slice_at(const hevcd_t *d, int x, int y)
+{
+    if (!d->slice_of_ctb) return 0;
+    const hevc_sps_t *sps = d->sps;
+    const int rs = (y >> sps->log2_ctb) * sps->ctb_width + (x >> sps->log2_ctb);
+    if (rs < 0 || rs >= sps->ctb_count) return -1;
+    return d->slice_of_ctb[rs];
+}
 
 #endif /* BC250_HEVC_DEC_INTERNAL_H */
