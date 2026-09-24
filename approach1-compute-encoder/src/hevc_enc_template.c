@@ -578,6 +578,33 @@ static inline __m128i FUNC(load_row16)(const pixel *p, int w)
 /* Sum of squared differences, eight-bit units. With SSE2 the differences
  * fit sixteen bits at either depth and PMADDWD squares and pairs them; a
  * 16x16 block of ten-bit differences sums to under 2^31. */
+/* The whole CTU's prediction for its 16x16 skip, when there is one. */
+typedef struct {
+    const pixel *y, *cb, *cr;
+    hevc_mv_t mv;
+} FUNC(pred16_t);
+
+/* predict_cu(), unless the CTU's 16x16 prediction was made with the same
+ * vector: then the CU's is a quarter of it, since every sample is
+ * interpolated from the same reference samples, clamped at the picture's
+ * edges the same way, whatever the size of the block around it. */
+static void FUNC(predict_cu_or_reuse)(const hevc_encoder_t *enc, int cu_x, int cu_y, hevc_mv_t mv,
+                                      const FUNC(pred16_t) *p16,
+                                      pixel py[64], pixel pcb[16], pixel pcr[16])
+{
+    if (p16 && p16->mv.x == mv.x && p16->mv.y == mv.y) {
+        const int ox = cu_x & (HEVC_CTU_SIZE - 1), oy = cu_y & (HEVC_CTU_SIZE - 1);
+        for (int y = 0; y < 8; y++)
+            memcpy(py + y * 8, p16->y + (oy + y) * 16 + ox, 8 * sizeof(pixel));
+        for (int y = 0; y < 4; y++) {
+            memcpy(pcb + y * 4, p16->cb + (oy / 2 + y) * 8 + ox / 2, 4 * sizeof(pixel));
+            memcpy(pcr + y * 4, p16->cr + (oy / 2 + y) * 8 + ox / 2, 4 * sizeof(pixel));
+        }
+        return;
+    }
+    FUNC(predict_cu)(enc, cu_x, cu_y, mv, py, pcb, pcr);
+}
+
 static inline int64_t FUNC(sse)(const pixel *a, uint32_t sa, const pixel *b, uint32_t sb,
                                 int w, int h)
 {
@@ -660,19 +687,19 @@ typedef struct {
     pixel rec_y[64], rec_cb[16], rec_cr[16];
     int64_t dist;        /* squared error against the source, eight-bit units */
     int bits;            /* coefficients, roughly */
+    int64_t dist_y, dist_c;   /* the same, luma and chroma apart */
+    int bits_y, bits_c;
 } FUNC(inter_res_t);
 
-static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
-                                 const pixel py[64], const pixel pcb[16], const pixel pcr[16],
-                                 int tu8, FUNC(inter_res_t) *r)
+/* The luma of an inter CU's residual: four 4x4 transforms, or one 8x8.
+ * Leaves dist_y and bits_y. */
+static void FUNC(inter_residual_luma)(const hevc_encoder_t *enc, int cu_x, int cu_y,
+                                      const pixel py[64], int tu8, FUNC(inter_res_t) *r)
 {
     const int qp = enc->qp;
-    const uint32_t cw = enc->coded_width, ccw = cw / 2;
+    const uint32_t cw = enc->coded_width;
     const pixel *src_y = (const pixel *)enc->src_y + (size_t)cu_y * cw + cu_x;
-    const int cx = cu_x / 2, cy = cu_y / 2;
-    const pixel *src_cb = (const pixel *)enc->src_cb + (size_t)cy * ccw + cx;
-    const pixel *src_cr = (const pixel *)enc->src_cr + (size_t)cy * ccw + cx;
-    r->bits = 0;
+    r->bits_y = 0;
     r->tu8 = tu8;
     r->cbf_y8 = 0;
     memset(r->cbf_y, 0, sizeof(r->cbf_y));
@@ -689,7 +716,7 @@ static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
                 int16_t c16[16];
                 for (int k = 0; k < 16; k++)
                     c16[k] = r->coeff_y8[((q >> 1) * 4 + (k >> 2)) * 8 + (q & 1) * 4 + (k & 3)];
-                r->bits += coeff_bits(c16);
+                r->bits_y += coeff_bits(c16);
             }
         }
         if (r->cbf_y8) FUNC(add_block)(py, 8, rres, 8, 8, r->rec_y, 8);
@@ -705,12 +732,25 @@ static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
         r->cbf_y[pu] = any_nonzero16(r->coeff_y[pu]);
         if (r->cbf_y[pu]) {
             FUNC(hevc_dequant_itransform_4x4)(r->coeff_y[pu], qp + QP_BD_OFFSET, 0, rres);
-            r->bits += coeff_bits(r->coeff_y[pu]);
+            r->bits_y += coeff_bits(r->coeff_y[pu]);
         }
         if (r->cbf_y[pu]) FUNC(add_block)(py + oy * 8 + ox, 8, rres, 4, 4, r->rec_y + oy * 8 + ox, 8);
         else              FUNC(copy_block)(py + oy * 8 + ox, 8, 4, 4, r->rec_y + oy * 8 + ox, 8);
     }
+    r->dist_y = FUNC(sse)(src_y, cw, r->rec_y, 8, 8, 8);
+}
 
+/* Its chroma: the same whatever the luma's transform size, so it is worked
+ * out once per prediction. Leaves dist_c and bits_c. */
+static void FUNC(inter_residual_chroma)(const hevc_encoder_t *enc, int cu_x, int cu_y,
+                                        const pixel pcb[16], const pixel pcr[16], FUNC(inter_res_t) *r)
+{
+    const int qp = enc->qp;
+    const uint32_t ccw = enc->coded_width / 2;
+    const int cx = cu_x / 2, cy = cu_y / 2;
+    const pixel *src_cb = (const pixel *)enc->src_cb + (size_t)cy * ccw + cx;
+    const pixel *src_cr = (const pixel *)enc->src_cr + (size_t)cy * ccw + cx;
+    r->bits_c = 0;
     const int cqp = hevc_chroma_qp_from_luma(qp) + QP_BD_OFFSET;
     const pixel *cs[2] = { src_cb, src_cr };
     const pixel *cp[2] = { pcb, pcr };
@@ -724,15 +764,41 @@ static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
         *cf[c] = any_nonzero16(cc[c]);
         if (*cf[c]) {
             FUNC(hevc_dequant_itransform_4x4)(cc[c], cqp, 0, rres);
-            r->bits += coeff_bits(cc[c]);
+            r->bits_c += coeff_bits(cc[c]);
         }
         if (*cf[c]) FUNC(add_block)(cp[c], 4, rres, 4, 4, cr[c], 4);
         else        memcpy(cr[c], cp[c], 16 * sizeof(pixel));
     }
 
-    r->dist = FUNC(sse)(src_y, cw, r->rec_y, 8, 8, 8)
-            + FUNC(sse)(src_cb, ccw, r->rec_cb, 4, 4, 4)
-            + FUNC(sse)(src_cr, ccw, r->rec_cr, 4, 4, 4);
+    r->dist_c = FUNC(sse)(src_cb, ccw, r->rec_cb, 4, 4, 4)
+              + FUNC(sse)(src_cr, ccw, r->rec_cr, 4, 4, 4);
+}
+
+/* The residual of a prediction: its chroma, and its luma at whichever
+ * transform size costs less by distortion and rough bits. The chroma adds
+ * the same to both sides of that comparison, so it is left out of it and
+ * computed once - the choice is the one comparing the whole CU made. */
+static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
+                                 const pixel py[64], const pixel pcb[16], const pixel pcr[16],
+                                 FUNC(inter_res_t) *r)
+{
+    FUNC(inter_residual_chroma)(enc, cu_x, cu_y, pcb, pcr, r);
+    FUNC(inter_residual_luma)(enc, cu_x, cu_y, py, 0, r);
+    if (enc->tu8) {
+        FUNC(inter_res_t) r8;
+        FUNC(inter_residual_luma)(enc, cu_x, cu_y, py, 1, &r8);
+        if (r8.dist_y * 256 + enc->lambda_sse_q8 * r8.bits_y < r->dist_y * 256 + enc->lambda_sse_q8 * r->bits_y) {
+            r->tu8 = 1;
+            r->cbf_y8 = r8.cbf_y8;
+            memset(r->cbf_y, 0, sizeof(r->cbf_y));
+            memcpy(r->coeff_y8, r8.coeff_y8, sizeof(r->coeff_y8));
+            memcpy(r->rec_y, r8.rec_y, sizeof(r->rec_y));
+            r->dist_y = r8.dist_y;
+            r->bits_y = r8.bits_y;
+        }
+    }
+    r->dist = r->dist_y + r->dist_c;
+    r->bits = r->bits_y + r->bits_c;
 }
 
 static inline int FUNC(inter_any_cbf)(const FUNC(inter_res_t) *r)
@@ -985,7 +1051,7 @@ static int64_t FUNC(pred_dist)(const hevc_encoder_t *enc, int cu_x, int cu_y,
  * bits are counted by running its syntax through `chain`, which then moves
  * on with the contexts the chosen one leaves. */
 static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, int cu_y, int y_min,
-                            FUNC(cu_decision_t) *d, uint32_t *sad_out)
+                            const FUNC(pred16_t) *p16, FUNC(cu_decision_t) *d, uint32_t *sad_out)
 {
     const int cux = cu_x / HEVC_CU_SIZE, cuy = cu_y / HEVC_CU_SIZE;
     const int lsad = enc->lambda_sad_q8;
@@ -1028,7 +1094,7 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
 
     /* Skip: the prediction alone, whatever the residual would have been. */
     pixel py[64], pcb[16], pcr[16];
-    FUNC(predict_cu)(enc, cu_x, cu_y, cand[best_merge], py, pcb, pcr);
+    FUNC(predict_cu_or_reuse)(enc, cu_x, cu_y, cand[best_merge], p16, py, pcb, pcr);
     cd.merge_idx = best_merge;
     memcpy(cd.res.rec_y, py, sizeof(py));
     memcpy(cd.res.rec_cb, pcb, sizeof(pcb));
@@ -1038,13 +1104,7 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
     /* Merge with its residual - unless there is none, which is the skip -
      * as four 4x4 transforms and as one 8x8. */
     {
-        FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, 0, &cd.res);
-        if (enc->tu8) {
-            FUNC(inter_res_t) r8;
-            FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, 1, &r8);
-            if (r8.dist * 256 + enc->lambda_sse_q8 * r8.bits < cd.res.dist * 256 + enc->lambda_sse_q8 * cd.res.bits)
-                cd.res = r8;
-        }
+        FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, &cd.res);
         if (FUNC(inter_any_cbf)(&cd.res))
             TRY(CU_MERGE, cd.res.dist, cand[best_merge]);
         else if (enc->early_skip)
@@ -1079,19 +1139,13 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
     const hevc_mv_t mv = FUNC(motion_search)(enc, cu_x, cu_y, mvp, starts, n_starts,
                                              lsad, &mvp_idx, &me_cost, &me_sad);
     if (mv.x != cand[best_merge].x || mv.y != cand[best_merge].y) {
-        FUNC(predict_cu)(enc, cu_x, cu_y, mv, py, pcb, pcr);
+        FUNC(predict_cu_or_reuse)(enc, cu_x, cu_y, mv, p16, py, pcb, pcr);
         cd.mvp_idx = mvp_idx;
         cd.mvd.x = (int16_t)(mv.x - mvp[mvp_idx].x);
         cd.mvd.y = (int16_t)(mv.y - mvp[mvp_idx].y);
         bool coded = false;
         {
-            FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, 0, &cd.res);
-            if (enc->tu8) {
-                FUNC(inter_res_t) r8;
-                FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, 1, &r8);
-                if (r8.dist * 256 + enc->lambda_sse_q8 * r8.bits < cd.res.dist * 256 + enc->lambda_sse_q8 * cd.res.bits)
-                    cd.res = r8;
-            }
+            FUNC(inter_residual)(enc, cu_x, cu_y, py, pcb, pcr, &cd.res);
             coded = FUNC(inter_any_cbf)(&cd.res) != 0;
             TRY(CU_AMVP, cd.res.dist, mv);
         }
@@ -1233,8 +1287,10 @@ static void FUNC(encode_ctu)(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col
     if (j16 >= floor_split) {
         /* Each CU decided against the contexts the ones before it leave. */
         j_split = (enc->lambda_sse_q8 * (int64_t)split_bits) >> 15;
+        const FUNC(pred16_t) p16 = { py16, pcb16, pcr16, mv16 };
         for (int i = 0; i < 4; i++) {
-            FUNC(decide_cu)(enc, &chain, ctu_x + cu_off_x[i], ctu_y + cu_off_y[i], y_min, &d[i], &sad8);
+            FUNC(decide_cu)(enc, &chain, ctu_x + cu_off_x[i], ctu_y + cu_off_y[i], y_min,
+                            enc->cu16 ? &p16 : NULL, &d[i], &sad8);
             j_split += d[i].j;
         }
     }
