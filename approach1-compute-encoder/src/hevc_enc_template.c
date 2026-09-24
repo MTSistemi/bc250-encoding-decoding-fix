@@ -194,6 +194,165 @@ static inline uint32_t FUNC(compute_sad_4x4_chroma)(const pixel *src_cb,
 
 #endif /* BIT_DEPTH */
 
+/* ------------------------------------------------ search-only half planes */
+
+/* The previous picture's luma at whole samples and at the three half-sample
+ * phases (right, below, both), each with a margin of HPEL_MARGIN samples of
+ * repeated edge, rebuilt once per P picture.
+ *
+ * ⚠️ For the motion SEARCH only. A quarter sample is approximated as the
+ * average of the two nearest points of this half-sample grid, which is how
+ * H.264 defines it and not how HEVC does - HEVC filters each quarter phase
+ * with its own taps. That is fine for choosing a vector: the prediction that
+ * goes into the picture is always built by hevc_mc_uni(), the decoder's own
+ * interpolation, from the vector chosen. Interpolating every candidate the
+ * exact way was a quarter of the encoder's time. */
+static void FUNC(build_hpel)(hevc_encoder_t *enc)
+{
+    const int w = (int)enc->coded_width, h = (int)enc->coded_height;
+    const int M = HPEL_MARGIN, ps = enc->hpel_stride;
+    const pixel *ref = enc->prev_recon_y;
+    static const int f[8] = { -1, 4, -11, 40, 40, -11, 4, -1 };
+    pixel *I = (pixel *)enc->hpel[0], *H = (pixel *)enc->hpel[1];
+    pixel *V = (pixel *)enc->hpel[2], *HV = (pixel *)enc->hpel[3];
+    int32_t *T = enc->hpel_tmp;   /* horizontal sums, rows -M-3 .. h+M+3 */
+    const int rows = h + 2 * M, cols = w + 2 * M;
+
+#define CLAMPX(xx) ((xx) < 0 ? 0 : ((xx) >= w ? w - 1 : (xx)))
+#define CLAMPY(yy) ((yy) < 0 ? 0 : ((yy) >= h ? h - 1 : (yy)))
+    /* Pass 1: the horizontal filter, unrounded, for every row pass 2 needs. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows + 7; r++) {
+        const pixel *row = ref + (size_t)CLAMPY(r - M - 3) * w;
+        int32_t *o = T + (size_t)r * ps;
+        for (int c = 0; c < cols; c++) {
+            const int x = c - M;
+            int s = 0;
+            if (x >= 3 && x + 4 < w) {
+                const pixel *q = row + x - 3;
+                for (int k = 0; k < 8; k++) s += f[k] * q[k];
+            } else {
+                for (int k = 0; k < 8; k++) s += f[k] * row[CLAMPX(x - 3 + k)];
+            }
+            o[c] = s;
+        }
+    }
+    /* Pass 2: whole, right half, lower half, both. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows; r++) {
+        const int y = r - M;
+        const pixel *rows8[8];
+        for (int k = 0; k < 8; k++) rows8[k] = ref + (size_t)CLAMPY(y - 3 + k) * w;
+        const int32_t *t8 = T + (size_t)r * ps;   /* row r of T is picture row y - 3 */
+        for (int c = 0; c < cols; c++) {
+            const int x = CLAMPX(c - M);
+            I[(size_t)r * ps + c] = rows8[3][x];
+            H[(size_t)r * ps + c] = FUNC(clip_sample)((t8[(size_t)3 * ps + c] + 32) >> 6);
+            int v = 0, hv = 0;
+            for (int k = 0; k < 8; k++) {
+                v += f[k] * rows8[k][x];
+                hv += f[k] * t8[(size_t)k * ps + c];
+            }
+            V[(size_t)r * ps + c] = FUNC(clip_sample)((v + 32) >> 6);
+            HV[(size_t)r * ps + c] = FUNC(clip_sample)((hv + 2048) >> 12);
+        }
+    }
+#undef CLAMPX
+#undef CLAMPY
+}
+
+/* 8x8 SAD between the source and a block of a half plane, and between the
+ * source and the average of two such blocks - both in the plane's own
+ * sample units. */
+static inline uint32_t FUNC(sad8_ptr)(const pixel *a, int sa, const pixel *b, int sb)
+{
+#if BIT_DEPTH == 8 && (defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64))
+    __m128i acc = _mm_setzero_si128();
+    for (int y = 0; y < 8; y += 2) {
+        __m128i x0 = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)(a + y * sa)),
+                                        _mm_loadl_epi64((const __m128i *)(a + (y + 1) * sa)));
+        __m128i y0 = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)(b + y * sb)),
+                                        _mm_loadl_epi64((const __m128i *)(b + (y + 1) * sb)));
+        acc = _mm_add_epi32(acc, _mm_sad_epu8(x0, y0));
+    }
+    return (uint32_t)(_mm_cvtsi128_si32(acc) + _mm_extract_epi16(acc, 4));
+#else
+    uint32_t s = 0;
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x++) {
+            int d = (int)a[y * sa + x] - (int)b[y * sb + x];
+            s += (uint32_t)(d < 0 ? -d : d);
+        }
+    return s;
+#endif
+}
+
+static inline uint32_t FUNC(sad8_avg)(const pixel *a, int sa, const pixel *b, const pixel *c, int sbc)
+{
+#if BIT_DEPTH == 8 && (defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64))
+    __m128i acc = _mm_setzero_si128();
+    for (int y = 0; y < 8; y += 2) {
+        __m128i x0 = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)(a + y * sa)),
+                                        _mm_loadl_epi64((const __m128i *)(a + (y + 1) * sa)));
+        __m128i b0 = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)(b + y * sbc)),
+                                        _mm_loadl_epi64((const __m128i *)(b + (y + 1) * sbc)));
+        __m128i c0 = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)(c + y * sbc)),
+                                        _mm_loadl_epi64((const __m128i *)(c + (y + 1) * sbc)));
+        acc = _mm_add_epi32(acc, _mm_sad_epu8(x0, _mm_avg_epu8(b0, c0)));
+    }
+    return (uint32_t)(_mm_cvtsi128_si32(acc) + _mm_extract_epi16(acc, 4));
+#else
+    uint32_t s = 0;
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x++) {
+            int p = ((int)b[y * sbc + x] + (int)c[y * sbc + x] + 1) >> 1;
+            int d = (int)a[y * sa + x] - p;
+            s += (uint32_t)(d < 0 ? -d : d);
+        }
+    return s;
+#endif
+}
+
+/* The half-grid block whose top-left sample sits at quarter position
+ * (qx, qy) with both fractions even: plane by phase, offset by margin. */
+static inline const pixel *FUNC(hpel_block)(const hevc_encoder_t *enc, int qx, int qy)
+{
+    const int phase = ((qx & 2) ? 1 : 0) + ((qy & 2) ? 2 : 0);
+    const int x = (qx >> 2) + HPEL_MARGIN, y = (qy >> 2) + HPEL_MARGIN;
+    return (const pixel *)enc->hpel[phase] + (size_t)y * enc->hpel_stride + x;
+}
+
+/* The approximate search SAD of the CU at quarter position (qx, qy) of the
+ * previous picture, eight-bit units. Positions beyond the margin are
+ * clamped: the search never needs them, a far merge candidate might. */
+static uint32_t FUNC(search_sad)(const hevc_encoder_t *enc, const pixel *src, int qx, int qy)
+{
+    const int lo = -(HPEL_MARGIN - 2) * 4;
+    const int hx = ((int)enc->coded_width - 8 + HPEL_MARGIN - 2) * 4;
+    const int hy = ((int)enc->coded_height - 8 + HPEL_MARGIN - 2) * 4;
+    qx = qx < lo ? lo : (qx > hx ? hx : qx);
+    qy = qy < lo ? lo : (qy > hy ? hy : qy);
+    const int ss = (int)enc->coded_width, ps = enc->hpel_stride;
+    uint32_t s;
+    if (!(qx & 1) && !(qy & 1)) {
+        s = FUNC(sad8_ptr)(src, ss, FUNC(hpel_block)(enc, qx, qy), ps);
+    } else if ((qx & 1) && (qy & 1)) {
+        s = FUNC(sad8_avg)(src, ss, FUNC(hpel_block)(enc, qx - 1, qy - 1),
+                           FUNC(hpel_block)(enc, qx + 1, qy + 1), ps);
+    } else if (qx & 1) {
+        s = FUNC(sad8_avg)(src, ss, FUNC(hpel_block)(enc, qx - 1, qy),
+                           FUNC(hpel_block)(enc, qx + 1, qy), ps);
+    } else {
+        s = FUNC(sad8_avg)(src, ss, FUNC(hpel_block)(enc, qx, qy - 1),
+                           FUNC(hpel_block)(enc, qx, qy + 1), ps);
+    }
+    return s >> (BIT_DEPTH - 8);
+}
+
 /* ---------------------------------------------------------------- intra */
 
 /* An intra CU as it was decided and reconstructed: the four luma modes, the
@@ -388,19 +547,6 @@ static void FUNC(predict_cu)(const hevc_encoder_t *enc, int cu_x, int cu_y, hevc
     }
 }
 
-/* Sum of absolute differences between the source CU and an 8x8 prediction,
- * in eight-bit units. */
-static inline uint32_t FUNC(sad8x8_pred)(const pixel *src, uint32_t stride, const pixel *pred)
-{
-    uint32_t sad = 0;
-    for (int y = 0; y < 8; y++)
-        for (int x = 0; x < 8; x++) {
-            int d = (int)src[y * stride + x] - (int)pred[y * 8 + x];
-            sad += (uint32_t)(d < 0 ? -d : d);
-        }
-    return sad >> (BIT_DEPTH - 8);
-}
-
 static inline int64_t FUNC(sse)(const pixel *a, uint32_t sa, const pixel *b, uint32_t sb,
                                 int w, int h)
 {
@@ -501,35 +647,40 @@ static inline uint32_t FUNC(sad_int)(const hevc_encoder_t *enc, int cu_x, int cu
  * Every starting point - both AMVP predictors, the merge candidates, zero,
  * the GPU's vector for the CTU - is tried at the nearest whole sample; the
  * best is walked downhill one sample at a time, then refined to half and to
- * quarter samples with the decoder's own interpolation. The cost is the SAD
- * plus lambda times the bits of the vector difference from the cheaper of
- * the two predictors. Returns the vector; `*mvp_idx` and `*cost_q8` say
- * which predictor and at what cost. */
+ * quarter samples. All of it on the search planes of build_hpel(). The cost
+ * is the SAD plus lambda times the bits of the vector difference from the
+ * cheaper of the two predictors. Returns the vector; `*mvp_idx`, `*cost_q8`
+ * and `*sad` say which predictor, at what cost, with what SAD. */
 static hevc_mv_t FUNC(motion_search)(const hevc_encoder_t *enc, int cu_x, int cu_y,
                                      const hevc_mv_t mvp[2], const hevc_mv_t *starts, int n_starts,
-                                     int lambda_q8, int *mvp_idx, int64_t *cost_q8)
+                                     int lambda_q8, int *mvp_idx, int64_t *cost_q8, uint32_t *sad_out)
 {
     const int cw = (int)enc->coded_width, ch = (int)enc->coded_height;
-    const int min_dx = -cu_x, max_dx = cw - 8 - cu_x;
-    const int min_dy = -cu_y, max_dy = ch - 8 - cu_y;
+    /* Up to eight samples past the picture: the search planes have a margin. */
+    const int min_dx = -cu_x - 8, max_dx = cw - cu_x;
+    const int min_dy = -cu_y - 8, max_dy = ch - cu_y;
     const int range = 64;
+    const pixel *src = (const pixel *)enc->src_y + (size_t)cu_y * enc->coded_width + cu_x;
+    const int qx0 = cu_x * 4, qy0 = cu_y * 4;
 
 #define MV_BITS(qx, qy) ({ \
         int b0_ = mvd_bits((qx) - mvp[0].x) + mvd_bits((qy) - mvp[0].y); \
         int b1_ = mvd_bits((qx) - mvp[1].x) + mvd_bits((qy) - mvp[1].y); \
         b0_ <= b1_ ? b0_ : b1_; })
+#define COST(qx, qy, sad) ((int64_t)(sad) * 256 + (int64_t)lambda_q8 * MV_BITS(qx, qy))
 
     int bx = 0, by = 0;
     int64_t best = INT64_MAX;
+    uint32_t best_sad = 0;
     for (int i = 0; i < n_starts; i++) {
         int dx = (starts[i].x + 2) >> 2, dy = (starts[i].y + 2) >> 2;
         if (dx < min_dx) dx = min_dx;
         if (dx > max_dx) dx = max_dx;
         if (dy < min_dy) dy = min_dy;
         if (dy > max_dy) dy = max_dy;
-        const int64_t c = (int64_t)FUNC(sad_int)(enc, cu_x, cu_y, dx, dy) * 256
-                        + (int64_t)lambda_q8 * MV_BITS(dx * 4, dy * 4);
-        if (c < best) { best = c; bx = dx; by = dy; }
+        const uint32_t s = FUNC(search_sad)(enc, src, qx0 + dx * 4, qy0 + dy * 4);
+        const int64_t c = COST(dx * 4, dy * 4, s);
+        if (c < best) { best = c; best_sad = s; bx = dx; by = dy; }
     }
 
     /* Downhill, one sample at a time, within the search range. */
@@ -541,9 +692,9 @@ static hevc_mv_t FUNC(motion_search)(const hevc_encoder_t *enc, int cu_x, int cu
             const int dx = bx + ddx[k], dy = by + ddy[k];
             if (dx < min_dx || dx > max_dx || dy < min_dy || dy > max_dy) continue;
             if (dx < cx0 - range || dx > cx0 + range || dy < cy0 - range || dy > cy0 + range) continue;
-            const int64_t c = (int64_t)FUNC(sad_int)(enc, cu_x, cu_y, dx, dy) * 256
-                            + (int64_t)lambda_q8 * MV_BITS(dx * 4, dy * 4);
-            if (c < best) { best = c; nbx = dx; nby = dy; }
+            const uint32_t s = FUNC(search_sad)(enc, src, qx0 + dx * 4, qy0 + dy * 4);
+            const int64_t c = COST(dx * 4, dy * 4, s);
+            if (c < best) { best = c; best_sad = s; nbx = dx; nby = dy; }
         }
         if (nbx == bx && nby == by) break;
         bx = nbx;
@@ -551,19 +702,16 @@ static hevc_mv_t FUNC(motion_search)(const hevc_encoder_t *enc, int cu_x, int cu
     }
 
     /* Half, then quarter samples around the best so far. */
-    const pixel *src = (const pixel *)enc->src_y + (size_t)cu_y * enc->coded_width + cu_x;
     hevc_mv_t m = { (int16_t)(bx * 4), (int16_t)(by * 4) };
     for (int s = 2; s >= 1; s >>= 1) {
-        hevc_mv_t c0 = m;
+        const hevc_mv_t c0 = m;
         for (int k = 0; k < 8; k++) {
             static const int ox[8] = { -1, 0, 1, -1, 1, -1, 0, 1 };
             static const int oy[8] = { -1, -1, -1, 0, 0, 1, 1, 1 };
-            hevc_mv_t t = { (int16_t)(c0.x + ox[k] * s), (int16_t)(c0.y + oy[k] * s) };
-            pixel pred[64];
-            FUNC(predict_cu)(enc, cu_x, cu_y, t, pred, NULL, NULL);
-            const int64_t c = (int64_t)FUNC(sad8x8_pred)(src, enc->coded_width, pred) * 256
-                            + (int64_t)lambda_q8 * MV_BITS(t.x, t.y);
-            if (c < best) { best = c; m = t; }
+            const int tx = c0.x + ox[k] * s, ty = c0.y + oy[k] * s;
+            const uint32_t sd = FUNC(search_sad)(enc, src, qx0 + tx, qy0 + ty);
+            const int64_t c = COST(tx, ty, sd);
+            if (c < best) { best = c; best_sad = sd; m.x = (int16_t)tx; m.y = (int16_t)ty; }
         }
     }
 
@@ -571,6 +719,8 @@ static hevc_mv_t FUNC(motion_search)(const hevc_encoder_t *enc, int cu_x, int cu
     const int b1 = mvd_bits(m.x - mvp[1].x) + mvd_bits(m.y - mvp[1].y);
     *mvp_idx = b1 < b0 ? 1 : 0;
     *cost_q8 = best;
+    *sad_out = best_sad;
+#undef COST
 #undef MV_BITS
     return m;
 }
@@ -644,8 +794,8 @@ static void FUNC(encode_cu)(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, in
         for (int p = 0; p < i; p++)
             if (cand[p].x == cand[i].x && cand[p].y == cand[i].y) { dup = true; break; }
         if (dup) continue;
-        FUNC(predict_cu)(enc, cu_x, cu_y, cand[i], pred_y, NULL, NULL);
-        const int64_t c = (int64_t)FUNC(sad8x8_pred)(src, enc->coded_width, pred_y) * 256
+        const int64_t c = (int64_t)FUNC(search_sad)(enc, src, cu_x * 4 + cand[i].x,
+                                                    cu_y * 4 + cand[i].y) * 256
                         + (int64_t)lsad * (i + 1);
         if (c < best_merge_cost) { best_merge_cost = c; best_merge = i; }
     }
@@ -692,8 +842,9 @@ static void FUNC(encode_cu)(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, in
     }
     int mvp_idx = 0;
     int64_t me_cost;
+    uint32_t me_sad;
     const hevc_mv_t mv = FUNC(motion_search)(enc, cu_x, cu_y, mvp, starts, n_starts,
-                                             lsad, &mvp_idx, &me_cost);
+                                             lsad, &mvp_idx, &me_cost, &me_sad);
     FUNC(inter_res_t) amvp_res;
     int64_t j_amvp = INT64_MAX;
     const bool same_as_merge = mv.x == cand[best_merge].x && mv.y == cand[best_merge].y;
@@ -706,7 +857,11 @@ static void FUNC(encode_cu)(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, in
                + lsse * (4 + mvbits + 1 + 1 + (FUNC(inter_any_cbf)(&amvp_res) ? 6 : 0) + amvp_res.bits);
     }
 
-    /* 4. Intra, tried for real: it has to be reconstructed to be judged. */
+    /* 4. Intra, tried for real: it has to be reconstructed to be judged.
+     * ⚠️ Every time. Skipping it when the motion search looked good enough
+     * - better than a flat block, or than an 8x8 intra guess - saved 7 to
+     * 15% of the time and cost 4 to 16% more bits on ducks_take_off, where
+     * the water is exactly what 4x4 intra wins. */
     FUNC(intra_trial)(enc, cu_x, cu_y, y_min, &intra);
     int intra_bits = 3 + 4 * 4 + 1 + 6;
     for (int pu = 0; pu < 4; pu++) intra_bits += intra.cbf_luma[pu] ? coeff_bits(intra.luma_coeff[pu]) : 0;

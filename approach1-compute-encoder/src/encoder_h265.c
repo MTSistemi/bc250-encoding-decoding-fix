@@ -98,6 +98,8 @@
 #define HEVC_CTU_SIZE 16
 #define HEVC_CU_SIZE   8
 #define HEVC_PU_SIZE   4
+/* Samples of repeated edge around the search planes - see build_hpel(). */
+#define HPEL_MARGIN   16
 
 /* ============================================================================
  * Level selection (Annex A.3 MaxLumaPs table, picture-size-only heuristic -
@@ -381,6 +383,12 @@ struct hevc_encoder {
     int8_t *luma_mode_map;
     uint32_t mode_map_stride;
 
+    /* The previous picture's luma at whole and half samples, for the
+     * motion search only - see build_hpel() in hevc_enc_template.c. */
+    void *hpel[4];
+    int32_t *hpel_tmp;
+    int hpel_stride;
+
     /* This frame's Lagrange multipliers - see lambda_sse_q8(). */
     int64_t lambda_sse_q8;
     int lambda_sad_q8;
@@ -535,6 +543,12 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
     enc->mode_map_stride = enc->coded_width / HEVC_PU_SIZE;
     enc->luma_mode_map = malloc((size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE));
 
+    enc->hpel_stride = (int)enc->coded_width + 2 * HPEL_MARGIN;
+    {
+        const size_t rows = enc->coded_height + 2 * HPEL_MARGIN;
+        for (int i = 0; i < 4; i++) enc->hpel[i] = malloc((size_t)enc->hpel_stride * rows * bps);
+        enc->hpel_tmp = malloc((size_t)enc->hpel_stride * (rows + 7) * sizeof(int32_t));
+    }
     enc->dl_y = malloc((size_t)width * height * bps);
     enc->dl_uv = malloc((size_t)(width / 2) * (height / 2) * 2 * bps);
 
@@ -580,7 +594,8 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
         !enc->prev_recon_y || !enc->prev_recon_cb || !enc->prev_recon_cr ||
         !enc->cu_skip_map || !enc->cu_is_inter || !enc->mv_x_map || !enc->mv_y_map ||
         !enc->luma_mode_map || !enc->dl_y || !enc->dl_uv ||
-        !enc->slice_rbsp || !enc->scratch_out || !enc->gpu_mvs) {
+        !enc->slice_rbsp || !enc->scratch_out || !enc->gpu_mvs ||
+        !enc->hpel[0] || !enc->hpel[1] || !enc->hpel[2] || !enc->hpel[3] || !enc->hpel_tmp) {
         hevc_encoder_destroy(enc);
         return NULL;
     }
@@ -747,6 +762,8 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
     free(encoder->slice_rbsp);
     free(encoder->scratch_out);
     free(encoder->gpu_mvs);
+    for (int i = 0; i < 4; i++) free(encoder->hpel[i]);
+    free(encoder->hpel_tmp);
     free(encoder);
 }
 
@@ -1141,6 +1158,11 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
      * accumulator, so nothing is shared while a slice is being encoded. That
      * is what lets the loop be handed to OpenMP.
      */
+    if (!is_idr && encoder->has_ref) {
+        if (ten_bit) build_hpel_10(encoder);
+        else         build_hpel_8(encoder);
+    }
+
     const int ns = encoder->num_slices;
     const uint32_t ctu_rows = encoder->height_ctu;
     uint32_t bit_address = 0;
