@@ -72,11 +72,13 @@
 #include "bitstream.h"
 #include "hevc_cabac.h"
 #include "hevc_intra.h"
+#include "hevc_inter.h"
 #include "dynamic_governor.h"
 #include "cpu_simd_me.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <immintrin.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -379,9 +381,10 @@ struct hevc_encoder {
     int8_t *luma_mode_map;
     uint32_t mode_map_stride;
 
-    /* BC250_HEVC_SKIP_THRESHOLD, read once when the encoder is made:
-     * -1 when unset. */
-    int skip_override;
+    /* This frame's Lagrange multipliers - see lambda_sse_q8(). */
+    int64_t lambda_sse_q8;
+    int lambda_sad_q8;
+
 
     /* Raw NV12 download scratch, real width x height - P010 at ten bits,
      * so two bytes a sample. */
@@ -436,10 +439,6 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
     enc->ctx_width = width;
     enc->ctx_height = height;
     enc->bit_depth = bit_depth;
-    {
-        const char *env = getenv("BC250_HEVC_SKIP_THRESHOLD");
-        enc->skip_override = env ? atoi(env) : -1;
-    }
     enc->width = width;
     enc->height = height;
     enc->fps = fps ? fps : 30;
@@ -941,6 +940,109 @@ static void deinterleava_uv(uint8_t *cb, uint8_t *cr, const uint8_t *uv, size_t 
     for (size_t i = 0; i < n; i++) { cb[i] = uv[2 * i]; cr[i] = uv[2 * i + 1]; }
 }
 
+/* ============================================================================
+ * Inter prediction: what does not depend on the sample depth
+ * ==========================================================================*/
+
+/* Whether the CU at (nb_cux, nb_cuy) is there to lend its motion: coded
+ * already, in this slice, and inter. 6.4.2 counts an intra neighbour as
+ * unavailable for motion. */
+static inline bool motion_available(const hevc_encoder_t *enc, int cuy_min,
+                                    int cux, int cuy, int nb_cux, int nb_cuy)
+{
+    if (!hevc_cu_is_available(enc->width_ctu, enc->height_ctu, cux, cuy,
+                              nb_cux, nb_cuy, cuy_min))
+        return false;
+    return enc->cu_is_inter[(uint32_t)nb_cuy * enc->width_ctu * 2 + (uint32_t)nb_cux] != 0;
+}
+
+static inline hevc_mv_t motion_at(const hevc_encoder_t *enc, int cux, int cuy)
+{
+    const uint32_t i = (uint32_t)cuy * enc->width_ctu * 2 + (uint32_t)cux;
+    hevc_mv_t m = { enc->mv_x_map[i], enc->mv_y_map[i] };
+    return m;
+}
+
+/* 8.5.3.2.6 and 8.5.3.2.7 for this encoder's only prediction unit shape, an
+ * 8x8 2Nx2N CU, with one reference picture and no temporal candidate.
+ *
+ * With every neighbour pointing at the same picture, the spec's second,
+ * scaled pass over each group finds exactly what the first one found, so
+ * it reduces to this: A is the first of A0, A1 with motion; B the first of
+ * B0, B1, B2. When neither A0 nor A1 is even there (isScaledFlag 0), A
+ * takes B's vector and B is looked for again - the same one - so the list
+ * collapses to B alone. A duplicate is dropped, and zeros fill the list to
+ * two. */
+static void derive_amvp_candidates(int cuy_min, const hevc_encoder_t *enc,
+                                   int cux, int cuy, hevc_mv_t out[2])
+{
+    const bool a0 = motion_available(enc, cuy_min, cux, cuy, cux - 1, cuy + 1);
+    const bool a1 = motion_available(enc, cuy_min, cux, cuy, cux - 1, cuy);
+    bool has_a = false, has_b = false;
+    hevc_mv_t mv_a = { 0, 0 }, mv_b = { 0, 0 };
+    if (a0)      { has_a = true; mv_a = motion_at(enc, cux - 1, cuy + 1); }
+    else if (a1) { has_a = true; mv_a = motion_at(enc, cux - 1, cuy); }
+
+    static const int bx[3] = { 1, 0, -1 };
+    for (int k = 0; k < 3 && !has_b; k++) {
+        if (motion_available(enc, cuy_min, cux, cuy, cux + bx[k], cuy - 1)) {
+            has_b = true;
+            mv_b = motion_at(enc, cux + bx[k], cuy - 1);
+        }
+    }
+    if (!a0 && !a1) {
+        /* isScaledFlag 0: A takes B, and B found again is B. */
+        has_a = has_b;
+        mv_a = mv_b;
+    }
+
+    int n = 0;
+    if (has_a) out[n++] = mv_a;
+    if (has_b && !(has_a && mv_a.x == mv_b.x && mv_a.y == mv_b.y)) out[n++] = mv_b;
+    while (n < 2) { out[n].x = 0; out[n].y = 0; n++; }
+}
+
+/* Rough bit counts, for choosing between candidates, not for the rate
+ * control. One motion vector component in quarter samples, as mvd_coding()
+ * spends it: greater0, greater1, an order-1 Exp-Golomb remainder, a sign. */
+static inline int mvd_bits(int d)
+{
+    const unsigned a = (unsigned)(d < 0 ? -d : d);
+    if (a == 0) return 1;
+    if (a == 1) return 3;
+    return 3 + 2 * (31 - __builtin_clz((a - 2) / 2 + 1)) + 2;
+}
+
+/* Bits a quantized 4x4 block costs, roughly: where the last coefficient
+ * is, a significance flag up to it, and per coefficient a sign and its
+ * size. */
+static int coeff_bits(const int16_t c[16])
+{
+    int last = -1, bits = 0;
+    for (int i = 15; i >= 0; i--) if (c[i]) { last = i; break; }
+    if (last < 0) return 0;
+    bits = 4 + last;
+    for (int i = 0; i <= last; i++) {
+        const int a = c[i] < 0 ? -c[i] : c[i];
+        if (a) bits += 2 + (a > 1 ? 1 + 2 * (31 - __builtin_clz((unsigned)a)) : 0);
+    }
+    return bits;
+}
+
+/* The Lagrange multipliers for this frame's QP: for sums of squared errors
+ * (0.57 * 2^((QP-12)/3), HM's value for P pictures) and for sums of absolute
+ * differences, its square root. Eight-bit units: the ten-bit path scales
+ * its distortions down before comparing. Fixed point, eight fraction bits. */
+static inline int64_t lambda_sse_q8(int qp)
+{
+    return (int64_t)(0.57 * pow(2.0, (qp - 12) / 3.0) * 256.0 + 0.5);
+}
+
+static inline int lambda_sad_q8(int qp)
+{
+    return (int)(sqrt(0.57 * pow(2.0, (qp - 12) / 3.0)) * 256.0 + 0.5);
+}
+
 /* Everything that touches samples, once per bit depth. */
 #define BIT_DEPTH 8
 #include "hevc_pixel.h"
@@ -1003,6 +1105,8 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
         }
     }
     encoder->last_frame_sad = 0;
+    encoder->lambda_sse_q8 = lambda_sse_q8(encoder->qp);
+    encoder->lambda_sad_q8 = lambda_sad_q8(encoder->qp);
 
     const bool ten_bit = encoder->bit_depth > 8;
     if (ten_bit) load_source_10(encoder);
