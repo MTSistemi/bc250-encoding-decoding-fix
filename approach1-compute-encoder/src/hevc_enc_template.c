@@ -212,55 +212,64 @@ static void FUNC(build_hpel)(hevc_encoder_t *enc)
     const int w = (int)enc->coded_width, h = (int)enc->coded_height;
     const int M = HPEL_MARGIN, ps = enc->hpel_stride;
     const pixel *ref = enc->prev_recon_y;
-    static const int f[8] = { -1, 4, -11, 40, 40, -11, 4, -1 };
     pixel *I = (pixel *)enc->hpel[0], *H = (pixel *)enc->hpel[1];
     pixel *V = (pixel *)enc->hpel[2], *HV = (pixel *)enc->hpel[3];
-    int32_t *T = enc->hpel_tmp;   /* horizontal sums, rows -M-3 .. h+M+3 */
+    int32_t *T = enc->hpel_tmp;   /* horizontal sums, picture rows -M-3 .. h+M+3 */
     const int rows = h + 2 * M, cols = w + 2 * M;
 
 #define CLAMPX(xx) ((xx) < 0 ? 0 : ((xx) >= w ? w - 1 : (xx)))
 #define CLAMPY(yy) ((yy) < 0 ? 0 : ((yy) >= h ? h - 1 : (yy)))
-    /* Pass 1: the horizontal filter, unrounded, for every row pass 2 needs. */
+/* The half-sample filter, 8.5.3.3.3.1, taps -1 4 -11 40 40 -11 4 -1. */
+#define TAPS(p, s) (-(p)[0] + 4 * (p)[(s)] - 11 * (p)[2 * (s)] + 40 * (p)[3 * (s)] \
+                    + 40 * (p)[4 * (s)] - 11 * (p)[5 * (s)] + 4 * (p)[6 * (s)] - (p)[7 * (s)])
+
+    /* Pass 1: every source row, edge-extended by M + 4 samples on each side,
+     * then the horizontal filter over it - one clean loop the compiler can
+     * vectorize, instead of a clamp per tap. */
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
     for (int r = 0; r < rows + 7; r++) {
         const pixel *row = ref + (size_t)CLAMPY(r - M - 3) * w;
+        pixel ext[w + 2 * M + 8];
+        for (int i = 0; i < M + 3; i++) ext[i] = row[0];
+        memcpy(ext + M + 3, row, (size_t)w * sizeof(pixel));
+        for (int i = M + 3 + w; i < w + 2 * M + 8; i++) ext[i] = row[w - 1];
         int32_t *o = T + (size_t)r * ps;
-        for (int c = 0; c < cols; c++) {
-            const int x = c - M;
-            int s = 0;
-            if (x >= 3 && x + 4 < w) {
-                const pixel *q = row + x - 3;
-                for (int k = 0; k < 8; k++) s += f[k] * q[k];
-            } else {
-                for (int k = 0; k < 8; k++) s += f[k] * row[CLAMPX(x - 3 + k)];
-            }
-            o[c] = s;
-        }
+        /* ext[c] is picture column c - M - 3: the taps for output column c
+         * start there. */
+        for (int c = 0; c < cols; c++) o[c] = TAPS(ext + c, 1);
     }
+
     /* Pass 2: whole, right half, lower half, both. */
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
     for (int r = 0; r < rows; r++) {
         const int y = r - M;
-        const pixel *rows8[8];
-        for (int k = 0; k < 8; k++) rows8[k] = ref + (size_t)CLAMPY(y - 3 + k) * w;
         const int32_t *t8 = T + (size_t)r * ps;   /* row r of T is picture row y - 3 */
+        pixel *Ir = I + (size_t)r * ps, *Hr = H + (size_t)r * ps;
+        pixel *Vr = V + (size_t)r * ps, *HVr = HV + (size_t)r * ps;
+        /* The eight source rows the vertical filter reads, edge-extended the
+         * same way. */
+        pixel ext[8][w + 2 * M];
+        for (int k = 0; k < 8; k++) {
+            const pixel *row = ref + (size_t)CLAMPY(y - 3 + k) * w;
+            for (int i = 0; i < M; i++) ext[k][i] = row[0];
+            memcpy(ext[k] + M, row, (size_t)w * sizeof(pixel));
+            for (int i = M + w; i < w + 2 * M; i++) ext[k][i] = row[w - 1];
+        }
         for (int c = 0; c < cols; c++) {
-            const int x = CLAMPX(c - M);
-            I[(size_t)r * ps + c] = rows8[3][x];
-            H[(size_t)r * ps + c] = FUNC(clip_sample)((t8[(size_t)3 * ps + c] + 32) >> 6);
-            int v = 0, hv = 0;
-            for (int k = 0; k < 8; k++) {
-                v += f[k] * rows8[k][x];
-                hv += f[k] * t8[(size_t)k * ps + c];
-            }
-            V[(size_t)r * ps + c] = FUNC(clip_sample)((v + 32) >> 6);
-            HV[(size_t)r * ps + c] = FUNC(clip_sample)((hv + 2048) >> 12);
+            Ir[c] = ext[3][c];
+            Hr[c] = FUNC(clip_sample)((t8[(size_t)3 * ps + c] + 32) >> 6);
+            const int v = -ext[0][c] + 4 * ext[1][c] - 11 * ext[2][c] + 40 * ext[3][c]
+                        + 40 * ext[4][c] - 11 * ext[5][c] + 4 * ext[6][c] - ext[7][c];
+            Vr[c] = FUNC(clip_sample)((v + 32) >> 6);
+            const int hv = TAPS(t8 + c, ps);
+            HVr[c] = FUNC(clip_sample)((hv + 2048) >> 12);
         }
     }
+#undef TAPS
 #undef CLAMPX
 #undef CLAMPY
 }
