@@ -625,6 +625,8 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
     const bool tiles = pps->tiles_enabled;
     int progress = 0;
     int substream = 0;      /* how many substream boundaries have passed */
+    /* Asked once, not once per unit: getenv walks the whole environment. */
+    const bool trace = getenv("HEVC_TRACE") != NULL;
 
     /* ⚠️ Tile scan. Without tiles the map is the identity and this is the
      * raster walk it always was. */
@@ -646,10 +648,10 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
          * When a slice does not land, this says where it stopped being
          * right - a unit that consumed implausibly little is where to
          * look, not the one that ran out of data. */
-        if (getenv("HEVC_TRACE")) {
+        if (trace) {
             const long n_read = (long)((d->cabac.ptr - d->cabac.start) * 8
                                       - d->cabac.cache_bits);
-            fprintf(stderr, "ctu ts %d rs %d (%d,%d): %ld bit su %ld" "\n",
+            fprintf(stderr, "ctu ts %d rs %d (%d,%d): %ld bits of %ld" "\n",
                     ts, addr, x, y, n_read, (long)(n - first) * 8);
         }
         if (hevcd_overrun(&d->cabac)) return 3;

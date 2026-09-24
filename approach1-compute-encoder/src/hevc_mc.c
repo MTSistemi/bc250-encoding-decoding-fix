@@ -411,6 +411,29 @@ static void two_weighted_v(uint8_t *dst, int stride, int w, int h,
     }
 }
 
+/* Two whole-sample predictions averaged. _mm_avg_epu8 is (a + b + 1) >> 1,
+ * which is exactly what 8.5.3.3.4.2 gives two samples taken up to fourteen
+ * bits, added, and brought back down with its rounding. */
+static void average_v(uint8_t *dst, int stride, const uint8_t *a, int sa,
+                      const uint8_t *b, int sb, int w, int h)
+{
+    for (int r = 0; r < h; r++) {
+        const uint8_t *pa = a + (size_t)r * sa;
+        const uint8_t *pb = b + (size_t)r * sb;
+        uint8_t *o = dst + (size_t)r * stride;
+        int c = 0;
+        for (; c + 16 <= w; c += 16)
+            _mm_storeu_si128((__m128i *)(o + c),
+                _mm_avg_epu8(_mm_loadu_si128((const __m128i *)(pa + c)),
+                             _mm_loadu_si128((const __m128i *)(pb + c))));
+        for (; c + 8 <= w; c += 8)
+            _mm_storel_epi64((__m128i *)(o + c),
+                _mm_avg_epu8(_mm_loadl_epi64((const __m128i *)(pa + c)),
+                             _mm_loadl_epi64((const __m128i *)(pb + c))));
+        for (; c < w; c++) o[c] = (uint8_t)((pa[c] + pb[c] + 1) >> 1);
+    }
+}
+
 #endif /* x86-64 */
 
 /* ⚠️ The vector paths are eight bit only. They pack to unsigned bytes,
