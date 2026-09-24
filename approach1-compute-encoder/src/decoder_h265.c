@@ -149,7 +149,10 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
     }
     if (!g->plane[0] || !g->plane[1] || !g->plane[2] || !g->mvf) return -1;
 
-    memset(g->mvf, 0, n_mvf * sizeof *g->mvf);
+    /* ⚠️ The motion field is not cleared here any more but one coding tree
+     * block at a time, as each is decoded - see hevcd_clear_ctb_motion().
+     * Cleared here it was ten megabytes of memset on one thread before
+     * every 4K picture, the largest part of what opening a picture cost. */
     g->stride[0] = w;
     g->stride[1] = g->stride[2] = w / 2;
     g->poc = poc;
@@ -873,6 +876,17 @@ int hevc_decoder_slice(hevc_decoder_t *h, const hevc_slice_t *sl,
 void hevc_decoder_end_picture(hevc_decoder_t *h)
 {
     if (!h->is_open || !h->d.current) return;
+    /* ⚠️ Units no slice reached - a slice lost or refused - were never
+     * cleared, and their motion field still holds whatever picture used
+     * this buffer before. A later picture reads it as its collocated
+     * motion, so it is cleared now. */
+    if (h->d.slice_of_ctb && h->d.mvf) {
+        const hevc_sps_t *sps = h->d.sps;
+        for (int rs = 0; rs < sps->ctb_count; rs++)
+            if (h->d.slice_of_ctb[rs] < 0)
+                hevcd_clear_ctb_motion(&h->d, rs % sps->ctb_width,
+                                       rs / sps->ctb_width);
+    }
     /* ⚠️ Before the filters or after makes no difference to them, but
      * it has to happen while the map is still this picture's: the next
      * begin_picture() clears it. */

@@ -298,6 +298,10 @@ typedef struct {
  * non-zero when the slice cannot go on. */
 int hevcd_read_ctu(hevcd_t *d, int x0, int y0);
 
+/* Clears one coding tree block's entries in the motion field. Done as each
+ * block is decoded, not for the whole picture up front. */
+void hevcd_clear_ctb_motion(hevcd_t *d, int rx, int ry);
+
 /* Several coding tree block rows at once, when the stream was written to
  * allow it. Returns the same reasons as the serial walk, or -1 when this
  * slice is not one it can split up. */
