@@ -782,17 +782,16 @@ static void reconstruct_tb(hevcd_t *d, int c_idx, int x, int y,
           : log2_size == 3 ? d->sf8[mat]
           : log2_size == 4 ? d->sf16[mat] : d->sf32[mat];
     }
-    if (m)
-        hevcd_dequantize_scaled(d->coeff, log2_size, block_qp(d, c_idx),
-                                bd, m);
-    else
-        hevcd_dequantize(d->coeff, log2_size, block_qp(d, c_idx), bd);
+    /* Only where hevcd_read_residual() put something: see nz_pos. */
+    hevcd_dequantize_at(d->coeff, d->nz_pos, d->n_nz, log2_size,
+                        block_qp(d, c_idx), bd, m);
     if (d->transform_skip)
         hevcd_skip_transform(d->coeff, log2_size, bd);
     else
-        hevcd_transform(d->coeff, log2_size,
-                        c_idx == 0 && log2_size == 2
-                        && d->cu.pred_mode == HEVCD_MODE_INTRA, bd);
+        hevcd_transform_box(d->coeff, log2_size,
+                            c_idx == 0 && log2_size == 2
+                            && d->cu.pred_mode == HEVCD_MODE_INTRA, bd,
+                            d->nz_max_x, d->nz_max_y);
     hevcd_add(d->plane[c_idx], d->stride[c_idx], x, y,
               d->coeff, log2_size, bd);
 }
@@ -1122,6 +1121,20 @@ int hevcd_prepare_zscan(hevcd_t *d)
     const int w = sps->width >> sps->log2_min_tb;
     const int h = sps->height >> sps->log2_min_tb;
     const size_t serve = (size_t)w * h;
+    const size_t ctbs = (size_t)sps->ctb_count;
+
+    /* ⚠️ Only when something it depends on changed: the picture size, the
+     * two block sizes, and the tile layout through rs_to_ts. Rebuilt for
+     * every picture it was five per cent of a 4K decode. The layout is
+     * compared by content, not by pointer: the parameter sets are
+     * overwritten in place when a stream resends them. */
+    if (d->min_tb_addr_zs && d->n_zs >= serve && d->rs_to_ts
+        && d->zs_rs_to_ts && d->n_zs_rs >= ctbs
+        && d->zs_w == w && d->zs_h == h
+        && d->zs_log2_min_tb == sps->log2_min_tb
+        && d->zs_log2_ctb == sps->log2_ctb
+        && !memcmp(d->zs_rs_to_ts, d->rs_to_ts, ctbs * sizeof(int32_t)))
+        return 0;
 
     if (!d->min_tb_addr_zs || d->n_zs < serve) {
         free(d->min_tb_addr_zs);
@@ -1129,6 +1142,7 @@ int hevcd_prepare_zscan(hevcd_t *d)
         d->n_zs = serve;
         if (!d->min_tb_addr_zs) return -1;
     }
+    d->zs_w = -1;       /* invalid until the table below is complete */
 
     const int diff = sps->log2_ctb - sps->log2_min_tb;
     for (int y = 0; y < h; y++) {
@@ -1148,7 +1162,43 @@ int hevcd_prepare_zscan(hevcd_t *d)
             d->min_tb_addr_zs[y * w + x] = a;
         }
     }
+
+    if (d->rs_to_ts) {
+        if (!d->zs_rs_to_ts || d->n_zs_rs < ctbs) {
+            free(d->zs_rs_to_ts);
+            d->zs_rs_to_ts = malloc(ctbs * sizeof(int32_t));
+            d->n_zs_rs = d->zs_rs_to_ts ? ctbs : 0;
+        }
+        if (d->zs_rs_to_ts) {
+            memcpy(d->zs_rs_to_ts, d->rs_to_ts, ctbs * sizeof(int32_t));
+            d->zs_w = w;
+            d->zs_h = h;
+            d->zs_log2_min_tb = sps->log2_min_tb;
+            d->zs_log2_ctb = sps->log2_ctb;
+        }
+    }
     return 0;
+}
+
+/* One coding tree block's motion field back to "nothing": what an intra
+ * block leaves there, since it writes none of its own, and what the
+ * blocks decoded after it may not read anyway - a unit not decoded yet is
+ * in no slice, and every neighbour question asks about the slice first.
+ * Only the block's own entries, which only it writes. */
+void hevcd_clear_ctb_motion(hevcd_t *d, int rx, int ry)
+{
+    if (!d->mvf) return;
+    const hevc_sps_t *sps = d->sps;
+    const int l = sps->log2_ctb - 2;
+    const int stride = d->min_pu_width;
+    const int x0 = rx << l, y0 = ry << l;
+    int x1 = (rx + 1) << l, y1 = (ry + 1) << l;
+    if (x1 > stride) x1 = stride;
+    if (y1 > d->min_pu_height) y1 = d->min_pu_height;
+    if (x0 >= x1) return;
+    for (int y = y0; y < y1; y++)
+        memset(d->mvf + (size_t)y * stride + x0, 0,
+               (size_t)(x1 - x0) * sizeof *d->mvf);
 }
 
 int hevcd_read_ctu(hevcd_t *d, int x0, int y0)
@@ -1160,6 +1210,7 @@ int hevcd_read_ctu(hevcd_t *d, int x0, int y0)
      * here rather than in each availability test, which is handed a
      * neighbour and has no idea where "here" is. */
     d->tile_now = hevcd_tile_at(d, x0, y0);
+    hevcd_clear_ctb_motion(d, x0 >> sps->log2_ctb, y0 >> sps->log2_ctb);
     if (d->slice_of_ctb) {
         const int rs = (y0 >> sps->log2_ctb) * sps->ctb_width
                        + (x0 >> sps->log2_ctb);

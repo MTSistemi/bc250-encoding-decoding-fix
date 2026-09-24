@@ -12,27 +12,49 @@
 #include "hevc_dec_internal.h"
 #include "gpu_compute.h"
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
 #endif
 
-#define IMG_SLOTS 20
+/* ⚠️ More than the sixteen a stream may keep: a picture being decoded
+ * holds its own slot and those it reads until its frame starts the next
+ * one, and with several in flight a slot the newest no longer names may
+ * still be read by an older one. Four per frame covers its own slot and
+ * the references a picture can drop at a time. */
+#define IMG_SLOTS (16 + 4 * HEVC_DECODER_FRAMES)
 
-struct hevc_decoder {
+/* One picture being decoded: everything that belongs to a picture while it
+ * is decoded - the maps, the parameter sets, the slice header, the threads
+ * - so that several can be decoded at once. The pictures themselves, and the
+ * references between them, are the decoder's. */
+typedef struct {
     hevcd_t d;
-    hevcd_img_t buffer[IMG_SLOTS];
-    uintptr_t surface_id[IMG_SLOTS];  /* what the caller calls each picture */
-    void *gpu;
-    int width, height;
     hevc_sps_t sps;
     hevc_pps_t pps;
     hevc_slice_t last_one;
     bool is_open;
-    uint8_t *uv_interleave;
-    size_t   uv_interleave_cap;
+    /* The slots this frame holds - the one it writes and those it reads -
+     * released when the frame starts its next picture. */
+    hevcd_img_t *held[IMG_SLOTS + 16];
+    int n_held;
+} hevc_frame_t;
+
+struct hevc_decoder {
+    hevc_frame_t f[HEVC_DECODER_FRAMES];
+    hevcd_progress_t progress;
+    /* Which slots are valid, what the caller calls them, and who holds
+     * them. Taken by every function that reads or changes any of that. */
+    pthread_mutex_t dpb;
+    hevcd_img_t buffer[IMG_SLOTS];
+    uintptr_t surface_id[IMG_SLOTS];  /* what the caller calls each picture */
+    void *gpu;
+    int width, height;
 };
 
 static void free_img(hevcd_img_t *g)
@@ -131,7 +153,9 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
 
     hevcd_img_t *g = NULL;
     for (int i = 0; i < d->n_buf && !g; i++)
-        if (!d->buf[i].is_valid) g = &d->buf[i];
+        /* ⚠️ Not only unused as a reference: not held either, by a
+         * picture still writing or reading it. */
+        if (!d->buf[i].is_valid && d->buf[i].users == 0) g = &d->buf[i];
     if (!g) return -1;
 
     if (g->n_planes != (size_t)w * h * bytes) {
@@ -148,14 +172,38 @@ static int open_picture(hevcd_t *d, const hevc_sps_t *sps, int poc)
     }
     if (!g->plane[0] || !g->plane[1] || !g->plane[2] || !g->mvf) return -1;
 
-    memset(g->mvf, 0, n_mvf * sizeof *g->mvf);
+    /* ⚠️ The motion field is not cleared here any more but one coding tree
+     * block at a time, as each is decoded - see hevcd_clear_ctb_motion().
+     * Cleared here it was ten megabytes of memset on one thread before
+     * every 4K picture, the largest part of what opening a picture cost. */
+    /* ⚠️ Sized once for the most slices a picture can have, one per
+     * coding tree block, and never grown while it is being decoded: a
+     * later picture decoding at the same time reads these, and a realloc
+     * would move them from under it. */
+    const size_t ctbs = (size_t)sps->ctb_count;
+    if (g->n_lists < ctbs) {
+        void *p = realloc(g->lists, ctbs * sizeof *g->lists);
+        if (!p) return -1;
+        g->lists = p;
+        g->n_lists = ctbs;
+    }
+    if (g->n_slice_map < ctbs) {
+        free(g->slice_of_ctb);
+        g->slice_of_ctb = malloc(ctbs * sizeof *g->slice_of_ctb);
+        g->n_slice_map = g->slice_of_ctb ? ctbs : 0;
+        if (!g->slice_of_ctb) return -1;
+    }
+
     g->stride[0] = w;
     g->stride[1] = g->stride[2] = w / 2;
     g->poc = poc;
     g->is_valid = true;
-    g->n_lists = 0;   /* filled as each slice is read */
+    g->progress = d->progress;
+    atomic_store_explicit(&g->rows_ready, 0, memory_order_relaxed);
 
     d->current = g;
+    d->slice_of_ctb = g->slice_of_ctb;
+    d->n_slice_map = g->n_slice_map;
     d->mvf = g->mvf;
     for (int i = 0; i < 3; i++) { d->plane[i] = g->plane[i]; d->stride[i] = g->stride[i]; }
     d->n_planes = g->n_planes;
@@ -489,18 +537,14 @@ static int prepare_picture(hevcd_t *d, const hevc_sps_t *sps,
     if (hevcd_prepare_tiles(d)) return 5;
     if (hevcd_prepare_zscan(d)) return 5;
 
-    if (!d->slice_of_ctb || d->n_slice_map < (size_t)sps->ctb_count) {
-        free(d->slice_of_ctb);
-        d->slice_of_ctb = malloc((size_t)sps->ctb_count
-                                 * sizeof *d->slice_of_ctb);
-        d->n_slice_map = (size_t)sps->ctb_count;
-        if (!d->slice_of_ctb) { d->n_slice_map = 0; return 5; }
-    }
+    /* The picture's own map, allocated when it was opened. */
+    if (!d->slice_of_ctb || d->n_slice_map < (size_t)sps->ctb_count) return 5;
     /* ⚠️ Minus one, not zero: zero is a real slice number. A unit still
      * holding minus one when the picture ends is one no slice ever
      * covered. */
     for (int i = 0; i < sps->ctb_count; i++) d->slice_of_ctb[i] = -1;
     d->slice_now = -1;
+    d->filters_done = false;
     /* Nothing carries across a picture boundary. */
     d->have_segment_end = false;
     d->have_wpp_snapshot = false;
@@ -624,6 +668,8 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
     const bool tiles = pps->tiles_enabled;
     int progress = 0;
     int substream = 0;      /* how many substream boundaries have passed */
+    /* Asked once, not once per unit: getenv walks the whole environment. */
+    const bool trace = getenv("HEVC_TRACE") != NULL;
 
     /* ⚠️ Tile scan. Without tiles the map is the identity and this is the
      * raster walk it always was. */
@@ -645,10 +691,10 @@ static int walk_slice(hevcd_t *d, const hevc_sps_t *sps,
          * When a slice does not land, this says where it stopped being
          * right - a unit that consumed implausibly little is where to
          * look, not the one that ran out of data. */
-        if (getenv("HEVC_TRACE")) {
+        if (trace) {
             const long n_read = (long)((d->cabac.ptr - d->cabac.start) * 8
                                       - d->cabac.cache_bits);
-            fprintf(stderr, "ctu ts %d rs %d (%d,%d): %ld bit su %ld" "\n",
+            fprintf(stderr, "ctu ts %d rs %d (%d,%d): %ld bits of %ld" "\n",
                     ts, addr, x, y, n_read, (long)(n - first) * 8);
         }
         if (hevcd_overrun(&d->cabac)) return 3;
@@ -729,29 +775,52 @@ hevc_decoder_t *hevc_decoder_create(void *gpu, int width, int height)
     h->gpu = gpu;
     h->width = width;
     h->height = height;
-    h->d.buf = h->buffer;
-    h->d.n_buf = IMG_SLOTS;
+    pthread_mutex_init(&h->progress.m, NULL);
+    pthread_cond_init(&h->progress.cv, NULL);
+    pthread_mutex_init(&h->dpb, NULL);
+    for (int k = 0; k < HEVC_DECODER_FRAMES; k++) {
+        h->f[k].d.buf = h->buffer;
+        h->f[k].d.n_buf = IMG_SLOTS;
+        h->f[k].d.progress = &h->progress;
+    }
     return h;
+}
+
+static void free_frame(hevc_frame_t *f)
+{
+    hevcd_t *d = &f->d;
+    hevcd_free_tiles(d);
+    free(d->slice_filter);
+    free(d->ct_depth); free(d->intra_mode); free(d->min_tb_addr_zs);
+    free(d->zs_rs_to_ts);
+    free(d->qp_y_map); free(d->edges); free(d->no_filter);
+    free(d->skip); free(d->cbf_map);
+    hevcd_free_filters(d);
+    hevcd_pool_destroy(d->pool);
 }
 
 void hevc_decoder_destroy(hevc_decoder_t *h)
 {
     if (!h) return;
+    for (int k = 0; k < HEVC_DECODER_FRAMES; k++) free_frame(&h->f[k]);
     for (int i = 0; i < IMG_SLOTS; i++) free_img(&h->buffer[i]);
-    hevcd_t *d = &h->d;
-    hevcd_free_tiles(d);
-    free(d->slice_filter);
-    free(d->ct_depth); free(d->intra_mode); free(d->min_tb_addr_zs);
-    free(d->qp_y_map); free(d->edges); free(d->no_filter);
-    free(d->skip); free(d->cbf_map);
-    hevcd_free_filters(d);
-    free(h->uv_interleave);
+    pthread_mutex_destroy(&h->dpb);
+    pthread_mutex_destroy(&h->progress.m);
+    pthread_cond_destroy(&h->progress.cv);
     free(h);
+}
+
+/* The buffer lock, from functions that only read and take a const decoder:
+ * the lock is not part of what they promise to leave alone. */
+static pthread_mutex_t *dpb_lock(const hevc_decoder_t *h)
+{
+    return (pthread_mutex_t *)&h->dpb;
 }
 
 void hevc_decoder_set_references(hevc_decoder_t *h, const uintptr_t *id,
                                  const int *poc, int n)
 {
+    pthread_mutex_lock(&h->dpb);
     for (int i = 0; i < IMG_SLOTS; i++) {
         if (!h->buffer[i].is_valid) continue;
         bool serve = false;
@@ -764,9 +833,10 @@ void hevc_decoder_set_references(hevc_decoder_t *h, const uintptr_t *id,
         }
         if (!serve) h->buffer[i].is_valid = false;
     }
+    pthread_mutex_unlock(&h->dpb);
 }
 
-const void *hevc_decoder_find_ref(const hevc_decoder_t *h, uintptr_t id, int poc)
+static const void *find_ref_locked(const hevc_decoder_t *h, uintptr_t id, int poc)
 {
     /* 1. Exact match on both surface ID and POC */
     for (int i = 0; i < IMG_SLOTS; i++) {
@@ -786,8 +856,17 @@ const void *hevc_decoder_find_ref(const hevc_decoder_t *h, uintptr_t id, int poc
     return NULL;
 }
 
+const void *hevc_decoder_find_ref(const hevc_decoder_t *h, uintptr_t id, int poc)
+{
+    pthread_mutex_lock(dpb_lock(h));
+    const void *g = find_ref_locked(h, id, poc);
+    pthread_mutex_unlock(dpb_lock(h));
+    return g;
+}
+
 const void *hevc_decoder_find_closest(const hevc_decoder_t *h, int poc)
 {
+    pthread_mutex_lock(dpb_lock(h));
     const hevcd_img_t *best = NULL;
     int min_diff = 0x7fffffff;
     for (int i = 0; i < IMG_SLOTS; i++) {
@@ -798,32 +877,65 @@ const void *hevc_decoder_find_closest(const hevc_decoder_t *h, int poc)
             best = &h->buffer[i];
         }
     }
+    pthread_mutex_unlock(dpb_lock(h));
     return best;
+}
+
+int hevc_decoder_begin_frame(hevc_decoder_t *h, int k, const hevc_sps_t *sps,
+                             const hevc_pps_t *pps, uintptr_t id, int poc,
+                             const void *const *refs, int n_refs)
+{
+    if (k < 0 || k >= HEVC_DECODER_FRAMES) return -1;
+    hevc_frame_t *f = &h->f[k];
+    f->sps = *sps;
+    f->pps = *pps;
+
+    pthread_mutex_lock(&h->dpb);
+    /* What this frame held for its last picture, which is done. */
+    for (int i = 0; i < f->n_held; i++) f->held[i]->users--;
+    f->n_held = 0;
+    const int e = open_picture(&f->d, &f->sps, poc);
+    if (!e) {
+        /* Held until this frame's next picture: the slot it writes, and
+         * every slot it reads, so that a later picture's reference set
+         * cannot free one of them from under it. */
+        f->held[f->n_held++] = f->d.current;
+        f->d.current->users++;
+        for (int i = 0; i < n_refs && f->n_held < IMG_SLOTS + 16; i++) {
+            hevcd_img_t *g = (hevcd_img_t *)refs[i];
+            if (!g) continue;
+            f->held[f->n_held++] = g;
+            g->users++;
+        }
+        for (int i = 0; i < IMG_SLOTS; i++)
+            if (&h->buffer[i] == f->d.current) h->surface_id[i] = id;
+    }
+    pthread_mutex_unlock(&h->dpb);
+    if (e) return -1;
+
+    /* ⚠️ Here and not in walk_slice(): once per picture, not once per
+     * slice. See prepare_picture(). */
+    if (prepare_picture(&f->d, &f->sps, &f->pps)) return -1;
+    f->is_open = true;
+    return 0;
 }
 
 int hevc_decoder_begin_picture(hevc_decoder_t *h, const hevc_sps_t *sps,
                                const hevc_pps_t *pps, uintptr_t id, int poc)
 {
-    h->sps = *sps;
-    h->pps = *pps;
-    if (open_picture(&h->d, &h->sps, poc)) return -1;
-    /* ⚠️ Here and not in walk_slice(): once per picture, not once per
-     * slice. See prepare_picture(). */
-    if (prepare_picture(&h->d, &h->sps, &h->pps)) return -1;
-    for (int i = 0; i < IMG_SLOTS; i++)
-        if (&h->buffer[i] == h->d.current) h->surface_id[i] = id;
-    h->is_open = true;
-    return 0;
+    return hevc_decoder_begin_frame(h, 0, sps, pps, id, poc, NULL, 0);
 }
 
-int hevc_decoder_slice(hevc_decoder_t *h, const hevc_slice_t *sl,
-                       const uint8_t *rbsp, size_t n)
+int hevc_decoder_frame_slice(hevc_decoder_t *h, int k, const hevc_slice_t *sl,
+                             const uint8_t *rbsp, size_t n)
 {
-    if (!h->is_open || !h->d.current) return 5;
+    if (k < 0 || k >= HEVC_DECODER_FRAMES) return 5;
+    hevc_frame_t *f = &h->f[k];
+    if (!f->is_open || !f->d.current) return 5;
 
-    if (sl->dependent_slice_segment && h->d.slice_now >= 0) {
+    if (sl->dependent_slice_segment && f->d.slice_now >= 0) {
         /* ⚠️ Everything except the few fields a dependent segment really
-         * does carry. h->last_one already holds the header this one
+         * does carry. last_one already holds the header this one
          * continues - which may itself be a merged dependent segment, so
          * a run of them chains correctly. */
         const int addr = sl->segment_address;
@@ -833,16 +945,16 @@ int hevc_decoder_slice(hevc_decoder_t *h, const hevc_slice_t *sl,
         uint32_t ep[600];
         if (n_ep > 0) memcpy(ep, sl->entry_point, (size_t)n_ep * sizeof ep[0]);
 
-        h->last_one.dependent_slice_segment = true;
-        h->last_one.first_slice_in_pic = false;
-        h->last_one.segment_address = addr;
-        h->last_one.num_entry_point_offsets = n_ep;
-        if (n_ep > 0) memcpy(h->last_one.entry_point, ep,
+        f->last_one.dependent_slice_segment = true;
+        f->last_one.first_slice_in_pic = false;
+        f->last_one.segment_address = addr;
+        f->last_one.num_entry_point_offsets = n_ep;
+        if (n_ep > 0) memcpy(f->last_one.entry_point, ep,
                              (size_t)n_ep * sizeof ep[0]);
-        h->last_one.data_bit_offset = off;
-        h->last_one.nal_type = nal;
+        f->last_one.data_bit_offset = off;
+        f->last_one.nal_type = nal;
     } else {
-        h->last_one = *sl;
+        f->last_one = *sl;
     }
     /* ⚠️ The picture order count comes from the picture, not from the
      * slice segment header. Only the first segment of a picture carries
@@ -850,62 +962,85 @@ int hevc_decoder_slice(hevc_decoder_t *h, const hevc_slice_t *sl,
      * and leaves the rest at zero - and build_lists() then looks up
      * `poc + delta_poc` in the buffer, finds nothing, and hands the slice
      * an empty reference list without a word. */
-    h->last_one.poc = h->d.current->poc;
-    h->d.slice = &h->last_one;
+    f->last_one.poc = f->d.current->poc;
+    f->d.slice = &f->last_one;
     /* ⚠️ A dependent segment is not a new slice, it is the rest of the
      * one before it, so it keeps that number. An independent one starts
      * a new slice. */
-    if (!sl->dependent_slice_segment || h->d.slice_now < 0)
-        h->d.slice_now++;
-    build_lists(&h->d, &h->last_one);
-    if (h->last_one.type != 2) {
-        for (int l = 0; l < (h->last_one.type == 0 ? 2 : 1); l++)
-            if (!h->d.n_refs[l]) return 8;
+    if (!sl->dependent_slice_segment || f->d.slice_now < 0)
+        f->d.slice_now++;
+    /* ⚠️ Lists built from the slice header look pictures up in the
+     * buffer, so they take its lock; lists handed over ready-made (the VA
+     * path) were resolved before the picture was begun. */
+    if (!f->last_one.has_explicit_rpl) pthread_mutex_lock(&h->dpb);
+    build_lists(&f->d, &f->last_one);
+    if (!f->last_one.has_explicit_rpl) pthread_mutex_unlock(&h->dpb);
+    if (f->last_one.type != 2) {
+        for (int l = 0; l < (f->last_one.type == 0 ? 2 : 1); l++)
+            if (!f->d.n_refs[l]) return 8;
     }
-    return walk_slice(&h->d, &h->sps, &h->pps, &h->last_one, rbsp, n);
+    return walk_slice(&f->d, &f->sps, &f->pps, &f->last_one, rbsp, n);
+}
+
+int hevc_decoder_slice(hevc_decoder_t *h, const hevc_slice_t *sl,
+                       const uint8_t *rbsp, size_t n)
+{
+    return hevc_decoder_frame_slice(h, 0, sl, rbsp, n);
+}
+
+void hevc_decoder_end_frame(hevc_decoder_t *h, int k)
+{
+    if (k < 0 || k >= HEVC_DECODER_FRAMES) return;
+    hevc_frame_t *f = &h->f[k];
+    if (!f->is_open || !f->d.current) return;
+    /* ⚠️ Units no slice reached - a slice lost or refused - were never
+     * cleared, and their motion field still holds whatever picture used
+     * this buffer before. A later picture reads it as its collocated
+     * motion, so it is cleared now. */
+    if (f->d.slice_of_ctb && f->d.mvf) {
+        const hevc_sps_t *sps = f->d.sps;
+        for (int rs = 0; rs < sps->ctb_count; rs++)
+            if (f->d.slice_of_ctb[rs] < 0)
+                hevcd_clear_ctb_motion(&f->d, rs % sps->ctb_width,
+                                       rs / sps->ctb_width);
+    }
+    if (f->d.slice && !f->d.filters_done) hevcd_loop_filters(&f->d);
+    /* ⚠️ Every row final now, whatever happened on the way - a picture
+     * that failed half way is still a picture someone may be waiting to
+     * read, and a wait that is never answered is a hang. */
+    hevcd_rows_ready(f->d.current, f->sps.ctb_height);
+    f->is_open = false;
 }
 
 void hevc_decoder_end_picture(hevc_decoder_t *h)
 {
-    if (!h->is_open || !h->d.current) return;
-    /* ⚠️ Before the filters or after makes no difference to them, but
-     * it has to happen while the map is still this picture's: the next
-     * begin_picture() clears it. */
-    if (h->d.slice_of_ctb && h->d.current) {
-        hevcd_img_t *g = h->d.current;
-        const size_t n = (size_t)h->sps.ctb_count;
-        if (g->n_slice_map < n) {
-            free(g->slice_of_ctb);
-            g->slice_of_ctb = malloc(n * sizeof *g->slice_of_ctb);
-            g->n_slice_map = g->slice_of_ctb ? n : 0;
-        }
-        if (g->slice_of_ctb)
-            memcpy(g->slice_of_ctb, h->d.slice_of_ctb,
-                   n * sizeof *g->slice_of_ctb);
-    }
-
-    if (h->d.slice) { hevcd_deblock(&h->d); hevcd_sao(&h->d); }
-    h->is_open = false;
+    hevc_decoder_end_frame(h, 0);
 }
 
 const uint8_t *hevc_decoder_plane(const hevc_decoder_t *h, int plane,
                                   int *stride)
 {
-    if (!h->d.current || plane < 0 || plane > 2) return NULL;
-    if (stride) *stride = h->d.current->stride[plane];
-    return h->d.current->plane[plane];
+    const hevcd_img_t *g = h->f[0].d.current;
+    if (!g || plane < 0 || plane > 2) return NULL;
+    if (stride) *stride = g->stride[plane];
+    return g->plane[plane];
 }
 
 bool hevc_decoder_holds(const hevc_decoder_t *h, uintptr_t id)
 {
-    for (int i = 0; i < IMG_SLOTS; i++)
-        if (h->buffer[i].is_valid && h->surface_id[i] == id) return true;
-    return false;
+    bool held = false;
+    pthread_mutex_lock(dpb_lock(h));
+    for (int i = 0; i < IMG_SLOTS && !held; i++)
+        if (h->buffer[i].is_valid && h->surface_id[i] == id) held = true;
+    pthread_mutex_unlock(dpb_lock(h));
+    return held;
 }
 
 void hevc_decoder_unescape(hevc_decoder_t *h, const hevc_slice_t *sl)
 {
-    unescape(&h->d, sl);
+    pthread_mutex_lock(&h->dpb);
+    unescape(&h->f[0].d, sl);
+    pthread_mutex_unlock(&h->dpb);
 }
 
 void hevc_decoder_shift_entry_points(hevc_slice_t *s, const uint8_t *grezzo,
@@ -914,70 +1049,177 @@ void hevc_decoder_shift_entry_points(hevc_slice_t *s, const uint8_t *grezzo,
     shift_entry_points(s, grezzo, n_grezzo, first);
 }
 
-/* ⚠️ The surface wants the two chroma planes interleaved, and it is
- * written once, here, rather than plane by plane as the picture is
- * decoded: surface memory is write-combining, which is fast to write
- * straight through and very slow to read back or revisit. */
+/* ------------------------------------------ the picture into the surface
+ *
+ * ⚠️ Written once, straight into the mapped surface, and never read back:
+ * surface memory is write-combining, fast to write straight through and
+ * very slow to read or revisit. The chroma planes are interleaved on the
+ * way, where they used to go through a buffer of their own first - four
+ * megabytes read and written again for every 4K picture.
+ *
+ * And on several threads. At 4K this is twelve megabytes a picture, and on
+ * one thread it came to a quarter of what the driver took over the
+ * decoder alone. */
+
+#define LOAD_BAND 32                /* luma rows per band, sixteen of chroma */
+#define LOAD_MAX_THREAD 8
+
+typedef struct {
+    const hevcd_img_t *g;
+    uint8_t *y, *uv;
+    size_t y_pitch, uv_pitch;
+    int width, height;
+    bool ten;
+    int bands;
+    _Atomic int next;
+} load_job_t;
+
+static void interleave8(uint8_t *o, const uint8_t *a, const uint8_t *b, int n)
+{
+    int x = 0;
+    for (; x + 16 <= n; x += 16) {
+        const __m128i va = _mm_loadu_si128((const __m128i *)(a + x));
+        const __m128i vb = _mm_loadu_si128((const __m128i *)(b + x));
+        _mm_storeu_si128((__m128i *)(o + 2 * x), _mm_unpacklo_epi8(va, vb));
+        _mm_storeu_si128((__m128i *)(o + 2 * x + 16), _mm_unpackhi_epi8(va, vb));
+    }
+    for (; x < n; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
+}
+
+/* P010 keeps its ten bits at the top of each sixteen. */
+static void shift10(uint16_t *o, const uint16_t *s, int n)
+{
+    int x = 0;
+    for (; x + 8 <= n; x += 8)
+        _mm_storeu_si128((__m128i *)(o + x),
+            _mm_slli_epi16(_mm_loadu_si128((const __m128i *)(s + x)), 6));
+    for (; x < n; x++) o[x] = (uint16_t)(s[x] << 6);
+}
+
+static void interleave10(uint16_t *o, const uint16_t *a, const uint16_t *b,
+                         int n)
+{
+    int x = 0;
+    for (; x + 8 <= n; x += 8) {
+        const __m128i va = _mm_slli_epi16(
+            _mm_loadu_si128((const __m128i *)(a + x)), 6);
+        const __m128i vb = _mm_slli_epi16(
+            _mm_loadu_si128((const __m128i *)(b + x)), 6);
+        _mm_storeu_si128((__m128i *)(o + 2 * x), _mm_unpacklo_epi16(va, vb));
+        _mm_storeu_si128((__m128i *)(o + 2 * x + 8), _mm_unpackhi_epi16(va, vb));
+    }
+    for (; x < n; x++) {
+        o[2 * x] = (uint16_t)(a[x] << 6);
+        o[2 * x + 1] = (uint16_t)(b[x] << 6);
+    }
+}
+
+static void load_band(load_job_t *j, int band)
+{
+    const hevcd_img_t *g = j->g;
+    const int y0 = band * LOAD_BAND;
+    const int y1 = y0 + LOAD_BAND < j->height ? y0 + LOAD_BAND : j->height;
+    const int cw = j->width / 2;
+
+    if (!j->ten) {
+        for (int r = y0; r < y1; r++)
+            memcpy(j->y + (size_t)r * j->y_pitch,
+                   g->plane[0] + (size_t)r * g->stride[0], (size_t)j->width);
+        for (int r = y0 / 2; r < y1 / 2; r++)
+            interleave8(j->uv + (size_t)r * j->uv_pitch,
+                        g->plane[1] + (size_t)r * g->stride[1],
+                        g->plane[2] + (size_t)r * g->stride[2], cw);
+        return;
+    }
+
+    /* ⚠️ The strides are sample counts, the pitches byte counts. */
+    for (int r = y0; r < y1; r++)
+        shift10((uint16_t *)(j->y + (size_t)r * j->y_pitch),
+                (const uint16_t *)g->plane[0] + (size_t)r * g->stride[0],
+                j->width);
+    for (int r = y0 / 2; r < y1 / 2; r++)
+        interleave10((uint16_t *)(j->uv + (size_t)r * j->uv_pitch),
+                     (const uint16_t *)g->plane[1] + (size_t)r * g->stride[1],
+                     (const uint16_t *)g->plane[2] + (size_t)r * g->stride[2],
+                     cw);
+}
+
+static void *load_worker(void *arg)
+{
+    load_job_t *j = arg;
+    for (;;) {
+        const int band = atomic_fetch_add_explicit(&j->next, 1,
+                                                   memory_order_relaxed);
+        if (band >= j->bands) break;
+        load_band(j, band);
+    }
+    return NULL;
+}
+
 int hevc_decoder_load(hevc_decoder_t *h, gpu_image_t out, gpu_memory_t mem)
 {
+    return hevc_decoder_load_frame(h, 0, out, mem);
+}
+
+int hevc_decoder_load_frame(hevc_decoder_t *h, int k, gpu_image_t out,
+                            gpu_memory_t mem)
+{
     if (!h->gpu) return 0;                 /* the harness keeps the planes */
-    const hevcd_img_t *g = h->d.current;
+    if (k < 0 || k >= HEVC_DECODER_FRAMES) return -1;
+    hevc_frame_t *f = &h->f[k];
+    const hevcd_img_t *g = f->d.current;
     if (!g || !g->plane[0]) return -1;
 
-    const int cw = h->width / 2, ch = h->height / 2;
-    const int ten_bit = h->sps.bit_depth_luma > 8;
-    const size_t sample = ten_bit ? 2 : 1;
-    const size_t needed = (size_t)cw * 2 * ch * sample;
+    gpu_context_t *gpu = h->gpu;
+    gpu_nv12_layout_t lay;
+    bool unmap = false;
+    uint8_t *mapped = gpu_compute_map_surface(gpu, &out, mem, &lay, &unmap);
+    if (!mapped) return -1;
 
-    if (h->uv_interleave_cap < needed) {
-        size_t new_cap = needed < 2097152 ? 2097152 : needed;
-        uint8_t *p = realloc(h->uv_interleave, new_cap);
-        if (!p) return -1;
-        h->uv_interleave = p;
-        h->uv_interleave_cap = new_cap;
-    }
-    uint8_t *uv = h->uv_interleave;
+    load_job_t j;
+    memset(&j, 0, sizeof j);
+    j.g = g;
+    j.width = h->width;
+    j.height = h->height;
+    j.ten = f->sps.bit_depth_luma > 8;
+    j.y_pitch = lay.y_pitch;
+    j.uv_pitch = lay.uv_pitch;
+    j.bands = (h->height + LOAD_BAND - 1) / LOAD_BAND;
 
-    if (ten_bit) {
-        /* ⚠️ Every one of these is a sample count, so every offset is
-         * multiplied. The shift into P010's high bits is not here - it
-         * belongs to the upload, which is the part that knows what a
-         * surface format is. */
-        for (int r = 0; r < ch; r++) {
-            const uint16_t *a = (const uint16_t *)g->plane[1]
-                                + (size_t)r * g->stride[1];
-            const uint16_t *b = (const uint16_t *)g->plane[2]
-                                + (size_t)r * g->stride[2];
-            uint16_t *o = (uint16_t *)uv + (size_t)r * cw * 2;
-            for (int x = 0; x < cw; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
-        }
-        return gpu_compute_upload_p010(h->gpu, &out, mem,
-                                      (const uint16_t *)g->plane[0],
-                                      g->stride[0] * 2,
-                                      (const uint16_t *)uv, cw * 4,
-                                      h->width, h->height);
+    /* ⚠️ Both planes have to fit inside the memory the surface was given.
+     * The copy this replaced trusted the layout; a surface smaller than
+     * the stream would have been written past its end. */
+    const size_t row = (size_t)h->width * (j.ten ? 2 : 1);
+    if (h->width <= 0 || h->height <= 1
+        || lay.y_offset + (uint64_t)(h->height - 1) * lay.y_pitch + row
+               > lay.total_size
+        || lay.uv_offset + (uint64_t)(h->height / 2 - 1) * lay.uv_pitch + row
+               > lay.total_size) {
+        gpu_compute_unmap_surface(gpu, mem, unmap);
+        return -1;
+    }
+    j.y = mapped + lay.y_offset;
+    j.uv = mapped + lay.uv_offset;
+
+    const char *s = getenv("BC250_HEVC_THREAD");
+    int want = s ? atoi(s) : (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (want > LOAD_MAX_THREAD) want = LOAD_MAX_THREAD;
+    if (want > j.bands) want = j.bands;
+
+    hevcd_pool_t *pool = want > 1 ? hevcd_pool_for(&f->d) : NULL;
+    if (pool) {
+        hevcd_pool_run(pool, load_worker, &j, want);
+    } else {
+        pthread_t t[LOAD_MAX_THREAD];
+        int alive = 0;
+        for (int i = 1; i < want; i++)
+            if (pthread_create(&t[alive], NULL, load_worker, &j) == 0) alive++;
+        load_worker(&j);
+        for (int i = 0; i < alive; i++) pthread_join(t[i], NULL);
     }
 
-    for (int r = 0; r < ch; r++) {
-        const uint8_t *a = g->plane[1] + (size_t)r * g->stride[1];
-        const uint8_t *b = g->plane[2] + (size_t)r * g->stride[2];
-        uint8_t *o = uv + (size_t)r * cw * 2;
-        int x = 0;
-#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
-        for (; x <= cw - 16; x += 16) {
-            __m128i va = _mm_loadu_si128((const __m128i *)(a + x));
-            __m128i vb = _mm_loadu_si128((const __m128i *)(b + x));
-            __m128i vlo = _mm_unpacklo_epi8(va, vb);
-            __m128i vhi = _mm_unpackhi_epi8(va, vb);
-            _mm_storeu_si128((__m128i *)(o + 2 * x), vlo);
-            _mm_storeu_si128((__m128i *)(o + 2 * x + 16), vhi);
-        }
-#endif
-        for (; x < cw; x++) { o[2 * x] = a[x]; o[2 * x + 1] = b[x]; }
-    }
-    return gpu_compute_upload_nv12(h->gpu, &out, mem,
-                                  g->plane[0], g->stride[0],
-                                  uv, cw * 2, h->width, h->height);
+    gpu_compute_unmap_surface(gpu, mem, unmap);
+    return 0;
 }
 
 const char *hevc_decoder_reason(int e)
