@@ -952,33 +952,46 @@ static hevc_mv_t FUNC(motion_search)(const hevc_encoder_t *enc, int cu_x, int cu
     int bx = 0, by = 0;
     int64_t best = INT64_MAX;
     uint32_t best_sad = 0;
+    /* The starting points often land on the same whole sample; each one is
+     * costed once. A repeat could not replace the first anyway: the same
+     * cost is not less. */
+    int seen_x[16], seen_y[16], n_seen = 0;
     for (int i = 0; i < n_starts; i++) {
         int dx = (starts[i].x + 2) >> 2, dy = (starts[i].y + 2) >> 2;
         if (dx < min_dx) dx = min_dx;
         if (dx > max_dx) dx = max_dx;
         if (dy < min_dy) dy = min_dy;
         if (dy > max_dy) dy = max_dy;
+        bool dup = false;
+        for (int k = 0; k < n_seen && !dup; k++) dup = seen_x[k] == dx && seen_y[k] == dy;
+        if (dup) continue;
+        seen_x[n_seen] = dx;
+        seen_y[n_seen++] = dy;
         const uint32_t s = FUNC(search_sad)(enc, src, qx0 + dx * 4, qy0 + dy * 4);
         const int64_t c = COST(dx * 4, dy * 4, s);
         if (c < best) { best = c; best_sad = s; bx = dx; by = dy; }
     }
 
-    /* Downhill, one sample at a time, within the search range. */
+    /* Downhill, one sample at a time, within the search range. The point
+     * a step came from is not costed again: it was the worse of the two. */
     const int cx0 = bx, cy0 = by;
+    int back = -1;
     for (int step = 0; step < 32; step++) {
         static const int ddx[4] = { -1, 1, 0, 0 }, ddy[4] = { 0, 0, -1, 1 };
-        int nbx = bx, nby = by;
+        int nbx = bx, nby = by, nk = -1;
         for (int k = 0; k < 4; k++) {
+            if (k == back) continue;
             const int dx = bx + ddx[k], dy = by + ddy[k];
             if (dx < min_dx || dx > max_dx || dy < min_dy || dy > max_dy) continue;
             if (dx < cx0 - range || dx > cx0 + range || dy < cy0 - range || dy > cy0 + range) continue;
             const uint32_t s = FUNC(search_sad)(enc, src, qx0 + dx * 4, qy0 + dy * 4);
             const int64_t c = COST(dx * 4, dy * 4, s);
-            if (c < best) { best = c; best_sad = s; nbx = dx; nby = dy; }
+            if (c < best) { best = c; best_sad = s; nbx = dx; nby = dy; nk = k; }
         }
         if (nbx == bx && nby == by) break;
         bx = nbx;
         by = nby;
+        back = nk ^ 1;   /* left <-> right, up <-> down */
     }
 
     /* Half, then quarter samples around the best so far. */
