@@ -74,6 +74,62 @@ static const char *get_cmdline_preset(void)
     return NULL;
 }
 
+static int get_cmdline_threads(void)
+{
+#if defined(__linux__)
+    static int cached_threads = -1;
+    if (cached_threads != -1) return cached_threads;
+
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    if (!f) {
+        cached_threads = 0;
+        return 0;
+    }
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        cached_threads = 0;
+        return 0;
+    }
+    buf[n] = '\0';
+
+    size_t pos = 0;
+    while (pos < n) {
+        const char *arg = buf + pos;
+        size_t len = strlen(arg);
+
+        if ((strcmp(arg, "-threads") == 0 || strcmp(arg, "--threads") == 0 ||
+             strcmp(arg, "-slices") == 0 || strcmp(arg, "--slices") == 0) && (pos + len + 1 < n)) {
+            const char *val = buf + pos + len + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 64) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-threads=", 9) == 0 || strncmp(arg, "--threads=", 10) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 64) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-slices=", 8) == 0 || strncmp(arg, "--slices=", 9) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 64) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        }
+        pos += len + 1;
+    }
+    cached_threads = 0;
+#endif
+    return 0;
+}
+
 const char *h264_x264_preset_for(const h264_x264_config_t *cfg)
 {
     /* 1. Environment variable override takes highest priority:
@@ -130,6 +186,8 @@ static int threads_for(const h264_x264_config_t *cfg)
         int t = atoi(env_max);
         if (t >= 0 && t <= 64) return t;
     }
+    int cmd_t = get_cmdline_threads();
+    if (cmd_t > 0 && cmd_t <= 64) return cmd_t;
     /* A streaming server shares the machine with the game it streams:
      * four threads, which is where x264 stops scaling usefully with sliced
      * threads anyway. For offline transcode, default to 4 threads as well to

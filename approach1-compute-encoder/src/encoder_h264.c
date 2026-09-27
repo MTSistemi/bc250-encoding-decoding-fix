@@ -1676,6 +1676,100 @@ static void encode_mb_p16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
     }
 }
 
+static int get_cmdline_threads(void)
+{
+#if defined(__linux__)
+    static int cached_threads = -1;
+    if (cached_threads != -1) return cached_threads;
+
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    if (!f) {
+        cached_threads = 0;
+        return 0;
+    }
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        cached_threads = 0;
+        return 0;
+    }
+    buf[n] = '\0';
+
+    size_t pos = 0;
+    while (pos < n) {
+        const char *arg = buf + pos;
+        size_t len = strlen(arg);
+
+        if ((strcmp(arg, "-threads") == 0 || strcmp(arg, "--threads") == 0 ||
+             strcmp(arg, "-slices") == 0 || strcmp(arg, "--slices") == 0) && (pos + len + 1 < n)) {
+            const char *val = buf + pos + len + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-threads=", 9) == 0 || strncmp(arg, "--threads=", 10) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-slices=", 8) == 0 || strncmp(arg, "--slices=", 9) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        }
+        pos += len + 1;
+    }
+    cached_threads = 0;
+#endif
+    return 0;
+}
+
+static int get_default_slice_threads(int num_slices) {
+    int threads = 1;
+    const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
+    if (!env_threads) env_threads = getenv("BC250_THREADS");
+    if (!env_threads) env_threads = getenv("BC250_CPU_THREADS");
+    if (env_threads) {
+        int t = atoi(env_threads);
+        if (t >= 1 && t <= 16) return (num_slices < t) ? num_slices : t;
+    }
+    const char *env_no_omp = getenv("BC250_DISABLE_OPENMP");
+    if (env_no_omp && (strcmp(env_no_omp, "0") != 0 && strcmp(env_no_omp, "false") != 0)) {
+        return 1;
+    }
+    int cmd_t = get_cmdline_threads();
+    if (cmd_t >= 1 && cmd_t <= 16) {
+        return (num_slices < cmd_t) ? num_slices : cmd_t;
+    }
+#if defined(__linux__)
+    if (program_invocation_short_name) {
+        if (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+            strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0) {
+            return (num_slices < 2) ? 1 : 2;
+        } else if (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+                   strcmp(program_invocation_short_name, "wivrn") == 0) {
+            int def_cap = (num_slices > 4) ? (num_slices > 16 ? 16 : num_slices) : 4;
+            return (num_slices < def_cap) ? num_slices : def_cap;
+        } else if (strcmp(program_invocation_short_name, "ffmpeg") == 0 ||
+                   strcmp(program_invocation_short_name, "ffmpeg_g") == 0) {
+            int def_cap = (num_slices > 4) ? (num_slices > 16 ? 16 : num_slices) : 4;
+            return (num_slices < def_cap) ? num_slices : def_cap;
+        }
+    }
+#endif
+    int def_cap = (num_slices > 4) ? (num_slices > 16 ? 16 : num_slices) : 4;
+    return (num_slices < def_cap) ? num_slices : def_cap;
+}
+
 h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
                                     uint32_t width, uint32_t height,
                                     uint32_t fps, uint32_t bitrate,
@@ -1701,16 +1795,34 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
     if (slice_env) {
         int s = atoi(slice_env);
         if (s >= 1 && s <= 16) encoder->num_slices = s;
-    }
+    } else {
+        int cmd_t = get_cmdline_threads();
+        if (cmd_t >= 1 && cmd_t <= 16) {
+            encoder->num_slices = cmd_t;
+        } else {
+            const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
+            if (!env_threads) env_threads = getenv("BC250_THREADS");
+            if (!env_threads) env_threads = getenv("BC250_CPU_THREADS");
+            if (env_threads) {
+                int t = atoi(env_threads);
+                if (t >= 1 && t <= 16) encoder->num_slices = t;
+            }
 #if defined(__linux__)
-    else if (program_invocation_short_name &&
-             (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
-              strcmp(program_invocation_short_name, "wivrn") == 0)) {
-        /* WiVRn encodes high-res VR streams (typically >= 1800x1800 per eye).
-         * Multi-slice H.264 enables parallel entropy coding and drastically reduces VR latency. */
-        encoder->num_slices = 4;
-    }
+            else if (program_invocation_short_name &&
+                     (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+                      strcmp(program_invocation_short_name, "wivrn") == 0 ||
+                      strcmp(program_invocation_short_name, "ffmpeg") == 0 ||
+                      strcmp(program_invocation_short_name, "ffmpeg_g") == 0)) {
+                encoder->num_slices = 4;
+            }
 #endif
+            else if (gpu_ctx != NULL && encoder->total_mbs >= 1000) {
+                /* When backed by real GPU context at HD/FHD resolutions (>= 720p),
+                 * default to 4 slices for multi-threaded parallel OpenMP entropy coding. */
+                encoder->num_slices = 4;
+            }
+        }
+    }
     encoder->quality_level = 4;
     encoder->max_frame_bits = 0;
 
@@ -1868,10 +1980,12 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
         encoder->governor.enabled = true;
         encoder->governor.cpu_offload_enabled = true;
     }
-    fprintf(stderr, "[bc250-h264] Encoder initialized: %ux%u @ %u fps, %u bps, profile %d, backend=%s, entropy=%s, hybrid_governor=%s\n",
+    fprintf(stderr, "[bc250-h264] Encoder initialized: %ux%u @ %u fps, %u bps, profile %d, backend=%s, entropy=%s, slices=%d, threads=%d, hybrid_governor=%s\n",
             width, height, encoder->fps, bitrate, prof_idc,
             gpu_only ? "gpu" : (be && strcmp(be, "hybrid") == 0 ? "hybrid" : "compute"),
             use_cabac ? "CABAC" : "CAVLC",
+            encoder->num_slices,
+            get_default_slice_threads(encoder->num_slices),
             encoder->governor.enabled ? "enabled" : "disabled");
 
     return encoder;
@@ -2292,36 +2406,6 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
     gpu_memory_t dummy_mem = {0};
     return h264_encoder_encode_frame_ext(encoder, gpu_ctx, input_surface, dummy_mem,
                                          output_buf, output_size);
-}
-
-static int get_default_slice_threads(int num_slices) {
-    int threads = 1;
-    const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
-    if (!env_threads) env_threads = getenv("BC250_THREADS");
-    if (!env_threads) env_threads = getenv("BC250_CPU_THREADS");
-    if (env_threads) {
-        int t = atoi(env_threads);
-        if (t >= 1 && t <= 16) return (num_slices < t) ? num_slices : t;
-    }
-    const char *env_no_omp = getenv("BC250_DISABLE_OPENMP");
-    if (env_no_omp && (strcmp(env_no_omp, "0") != 0 && strcmp(env_no_omp, "false") != 0)) {
-        return 1;
-    }
-#if defined(__linux__)
-    if (program_invocation_short_name) {
-        if (strcmp(program_invocation_short_name, "sunshine") == 0 ||
-            strcmp(program_invocation_short_name, "steam") == 0 ||
-            strcmp(program_invocation_short_name, "streaming_client") == 0) {
-            return (num_slices < 2) ? 1 : 2;
-        } else if (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
-                   strcmp(program_invocation_short_name, "wivrn") == 0) {
-            return (num_slices < 4) ? num_slices : 4;
-        } else if (strcmp(program_invocation_short_name, "ffmpeg") == 0) {
-            return (num_slices < 4) ? num_slices : 4;
-        }
-    }
-#endif
-    return (num_slices < 4) ? num_slices : 4;
 }
 
 int h264_encoder_finish_frame(h264_encoder_t *encoder,

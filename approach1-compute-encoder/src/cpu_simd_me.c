@@ -134,6 +134,62 @@ uint32_t cpu_simd_sad_16x16(const uint8_t *src, int src_stride,
     return fn(src, src_stride, ref, ref_stride);
 }
 
+static int get_cmdline_threads(void)
+{
+#if defined(__linux__)
+    static int cached_threads = -1;
+    if (cached_threads != -1) return cached_threads;
+
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    if (!f) {
+        cached_threads = 0;
+        return 0;
+    }
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        cached_threads = 0;
+        return 0;
+    }
+    buf[n] = '\0';
+
+    size_t pos = 0;
+    while (pos < n) {
+        const char *arg = buf + pos;
+        size_t len = strlen(arg);
+
+        if ((strcmp(arg, "-threads") == 0 || strcmp(arg, "--threads") == 0 ||
+             strcmp(arg, "-slices") == 0 || strcmp(arg, "--slices") == 0) && (pos + len + 1 < n)) {
+            const char *val = buf + pos + len + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-threads=", 9) == 0 || strncmp(arg, "--threads=", 10) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-slices=", 8) == 0 || strncmp(arg, "--slices=", 9) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        }
+        pos += len + 1;
+    }
+    cached_threads = 0;
+#endif
+    return 0;
+}
+
 void cpu_simd_me_config_init(cpu_simd_me_config_t *cfg, uint32_t width, uint32_t height)
 {
     if (!cfg) return;
@@ -149,13 +205,16 @@ void cpu_simd_me_config_init(cpu_simd_me_config_t *cfg, uint32_t width, uint32_t
         int t = atoi(env_threads);
         if (t > 0 && t <= 16) cfg->num_threads = t;
     }
+    int cmd_t = get_cmdline_threads();
+    if (cmd_t > 0 && cmd_t <= 16) cfg->num_threads = cmd_t;
 #if defined(__linux__)
-    if (program_invocation_short_name &&
-        (strcmp(program_invocation_short_name, "sunshine") == 0 ||
-         strcmp(program_invocation_short_name, "steam") == 0 ||
-         strcmp(program_invocation_short_name, "streaming_client") == 0)) {
-        /* In live streaming, cap to 2 threads to guarantee game CPU headroom */
-        if (!env_threads && cfg->num_threads > 2) cfg->num_threads = 2;
+    if (program_invocation_short_name) {
+        if (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+            strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0) {
+            /* In live streaming, cap to 2 threads to guarantee game CPU headroom */
+            if (!env_threads && cmd_t <= 0 && cfg->num_threads > 2) cfg->num_threads = 2;
+        }
     }
 #endif
     cfg->core_ids[0] = -1;
@@ -222,12 +281,14 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
     if (max_rad > 16) max_rad = 16;
 
     int threads = (cfg && cfg->num_threads > 0) ? cfg->num_threads : 4;
+    int cmd_t = get_cmdline_threads();
+    if (cmd_t > 0 && cmd_t <= 16) threads = cmd_t;
 #if defined(__linux__)
     if (program_invocation_short_name &&
         (strcmp(program_invocation_short_name, "sunshine") == 0 ||
          strcmp(program_invocation_short_name, "steam") == 0 ||
          strcmp(program_invocation_short_name, "streaming_client") == 0)) {
-        if (threads > 2) threads = 2; /* Cap at 2 threads to guarantee game CPU headroom */
+        if (cmd_t <= 0 && threads > 2) threads = 2; /* Cap at 2 threads to guarantee game CPU headroom */
     }
 #endif
     if (threads > 16) threads = 16;

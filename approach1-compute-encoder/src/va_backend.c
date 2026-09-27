@@ -46,6 +46,62 @@ static int big_decode(VAProfile profile, VAEntrypoint entrypoint)
         && (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10);
 }
 
+static int get_cmdline_threads(void)
+{
+#if defined(__linux__)
+    static int cached_threads = -1;
+    if (cached_threads != -1) return cached_threads;
+
+    FILE *f = fopen("/proc/self/cmdline", "rb");
+    if (!f) {
+        cached_threads = 0;
+        return 0;
+    }
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        cached_threads = 0;
+        return 0;
+    }
+    buf[n] = '\0';
+
+    size_t pos = 0;
+    while (pos < n) {
+        const char *arg = buf + pos;
+        size_t len = strlen(arg);
+
+        if ((strcmp(arg, "-threads") == 0 || strcmp(arg, "--threads") == 0 ||
+             strcmp(arg, "-slices") == 0 || strcmp(arg, "--slices") == 0) && (pos + len + 1 < n)) {
+            const char *val = buf + pos + len + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-threads=", 9) == 0 || strncmp(arg, "--threads=", 10) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        } else if (strncmp(arg, "-slices=", 8) == 0 || strncmp(arg, "--slices=", 9) == 0) {
+            const char *val = strchr(arg, '=') + 1;
+            int t = atoi(val);
+            if (t >= 1 && t <= 16) {
+                cached_threads = t;
+                return cached_threads;
+            }
+        }
+        pos += len + 1;
+    }
+    cached_threads = 0;
+#endif
+    return 0;
+}
+
 static bc250_driver_data* get_driver_data(VADriverContextP ctx) {
     return (bc250_driver_data*)ctx->pDriverData;
 }
@@ -625,6 +681,17 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                 } else {
                     c->h264_enc = h264_encoder_create(&data->gpu, picture_width, picture_height, 30, 4000000, prof);
                     if (c->h264_enc) {
+                        int def_slices = 4;
+                        const char *s_env = getenv("BC250_SLICES_PER_FRAME");
+                        if (s_env) {
+                            int s = atoi(s_env);
+                            if (s >= 1 && s <= 16) def_slices = s;
+                        } else {
+                            int cmd_t = get_cmdline_threads();
+                            if (cmd_t >= 1 && cmd_t <= 16) def_slices = cmd_t;
+                            else if (picture_width < 1280 && picture_height < 720) def_slices = 1;
+                        }
+                        h264_encoder_set_num_slices(c->h264_enc, def_slices);
                         for (int a = 0; a < data->configs[config_id].num_attribs; a++) {
                             if (data->configs[config_id].attribs[a].type == VAConfigAttribRateControl) {
                                 unsigned int rc_attrib = data->configs[config_id].attribs[a].value;
@@ -2296,11 +2363,14 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
         } else if (strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
                    strcmp(program_invocation_short_name, "wivrn") == 0) {
             def_threads = 4;
-        } else if (strcmp(program_invocation_short_name, "ffmpeg") == 0) {
+        } else if (strcmp(program_invocation_short_name, "ffmpeg") == 0 ||
+                   strcmp(program_invocation_short_name, "ffmpeg_g") == 0) {
             def_threads = 4;
         }
     }
 #endif
+    int cmd_t = get_cmdline_threads();
+    if (cmd_t > 0 && cmd_t <= 16) def_threads = cmd_t;
     omp_set_num_threads(def_threads);
 #endif
 
