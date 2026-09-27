@@ -1733,7 +1733,6 @@ static int get_cmdline_threads(void)
 }
 
 static int get_default_slice_threads(int num_slices) {
-    int threads = 1;
     const char *env_threads = getenv("BC250_MAX_CPU_THREADS");
     if (!env_threads) env_threads = getenv("BC250_THREADS");
     if (!env_threads) env_threads = getenv("BC250_CPU_THREADS");
@@ -1970,6 +1969,7 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
                 width, height, prof_idc);
         return encoder;
     }
+#endif
     /* Compute/Hybrid GPU+CPU backend */
     const char *be = getenv("BC250_H264_BACKEND");
     bool gpu_only = be && strcmp(be, "gpu") == 0;
