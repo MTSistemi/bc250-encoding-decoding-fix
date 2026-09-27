@@ -9,15 +9,18 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #if defined(__linux__)
 #include <sched.h>
 #include <pthread.h>
+extern char *program_invocation_short_name;
 #endif
 
 #include "cpu_simd_me.h"
-#include <stdlib.h>
-#include <string.h>
 
 #if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
@@ -88,6 +91,9 @@ static uint32_t cpu_simd_sad_16x16_sse2(const uint8_t *src, int src_stride,
 }
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((unused))
+#endif
 static uint32_t cpu_simd_sad_16x16_scalar(const uint8_t *src, int src_stride,
                                           const uint8_t *ref, int ref_stride)
 {
