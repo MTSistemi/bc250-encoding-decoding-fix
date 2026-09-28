@@ -13,12 +13,28 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <string.h>
 #include <assert.h>
 
 #include "encoder_h265.h"
 #include "hevc_intra.h"
+
+/* Create the test's stream file 0600 and refuse a symbolic link at its name.
+ * The fallback is /tmp, which anybody can write to: a link planted there with
+ * this name would otherwise make the test write through it, and fopen(...,
+ * "wb") would also leave the mode to the umask (CodeQL
+ * cpp/world-writable-file-creation). */
+static FILE *fopen_wb(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) close(fd);
+    return f;
+}
 
 /* Pure-math regression: forward transform + real HEVC dequant/inverse
  * transform should round-trip a DC-only (constant) residual block back to
@@ -121,9 +137,9 @@ static void test_multi_frame_gop(void) {
     uint8_t *out_buf = malloc(out_cap);
     assert(out_buf != NULL);
 
-    FILE *f = fopen("bc250_test_stream.hevc", "wb");
+    FILE *f = fopen_wb("bc250_test_stream.hevc");
     if (!f) {
-        f = fopen("/tmp/bc250_test_stream.hevc", "wb");
+        f = fopen_wb("/tmp/bc250_test_stream.hevc");
     }
     if (!f) {
         fprintf(stderr, "[test_hevc_encode] Warning: could not open output stream file for writing, proceeding in memory\n");

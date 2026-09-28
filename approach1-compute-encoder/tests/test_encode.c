@@ -5,6 +5,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -13,6 +15,20 @@
 #include "encoder_h264.h"
 #include "bitstream.h"
 #include "cavlc.h"
+
+/* Create the test's stream file 0600 and refuse a symbolic link at its name.
+ * The fallback is /tmp, which anybody can write to: a link planted there with
+ * this name would otherwise make the test write through it, and fopen(...,
+ * "wb") would also leave the mode to the umask (CodeQL
+ * cpp/world-writable-file-creation). */
+static FILE *fopen_wb(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) close(fd);
+    return f;
+}
 
 /*
  * Regression test for the Intra16x16 luma DC transpose bug fixed in commit
@@ -357,9 +373,9 @@ int main(void) {
     uint8_t *out_buf = malloc(out_cap);
     assert(out_buf != NULL);
 
-    FILE *f_stream = fopen("bc250_test_stream.h264", "wb");
+    FILE *f_stream = fopen_wb("bc250_test_stream.h264");
     if (!f_stream) {
-        f_stream = fopen("/tmp/bc250_test_stream.h264", "wb");
+        f_stream = fopen_wb("/tmp/bc250_test_stream.h264");
     }
     if (!f_stream) {
         fprintf(stderr, "[test_encode] Warning: could not open output stream file for writing, running in-memory checks\n");
