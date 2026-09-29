@@ -4211,11 +4211,17 @@ of Sunshine before either starts.
 * `BC250_CU_REPORT=1` (opt-in, diagnostic only) queries
   `VkPhysicalDeviceShaderCoreProperties{,2}` on the same physical device the
   encoder runs on, prints the SE x SA x CU/SA topology, and prints the two
-  `AMD_CU_MASK` values - having checked both against Mesa's legality rules
-  first, so a mask this driver recommends is one Mesa will accept. Compiled
-  out entirely on Vulkan-Headers older than the AMD registry entry, for the
-  same reason the dma-buf wait is: a hand-transcribed struct layout that is
-  subtly wrong reads garbage.
+  `AMD_CU_MASK` values. The masks are **found by search**
+  (`bc250_pick_cu_split()`), not computed as "the top K", and that is not
+  fussiness: CU2/CU3 are required in every mask, so a contiguous split is
+  illegal on both sides and neither half can be smaller than 2. The first
+  implementation here *was* "the top K", and a brute-force check against
+  Mesa's own rule set found it produced a mask Mesa would reject on 5 of the 7
+  plausible shader-array widths - silently, since a rejected mask means "all
+  CUs". The search was verified against exhaustive enumeration on every width
+  from 2 to 16. Compiled out entirely on Vulkan-Headers older than the AMD
+  registry entry, for the same reason the dma-buf wait is: a hand-transcribed
+  struct layout that is subtly wrong reads garbage.
 * `tools/sunshine_preset/apply_gpu_ringfence.sh` reads that report, writes the
   encoder mask into a Sunshine systemd drop-in, writes a wrapper for the
   game's launch command, and grants `CAP_SYS_NICE` so

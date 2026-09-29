@@ -154,55 +154,141 @@ if ! [[ "$CU_PER_SA" =~ ^[0-9]+$ ]] || ! [[ "$TOTAL_CUS" =~ ^[0-9]+$ ]] ||
 fi
 ARRAYS="$(( TOTAL_CUS / CU_PER_SA ))"
 
+# The masks themselves, in Mesa's own syntax: a list of CUs to ENABLE, within
+# one shader array, applied identically to every shader array. See
+# set_custom_cu_en_mask() in Mesa's src/amd/common/ac_gpu_info.c.
+#
+# ⚠️ The split is FOUND BY SEARCH, not computed as "the top K". Mesa requires
+# CU2 and CU3 in every mask (PS late-alloc) and at least one of CU0/CU1/CU3/CU4
+# (SPI late-alloc), which means a contiguous range is never legal on either
+# side: CU2/CU3 can only be in one half of a contiguous split. It also means
+# neither half can be smaller than 2 CUs. A mask that breaks any of these is
+# rejected with a message and then ignored - the process gets all CUs - so this
+# searches for a split Mesa will actually accept, and validates both halves
+# before writing anything.
+#
+# This is the same algorithm as bc250_pick_cu_split() in the driver, which is
+# what prints the masks this script consumes.
+cu_mask_legal() {   # $@ = the CU indices in the mask
+    local m=0 full ge i
+    for i in "$@"; do
+        [ "$i" -ge "$CU_PER_SA" ] && return 1
+        m=$(( m | (1 << i) ))
+    done
+    [ "$m" -eq 0 ] && return 1
+    full=$(( (1 << CU_PER_SA) - 1 ))
+    [ $(( m & full )) -eq 0 ] && return 1
+    ge=$(( full & ~0x3 ))              # gfx10: everything except CU2/CU3
+    [ $(( m & ge )) -eq 0 ] && return 1
+    [ $(( full & m & ~ge )) -eq 0 ] && return 1
+    return 0
+}
+
+# Renders a CU set (array CU_LIST) as Mesa's ID-list syntax:
+# comma-separated items, each "N" or "N-M".
+format_cu_set() {
+    local -a s=("$@")
+    local out="" i=0 j n
+    while [ "$i" -lt "${#s[@]}" ]; do
+        j="$i"
+        while [ $(( j + 1 )) -lt "${#s[@]}" && [ "${s[j+1]}" -eq $(( s[j] + 1 )) ]; do
+            j=$(( j + 1 ))
+        done
+        if [ "$j" -eq "$i" ]; then
+            out="${out:+$out,}${s[i]}"
+        else
+            out="${out:+$out,}${s[i]}-${s[j]}"
+        fi
+        i=$(( j + 1 ))
+    done
+    echo "$out"
+}
+
+# Smallest legal disjoint split giving the encoder $1 CUs per shader array.
+# On success sets the global arrays ENC_SET / GAME_SET. Same algorithm, and the
+# same answer, as bc250_pick_cu_split() in the driver.
+find_split() {
+    local want="$1"
+    local k start i j p moved
+    local -a chosen game in_enc
+
+    ENC_SET=()
+    GAME_SET=()
+    [ "$CU_PER_SA" -lt 4 ] && return 1
+
+    for (( k = want; k + 2 <= CU_PER_SA; k++ )); do
+        for (( start = 0; start + k <= CU_PER_SA; start++ )); do
+            chosen=()
+            for (( i = 0; i < k; i++ )); do chosen+=( $(( start + i )) ); done
+
+            while :; do
+                # Odometer over the k chosen indices: advance the rightmost
+                # one that can still move, then cascade the ones after it.
+                p=$(( k - 1 ))
+                moved=0
+                while [ "$p" -ge 0 ]; do
+                    if [ "${chosen[p]}" -lt $(( CU_PER_SA - (k - p) )) ]; then
+                        chosen[p]=$(( chosen[p] + 1 ))
+                        for (( j = p + 1; j < k; j++ )); do
+                            chosen[j]=$(( chosen[j-1] + 1 ))
+                        done
+                        moved=1
+                        break
+                    fi
+                    p=$(( p - 1 ))
+                done
+                [ "$moved" -eq 0 ] && break
+
+                game=()
+                for (( i = 0; i < CU_PER_SA; i++ )); do
+                    in_enc=0
+                    for (( j = 0; j < k; j++ )); do
+                        [ "${chosen[j]}" -eq "$i" ] && in_enc=1
+                    done
+                    [ "$in_enc" -eq 0 ] && game+=( "$i" )
+                done
+
+                if cu_mask_legal "${chosen[@]}" && cu_mask_legal "${game[@]}"; then
+                    ENC_SET=( "${chosen[@]}" )
+                    GAME_SET=( "${game[@]}" )
+                    return 0
+                fi
+            done
+        done
+    done
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# Split
+# --------------------------------------------------------------------------
 if [ "$CUS_PER_ARRAY" -ge "$CU_PER_SA" ]; then
     echo -e "${RED}  --cus-per-array $CUS_PER_ARRAY leaves nothing for the game (this part has $CU_PER_SA CUs per shader array).${NC}"
     echo -e "  Nothing has been changed."
     exit 1
 fi
+if ! find_split "$CUS_PER_ARRAY"; then
+    echo -e "${RED}  No legal AMD_CU_MASK split exists for a ${CU_PER_SA} CU/SA part.${NC}"
+    echo -e "  Mesa requires CU2/CU3 in *every* mask, so each half needs at least 2 CUs"
+    echo -e "  and a contiguous range is never legal. Ring-fencing is not available here;"
+    echo -e "  see docs/streaming-ringfence.md for what to do instead. Nothing changed."
+    exit 1
+fi
 
-# The masks themselves, in Mesa's own syntax: a list of CUs to ENABLE, within
-# one shader array, applied identically to every shader array. The encoder
-# takes the top K, the game gets the bottom CU/SA - K. See
-# set_custom_cu_en_mask() in Mesa's src/amd/common/ac_gpu_info.c.
-mask_for() {   # $1 = lowest CU index to enable, $2 = highest
-    if [ "$1" -eq "$2" ]; then echo "$1"; else echo "$1-$2"; fi
-}
-
-ENC_LO=$(( CU_PER_SA - CUS_PER_ARRAY ))
-ENC_HI=$(( CU_PER_SA - 1 ))
-GAME_LO=0
-GAME_HI=$(( CU_PER_SA - CUS_PER_ARRAY - 1 ))
-ENC_MASK="$(mask_for "$ENC_LO" "$ENC_HI")"
-GAME_MASK="$(mask_for "$GAME_LO" "$GAME_HI")"
-
-# Mesa's legality rules, applied here rather than discovered at runtime: it
-# needs a CU in {0,1,3,4} (SPI late-alloc) and one in {2,3} (PS late-alloc)
-# in the mask, or it rejects the whole thing and silently means "all CUs".
-# The set is contiguous, so walking it is both the clearest way to say this
-# and the only one that cannot be got subtly wrong by an off-by-one.
-cu_mask_legal() {   # $1 = lowest CU index enabled, $2 = highest
-    local lo="$1" hi="$2" ge=0 ps=0 i
-    for ((i = lo; i <= hi && i < 32; i++)); do
-        case "$i" in 0|1|3|4) ge=1 ;; esac
-        case "$i" in 2|3)     ps=1 ;; esac
-    done
-    [ "$ge" -eq 1 ] && [ "$ps" -eq 1 ]
-}
+ENC_MASK="$(format_cu_set "${ENC_SET[@]}")"
+GAME_MASK="$(format_cu_set "${GAME_SET[@]}")"
+ENC_N=${#ENC_SET[@]}
+GAME_N=${#GAME_SET[@]}
 
 echo
 echo -e "  ${BOLD}Planned fence${NC}"
-echo -e "     encoder : AMD_CU_MASK=${GREEN}${ENC_MASK}${NC}  ($CUS_PER_ARRAY of $CU_PER_SA CU/SA, $(( CUS_PER_ARRAY * ARRAYS )) of $TOTAL_CUS CUs)"
-echo -e "     game    : AMD_CU_MASK=${GREEN}${GAME_MASK}${NC}  ($GAME_HI+1 of $CU_PER_SA CU/SA, $(( (GAME_HI + 1) * ARRAYS )) of $TOTAL_CUS CUs)"
-
-if ! cu_mask_legal "$ENC_LO" "$ENC_HI"; then
-    echo -e "  ${YELLOW}Note:${NC} Mesa will reject AMD_CU_MASK=${ENC_MASK} on this part (it needs a CU in"
-    echo -e "        both {0,1,3,4} and {2,3}). Try --cus-per-array 2, or a CU range that"
-    echo -e "        includes CU2 or CU3. Continuing anyway so you can see the driver's own"
-    echo -e "        warning on stderr - it will tell you the same thing."
-fi
-if ! cu_mask_legal "$GAME_LO" "$GAME_HI"; then
-    echo -e "  ${YELLOW}Note:${NC} the game's AMD_CU_MASK=${GAME_MASK} would also be rejected; give the game"
-    echo -e "        at least 3 CUs per shader array (--cus-per-array 1 with a ${CU_PER_SA}-CU array)."
+echo -e "     encoder : AMD_CU_MASK=${GREEN}${ENC_MASK}${NC}  ($ENC_N of $CU_PER_SA CU/SA, $(( ENC_N * ARRAYS )) of $TOTAL_CUS CUs)"
+echo -e "     game    : AMD_CU_MASK=${GREEN}${GAME_MASK}${NC}  ($GAME_N of $CU_PER_SA CU/SA, $(( GAME_N * ARRAYS )) of $TOTAL_CUS CUs)"
+echo -e "     ${GAME_N}CU per shader array is the finest split Mesa will accept on this part:"
+echo -e "     CU2/CU3 are required in every mask, so neither half can be a contiguous range."
+if [ "$ENC_N" -ne "$CUS_PER_ARRAY" ]; then
+    echo -e "     ${YELLOW}Note:${NC} asked for $CUS_PER_ARRAY, got $ENC_N - the search takes the nearest"
+    echo -e "           legal size at or above what was asked for."
 fi
 
 # --------------------------------------------------------------------------

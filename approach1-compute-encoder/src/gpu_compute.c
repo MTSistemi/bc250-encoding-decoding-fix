@@ -713,40 +713,138 @@ static VkShaderModule load_spirv_shader(VkDevice device, const char *filename) {
 #ifdef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD
 
 /* Mesa's own legality rules, transcribed from set_custom_cu_en_mask() in
- * src/amd/common/ac_gpu_info.c (Mesa 22.0+). A mask naming none of these
- * bits is REJECTED by the driver with a message on stderr and silently falls
- * back to "all CUs", which is the worst possible outcome for a user who
- * thinks they have ring-fenced something. Printed so the numbers below can be
- * checked rather than trusted, and checked again in code below so a mask this
- * driver recommends is one Mesa will actually accept. */
+ * src/amd/common/ac_gpu_info.c (Mesa 22.0+):
+ *
+ *   spi_cu_en &= BITFIELD_MASK(max_good_cu_per_sa);      // per array
+ *   if (!spi_cu_en)                                  error  // >= 1 CU
+ *   min_full_cu_mask = BITFIELD_MASK(min_good_cu_per_sa);
+ *   if (!(spi_cu_en & min_full_cu_mask))             error  // >= 1 "full" CU
+ *   ac_compute_late_alloc() -> cu_mask_ge;  gfx10: ~BITFIELD_RANGE(2, 2)
+ *   if (!(spi_cu_en & cu_mask_ge))                   error  // >= 1 of {0,1,3,4}
+ *   if (!(min_full & spi_cu_en & ~cu_mask_ge))       error  // >= 1 of {2,3}
+ *
+ * A mask failing any of these is REJECTED with a message on stderr and then
+ * IGNORED - the process gets all CUs. So a wrong mask does not degrade, it
+ * does nothing while looking as though it worked.
+ *
+ * The consequence that matters, and that a "just mask off the top N CUs"
+ * heuristic gets wrong on every real topology: CU2 and CU3 are required in
+ * EVERY mask, and a contiguous split can only put them in one half. So the
+ * two halves must be non-contiguous, and neither can be smaller than 2.
+ * That is why bc250_pick_cu_split() below searches rather than subtracts. */
 static const char *bc250_cu_mask_note(void)
 {
-    return "Mesa requires: at least 1 CU per SA; and at least one of CU0/CU1/CU3/CU4 "
-           "(SPI late-alloc) plus at least one of CU2/CU3 (PS late-alloc). A mask "
-           "failing any of these is rejected and silently becomes 'all CUs'.";
+    return "Mesa requires in EVERY mask: at least 1 CU, at least one of "
+           "CU0/CU1/CU3/CU4 (SPI late-alloc) and at least one of CU2/CU3 "
+           "(PS late-alloc). A mask failing any of these is rejected and "
+           "silently becomes 'all CUs'. CU2/CU3 are therefore required in both "
+           "halves, so a legal split is never a contiguous range and never "
+           "gives either side fewer than 2 CUs per array.";
 }
 
-/* Renders {lo..hi} as the AMD_CU_MASK ID-list syntax ("3,4" / "0-3" / a single
- * "2"), which is what set_custom_cu_en_mask() parses. */
-static void bc250_format_cu_range(char *buf, size_t buf_size, unsigned lo, unsigned hi)
+/* Renders a CU set as the AMD_CU_MASK ID-list syntax Mesa parses:
+ * comma-separated items, each "N" or "N-M" ("0,2-4,7"). */
+static void bc250_format_cu_set(char *buf, size_t buf_size,
+                                const unsigned *set, unsigned count)
 {
-    if (lo == hi) snprintf(buf, buf_size, "%u", lo);
-    else          snprintf(buf, buf_size, "%u-%u", lo, hi);
+    size_t off = 0;
+    buf[0] = '\0';
+    for (unsigned i = 0; i < count && off + 1 < buf_size; i++) {
+        unsigned j = i;
+        while (j + 1 < count && set[j + 1] == set[j] + 1) j++;
+        int n = snprintf(buf + off, buf_size - off, "%s%u",
+                         i ? "," : "", set[i]);
+        if (n < 0 || (size_t)n >= buf_size - off) break;
+        off += (size_t)n;
+        if (j > i) {
+            n = snprintf(buf + off, buf_size - off, "-%u", set[j]);
+            if (n < 0 || (size_t)n >= buf_size - off) break;
+            off += (size_t)n;
+        }
+        i = j;
+    }
 }
 
-/* The gfx10 legality rules above, applied to one candidate mask. Returns
- * true when Mesa would accept it. Kept next to bc250_cu_mask_note() so the
- * note and the check cannot drift apart. */
-static bool bc250_cu_mask_is_legal(unsigned cu_per_sa, unsigned lo, unsigned hi)
+/* The rules above, applied to one candidate set. Kept next to
+ * bc250_cu_mask_note() so the note and the check cannot drift apart. */
+static bool bc250_cu_set_is_legal(const unsigned *set, unsigned count, unsigned cu_per_sa)
 {
-    if (lo > hi || hi >= cu_per_sa || lo >= 32) return false;
-    /* At least one CU in the range (the "at least 1 CU per SA" rule). */
-    if (lo > 0) return false;
-    /* gfx10 SPI/PS late-alloc: one of {0,1,3,4} and one of {2,3}. */
-    const bool ge_ok = (lo <= 0 && hi >= 0) || (lo <= 1 && hi >= 1) ||
-                       (lo <= 3 && hi >= 3) || (lo <= 4 && hi >= 4);
-    const bool ps_ok = (lo <= 2 && hi >= 2) || (lo <= 3 && hi >= 3);
-    return ge_ok && ps_ok;
+    uint32_t m = 0;
+    for (unsigned i = 0; i < count; i++) {
+        if (set[i] >= cu_per_sa || set[i] >= 32) return false;
+        m |= 1u << set[i];
+    }
+    if (!m) return false;
+    const uint32_t min_full = (cu_per_sa >= 32) ? 0xFFFFFFFFu
+                                                : ((1u << cu_per_sa) - 1u);
+    if (!(m & min_full)) return false;
+    const uint32_t cu_mask_ge = min_full & ~((cu_per_sa > 3) ? 0x3u : 0u); /* gfx10: not CU2/CU3 */
+    if (!(m & cu_mask_ge)) return false;
+    if (!(min_full & m & ~cu_mask_ge)) return false;
+    return true;
+}
+
+/* Pick the smallest legal disjoint split of one shader array's CUs, giving
+ * `want_enc` of them to the encoder and the rest to the game. Both halves are
+ * validated by bc250_cu_set_is_legal(), so whatever comes back is a pair Mesa
+ * will actually accept - the whole point, since a rejected mask is silently
+ * ignored.
+ *
+ * Encoded as a search over the encoder set rather than arithmetic on a range
+ * because the constraint set forbids contiguous splits (see above): the first
+ * legal configuration found by scanning CU indices in order happens to be
+ * {0,2}, which is a legal, minimal, and intuitively "the two CUs you gave up
+ * are spread across the array" answer. Returns the number of CUs actually
+ * allocated to the encoder, or 0 if no legal split exists (cu_per_sa < 4). */
+static unsigned bc250_pick_cu_split(unsigned cu_per_sa, unsigned want_enc,
+                                    unsigned *enc_set, unsigned *game_set,
+                                    unsigned *enc_count, unsigned *game_count)
+{
+    *enc_count = *game_count = 0;
+    if (cu_per_sa < 4 || cu_per_sa > 31) return 0;
+
+    for (unsigned k = want_enc; k + 2 <= cu_per_sa; k++) {
+        /* Every k-subset of 0..cu_per_sa-1, walked in index order with an
+         * odometer over the chosen indices. cu_per_sa is at most 31, so this
+         * is not a performance concern; it is written out rather than
+         * recursed because the odometer is the clearest thing that is
+         * obviously correct about combinations, and a subtle bug here
+         * recommends a mask Mesa silently discards. */
+        for (unsigned start = 0; start + k <= cu_per_sa; start++) {
+            unsigned chosen[32];
+            for (unsigned i = 0; i < k; i++) chosen[i] = start + i;
+            bool more = true;
+            while (more) {
+                /* odometer: advance the rightmost element that can move */
+                unsigned p = k;
+                while (p > 0) {
+                    p--;
+                    if (chosen[p] < cu_per_sa - (k - p)) {
+                        chosen[p]++;
+                        for (unsigned q = p + 1; q < k; q++) chosen[q] = chosen[q - 1] + 1;
+                        break;
+                    }
+                    if (p == 0) more = false;
+                }
+                if (!more) break;
+
+                unsigned gcount = 0;
+                for (unsigned i = 0; i < cu_per_sa; i++) {
+                    bool in_enc = false;
+                    for (unsigned j = 0; j < k; j++) if (chosen[j] == i) { in_enc = true; break; }
+                    if (!in_enc) game_set[gcount++] = i;
+                }
+                if (bc250_cu_set_is_legal(chosen, k, cu_per_sa) &&
+                    bc250_cu_set_is_legal(game_set, gcount, cu_per_sa)) {
+                    for (unsigned j = 0; j < k; j++) enc_set[j] = chosen[j];
+                    *enc_count = k;
+                    *game_count = gcount;
+                    return k;
+                }
+            }
+        }
+    }
+    return 0;
 }
 
 void gpu_compute_report_cu_topology(gpu_context_t *ctx)
@@ -817,40 +915,42 @@ void gpu_compute_report_cu_topology(gpu_context_t *ctx)
             (active && active != total) ? ", harvested" : "");
 
     /* "Ring-fence K CUs for the encoder" in the only granularity this
-     * interface has: the encoder takes the top K CUs of every shader array,
-     * the game is told to use the bottom (CU/SA - K) and nothing else. Print
-     * both halves, because they are set in two different processes. */
+     * interface has: K CUs *of every shader array* for the encoder, the rest
+     * for the game. Found by search rather than by arithmetic - see
+     * bc250_pick_cu_split() for why no contiguous split is legal. Both halves
+     * printed, because they are set in two different processes. */
     const char *k_env = getenv("BC250_RINGFENCE_CUS_PER_SA");
-    unsigned k = (k_env && *k_env) ? (unsigned)atoi(k_env) : 2u;
-    if (k == 0 || k >= cu_per_sa) {
-        fprintf(stderr, "[bc250-gpu]   BC250_RINGFENCE_CUS_PER_SA=%u is out of range for "
-                        "%u CU/SA - using 2\n", k, cu_per_sa);
-        k = 2u;
+    unsigned want = (k_env && *k_env) ? (unsigned)atoi(k_env) : 2u;
+    if (want == 0 || want + 2 > cu_per_sa) {
+        fprintf(stderr, "[bc250-gpu]   BC250_RINGFENCE_CUS_PER_SA=%u cannot be honoured on a "
+                        "%u CU/SA part (Mesa needs >= 2 CUs in each half) - using 2\n",
+                want, cu_per_sa);
+        want = 2u;
     }
-    /* Mesa rejects a single-CU mask on gfx10 (the late-alloc rules below need
-     * two distinct bits), so K=1 cannot be honoured and is reported as such
-     * rather than silently rounded. */
-    const unsigned enc_lo = cu_per_sa - k, enc_hi = cu_per_sa - 1;
-    const unsigned game_lo = 0, game_hi = cu_per_sa - k - 1;
 
-    char enc[64], game[64];
-    bc250_format_cu_range(enc, sizeof enc, enc_lo, enc_hi);
-    bc250_format_cu_range(game, sizeof game, game_lo, game_hi);
+    unsigned enc_set[32], game_set[32];
+    unsigned enc_count = 0, game_count = 0;
+    unsigned k = bc250_pick_cu_split(cu_per_sa, want, enc_set, game_set,
+                                      &enc_count, &game_count);
+    if (k == 0) {
+        fprintf(stderr, "[bc250-gpu]   No legal AMD_CU_MASK split exists for a %u CU/SA part: Mesa "
+                        "requires CU2/CU3 in every mask, so both halves need >= 2 CUs.\n"
+                        "            Ring-fencing is not available here; see "
+                        "docs/streaming-ringfence.md for what to do instead.\n", cu_per_sa);
+        return;
+    }
 
+    char enc[96], game[96];
+    bc250_format_cu_set(enc, sizeof enc, enc_set, enc_count);
+    bc250_format_cu_set(game, sizeof game, game_set, game_count);
+
+    fprintf(stderr, "[bc250-gpu]   ring-fence: encode-> AMD_CU_MASK=%s   (%u of %u CU/SA, %u CUs total)\n",
+            enc, k, cu_per_sa, k * se * sa_per_se);
     fprintf(stderr, "[bc250-gpu]   ring-fence: game  -> AMD_CU_MASK=%s   (%u of %u CU/SA, %u CUs total)\n",
-            game, game_hi + 1u, cu_per_sa, (game_hi + 1u) * se * sa_per_se);
-    fprintf(stderr, "[bc250-gpu]   ring-fence: encode-> AMD_CU_MASK=%s   (%u CU/SA, %u CUs total)\n",
-            enc, k, k * se * sa_per_se);
+            game, game_count, cu_per_sa, game_count * se * sa_per_se);
     fprintf(stderr, "[bc250-gpu]   %s\n", bc250_cu_mask_note());
-
-    if (!bc250_cu_mask_is_legal(cu_per_sa, enc_lo, enc_hi)) {
-        fprintf(stderr, "[bc250-gpu]   NOTE: AMD_CU_MASK=%s would be REJECTED by Mesa on this part; "
-                        "the finest legal per-SA split is 2 CUs (e.g. 2,3).\n", enc);
-    }
-    if (!bc250_cu_mask_is_legal(cu_per_sa, game_lo, game_hi)) {
-        fprintf(stderr, "[bc250-gpu]   NOTE: AMD_CU_MASK=%s would be REJECTED by Mesa on this part; "
-                        "give the game at least 3 CU/SA.\n", game);
-    }
+    fprintf(stderr, "[bc250-gpu]   Both masks above are checked against those rules by this "
+                    "report, not asserted by it.\n");
     fprintf(stderr, "[bc250-gpu]   Apply with tools/sunshine_preset/apply_gpu_ringfence.sh; see "
                     "docs/streaming-ringfence.md for what this does and does not guarantee.\n");
 }

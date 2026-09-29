@@ -62,9 +62,20 @@ process gets all CUs. So a typo does not degrade, it does nothing while
 looking like it worked. Both `apply_gpu_ringfence.sh` and the driver's own
 `BC250_CU_REPORT=1` check the mask against these rules before recommending it.
 
-The practical consequence: the finest split Mesa accepts on gfx10 is **two**
-CUs per array, and those two must include one of CU2/CU3. On a 5-CU array that
-is `{3,4}`; on an 8-CU array it is `{2,7}`, not `{6,7}`.
+**This rules out the obvious approach.** CU2 and CU3 are required in *every*
+mask, and a contiguous range can only put them in one half. So:
+
+* a contiguous split is **never** legal, on either side;
+* neither half can be smaller than **2 CUs**, since each needs at least one of
+  CU2/CU3 and at least one of the others;
+* on a part with fewer than 4 CUs per array, no legal split exists at all.
+
+The masks are therefore found by *search* over CU sets, not by taking "the top
+N" - which is why both the driver and the script contain a small
+`bc250_pick_cu_split()` / `find_split()` rather than some arithmetic. On a
+5-CU array the answer is `0,2` for the encoder and `1,3-4` for the game, not
+`3,4` and `0,2`. On a part where no legal split exists, both say so plainly
+instead of emitting a mask Mesa would throw away.
 
 ## 3. Doing it
 
@@ -106,11 +117,17 @@ BC250_CU_REPORT=1 vainfo        # any VA-API/Vulkan client will do
 
 ```
 [bc250-gpu] CU topology: 8 SE x 1 SA x 5 CU/SA = 40 CUs (wave64)
-[bc250-gpu]   ring-fence: game  -> AMD_CU_MASK=0-3   (3 of 5 CU/SA, 24 CUs total)
-[bc250-gpu]   ring-fence: encode-> AMD_CU_MASK=3,4   (2 CU/SA, 16 CUs total)
+[bc250-gpu]   ring-fence: encode-> AMD_CU_MASK=0,2   (2 of 5 CU/SA, 16 CUs total)
+[bc250-gpu]   ring-fence: game  -> AMD_CU_MASK=1,3-4 (3 of 5 CU/SA, 24 CUs total)
+[bc250-gpu]   Mesa requires in EVERY mask: at least 1 CU, at least one of ...
 ```
 
-(`BC250_RINGFENCE_CUS_PER_SA=N` changes the K the report assumes.)
+(`BC250_RINGFENCE_CUS_PER_SA=N` changes the K the report aims for; the search
+takes the nearest legal size at or above it.)
+
+The 40-CU BC-250 works out at 16 CUs for the encoder, not 2 - and that is the
+interface's granularity talking, not a driver choice. "Two CUs" through this
+interface is always "two per shader array".
 
 ## 4. What this will not fix
 
