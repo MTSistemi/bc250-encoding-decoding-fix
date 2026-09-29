@@ -57,7 +57,9 @@ static bool is_steam_caller(void)
     return (strcmp(program_invocation_short_name, "steam") == 0 ||
             strcmp(program_invocation_short_name, "streaming_client") == 0 ||
             strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
-            strstr(program_invocation_short_name, "steam") != NULL);
+            strcmp(program_invocation_short_name, "gamescope") == 0 ||
+            strstr(program_invocation_short_name, "steam") != NULL ||
+            strstr(program_invocation_short_name, "gamescope") != NULL);
 #else
     return false;
 #endif
@@ -395,7 +397,7 @@ VAStatus bc250_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config, V
     }
 
     if (!attrib_list) {
-        *num_attribs = both ? 4 : 3;
+        *num_attribs = both ? 5 : 4;
         return VA_STATUS_SUCCESS;
     }
 
@@ -413,6 +415,12 @@ VAStatus bc250_QuerySurfaceAttributes(VADriverContextP ctx, VAConfigID config, V
         attrib_list[i].value.value.i = VA_FOURCC_P010;
         i++;
     }
+
+    attrib_list[i].type = VASurfaceAttribMemoryType;
+    attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+    attrib_list[i].value.type = VAGenericValueTypeInteger;
+    attrib_list[i].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
+    i++;
 
     attrib_list[i].type = VASurfaceAttribMaxWidth;
     attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
@@ -524,6 +532,16 @@ VAStatus bc250_CreateSurfaces2(VADriverContextP ctx, unsigned int format, unsign
                  * callers to correctly fall back to their working copy or EGL blit paths. */
                 if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_VA && mem_type != 0) {
                     return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+                }
+            } else if (attrib_list[i].type == VASurfaceAttribExternalBuffers) {
+                /* External buffer descriptor passed directly without memory type flag */
+                return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+            } else if (attrib_list[i].type == VASurfaceAttribPixelFormat) {
+                uint32_t fourcc = (uint32_t)attrib_list[i].value.value.i;
+                if (fourcc == VA_FOURCC_P010) {
+                    format = VA_RT_FORMAT_YUV420_10;
+                } else if (fourcc == VA_FOURCC_NV12 || fourcc == VA_FOURCC_YV12 || fourcc == VA_FOURCC_I420) {
+                    format = VA_RT_FORMAT_YUV420;
                 }
             }
         }

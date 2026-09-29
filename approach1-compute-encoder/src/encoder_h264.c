@@ -215,6 +215,32 @@ struct h264_encoder {
     gpu_mv_t *cpu_mvs;
     size_t cpu_mvs_cap;
 
+    /* Host-heap (ordinary cached RAM) copies of the two luma planes the CPU
+     * ME offload searches: the current frame and the reconstruction.
+     *
+     * WHY THIS EXISTS, and it is not a micro-optimisation: the surfaces they
+     * are copied from are allocated HOST_VISIBLE|HOST_COHERENT (see
+     * gpu_compute_create_image()), which on this APU is the GART aperture
+     * rather than a cached host mapping - a CPU load from it cannot be served
+     * by the CPU's caches at all. cpu_simd_me_search_frame() is built to be
+     * read-friendly (SIMD SAD, spatial-predicator and static-block early
+     * exits) and that only pays off out of cache: its worst case, the
+     * diamond search, is up to ~34 sixteen-byte loads per 16x16 block, and at
+     * 1080p that is millions of scattered uncached reads - tens of
+     * milliseconds, every frame, for the "cheap CPU fallback" that exists
+     * precisely because the GPU was slow. The early exits are also exactly
+     * what stops it on static content and what fails on fast action, so the
+     * worst case is reached in precisely the situation where the offload was
+     * engaged. One sequential row-by-row copy of each luma plane per frame is
+     * two streaming passes over ~3 MB, and after it the search runs out of
+     * ordinary cached memory.
+     *
+     * Allocated once per resolution and reused; freed in
+     * h264_encoder_destroy(). */
+    uint8_t *me_src_stage;
+    uint8_t *me_ref_stage;
+    size_t me_stage_cap;
+
 #ifdef BC250_HAVE_X264
     /* Non-NULL when H.264 goes through libx264 - see encoder_x264.h. The
      * compute pipeline above stays allocated either way: encode_raw() and
@@ -1775,7 +1801,9 @@ static bool is_steam_caller(void)
     return (strcmp(program_invocation_short_name, "steam") == 0 ||
             strcmp(program_invocation_short_name, "streaming_client") == 0 ||
             strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
-            strstr(program_invocation_short_name, "steam") != NULL);
+            strcmp(program_invocation_short_name, "gamescope") == 0 ||
+            strstr(program_invocation_short_name, "steam") != NULL ||
+            strstr(program_invocation_short_name, "gamescope") != NULL);
 #else
     return false;
 #endif
@@ -2270,23 +2298,75 @@ int h264_encoder_submit_frame_ext(h264_encoder_t *encoder,
         int me_mode = (tier >= GOV_TIER_1_GPU_FAST) ? 1 : 0;
 
         /* Dynamic Governor Tier 2: CPU SIMD Motion Estimation Offload.
-         * Only run if explicitly opted in via BC250_ENABLE_CPU_ME=1 / cpu_offload_enabled. */
+         * Only run if explicitly opted in via BC250_ENABLE_CPU_ME=1 / cpu_offload_enabled.
+         *
+         * This is the one path in the encoder that reads the *input frame*
+         * and the *reconstruction* from the CPU rather than handing them to a
+         * compute shader, and both of those reads are hazards that the GPU
+         * path does not have, which is why the two gates below exist. Neither
+         * hazard is theoretical; see gpu_compute_wait_for_image_ready_host()
+         * and gpu_compute_cpu_read_safe() for the full argument. In short:
+         * this tier is entered when the GPU is slow, which is also when the
+         * foreign renderer (Sunshine's own GL pass) is slow, which is also
+         * when reading its half-written output is most likely - so the tier
+         * that was supposed to make a busy stream smoother was instead a
+         * source of the garbled frames that come with a busy one. */
         if (!is_idr && tier == GOV_TIER_2_CPU_OFFLOAD && encoder->governor.cpu_offload_enabled &&
             input_memory.memory != VK_NULL_HANDLE &&
             gpu_ctx->has_recon_frame && gpu_ctx->recon_image.y_plane != VK_NULL_HANDLE &&
-            gpu_ctx->recon_memory.memory != VK_NULL_HANDLE) {
+            gpu_ctx->recon_memory.memory != VK_NULL_HANDLE &&
+            /* GATE 1: the reconstruction is written by *this* driver's own
+             * GPU. Provably finished in the synchronous path (it finished the
+             * previous frame before returning), NOT provably finished in the
+             * pipelined path, where the previous frame may still be
+             * mid-reconstruct - and reading that from the CPU is a torn read
+             * of our own output, which no amount of dma-buf fencing helps
+             * with. Falling back to GPU ME here is always safe: it is the
+             * behaviour this driver had before Tier 2 existed. */
+            gpu_compute_cpu_read_safe(gpu_ctx) &&
+            /* GATE 2: the input surface is written by a *foreign* GPU
+             * context when it has been exported as a dma-buf, and nothing in
+             * this thread can know whether that render pass has finished.
+             * gpu_compute_wait_for_image_ready_host() blocks on the same
+             * dma-buf read fence va_backend.c already hands to the GPU as a
+             * submit semaphore, so this costs the wait the GPU path was about
+             * to pay anyway microseconds later and orders the CPU against
+             * exactly the same dependency. */
+            (!gpu_ctx->any_surface_exported ||
+             gpu_compute_wait_for_image_ready_host(gpu_ctx, input_memory) == 0)) {
 
             gpu_nv12_layout_t in_layout, ref_layout;
             bool unmap_in = false, unmap_ref = false;
             uint8_t *in_base = gpu_compute_map_surface(gpu_ctx, &input_surface, input_memory, &in_layout, &unmap_in);
             uint8_t *ref_base = gpu_compute_map_surface(gpu_ctx, &gpu_ctx->recon_image, gpu_ctx->recon_memory, &ref_layout, &unmap_ref);
 
-            if (in_base && ref_base) {
+            /* One streaming copy of each luma plane into cached host RAM, so
+             * the search itself runs out of cache instead of out of the GART.
+             * See me_src_stage's comment in struct h264_encoder. */
+            const size_t luma_bytes = (size_t)encoder->width * encoder->height;
+            if (in_base && ref_base && encoder->me_stage_cap < luma_bytes) {
+                uint8_t *ns = realloc(encoder->me_src_stage, luma_bytes);
+                uint8_t *nr = ns ? realloc(encoder->me_ref_stage, luma_bytes) : NULL;
+                if (nr) {
+                    encoder->me_src_stage = ns;
+                    encoder->me_ref_stage = nr;
+                    encoder->me_stage_cap = luma_bytes;
+                }
+            }
+
+            if (in_base && ref_base && encoder->me_stage_cap >= luma_bytes) {
                 const uint8_t *src_y = in_base + in_layout.y_offset;
                 const uint8_t *ref_y = ref_base + ref_layout.y_offset;
+                uint8_t *src_stage = encoder->me_src_stage;
+                uint8_t *ref_stage = encoder->me_ref_stage;
 
-                if (cpu_simd_me_search_frame(src_y, (int)in_layout.y_pitch,
-                                             ref_y, (int)ref_layout.y_pitch,
+                for (uint32_t r = 0; r < encoder->height; r++) {
+                    memcpy(src_stage + (size_t)r * encoder->width, src_y + (size_t)r * in_layout.y_pitch, encoder->width);
+                    memcpy(ref_stage + (size_t)r * encoder->width, ref_y + (size_t)r * ref_layout.y_pitch, encoder->width);
+                }
+
+                if (cpu_simd_me_search_frame(src_stage, (int)encoder->width,
+                                             ref_stage, (int)encoder->width,
                                              encoder->width, encoder->height,
                                              encoder->cpu_mvs,
                                              &encoder->me_cfg) == 0) {
@@ -3794,5 +3874,7 @@ void h264_encoder_destroy(h264_encoder_t *encoder)
     if (encoder->mvs_shadow) free(encoder->mvs_shadow);
     if (encoder->nz_masks_shadow) free(encoder->nz_masks_shadow);
     if (encoder->cpu_mvs) free(encoder->cpu_mvs);
+    if (encoder->me_src_stage) free(encoder->me_src_stage);
+    if (encoder->me_ref_stage) free(encoder->me_ref_stage);
     free(encoder);
 }

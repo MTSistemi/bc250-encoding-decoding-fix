@@ -27,7 +27,9 @@ static bool is_steam_caller(void)
     return (strcmp(program_invocation_short_name, "steam") == 0 ||
             strcmp(program_invocation_short_name, "streaming_client") == 0 ||
             strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
-            strstr(program_invocation_short_name, "steam") != NULL);
+            strcmp(program_invocation_short_name, "gamescope") == 0 ||
+            strstr(program_invocation_short_name, "steam") != NULL ||
+            strstr(program_invocation_short_name, "gamescope") != NULL);
 #else
     return false;
 #endif

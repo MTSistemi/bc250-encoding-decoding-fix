@@ -111,6 +111,12 @@ To configure Sunshine for zero-stutter 60/120 FPS game streaming with minimal GP
 ```
 *See [`docs/sunshine-guide.md`](docs/sunshine-guide.md) for full configuration, and [`docs/troubleshooting.md`](docs/troubleshooting.md) for Gamescope / Steam Link fixes.*
 
+To stop a game taking every Compute Unit from the encoder:
+```bash
+./tools/sunshine_preset/apply_gpu_ringfence.sh
+```
+*See [`docs/streaming-ringfence.md`](docs/streaming-ringfence.md) — what can and cannot be ring-fenced on Mesa, and why a saturated game still costs a live stream more than a CU shortage alone explains.*
+
 ### WiVRn (Wireless VR Streaming)
 To configure WiVRn for ~36ms motion-to-photon latency and ~190 Mbps throughput:
 ```bash
@@ -135,6 +141,11 @@ To configure WiVRn for ~36ms motion-to-photon latency and ~190 Mbps throughput:
 | `OMP_WAIT_POLICY` | `PASSIVE` | Critical: enforces passive wait in `libgomp`, cutting CPU usage from 1300% to ~350%. |
 | `GOMP_SPINCOUNT` | `0` | Disables CPU busy-wait spin loops in worker threads. |
 | `BC250_USE_CABAC` | `1` (Main/High) | Toggles CABAC (10–13% smaller bitrate) vs CAVLC for H.264 encode. |
+| `BC250_CU_REPORT` | *(unset)* | Print this device's CU topology and the exact `AMD_CU_MASK` values that would ring-fence part of it. Diagnostic only; see [`docs/streaming-ringfence.md`](docs/streaming-ringfence.md). |
+| `BC250_RINGFENCE_CUS_PER_SA` | `2` | CUs per shader array that `BC250_CU_REPORT`'s advice assumes. Changes the reported advice, nothing else. |
+| `BC250_QUEUE_PRIORITY` | *(unset)* | `low`/`medium`/`high`/`realtime` global queue priority. HIGH and REALTIME need `CAP_SYS_NICE` or Vulkan refuses the device outright - see `apply_gpu_ringfence.sh`. |
+| `BC250_GOVERNOR_DWELL_FRAMES` | `0` (`8` live) | Frames a tier must be held before the governor may enter the CPU ME offload. Bounds how often the per-frame work mix can change; `0` for offline transcode. |
+| `BC250_GPU_TIMEOUT_MS` | *(unset)* | Overrides the GPU fence-wait budget. Unset means 16 ms for a live streaming caller, infinite otherwise. |
 
 ---
 

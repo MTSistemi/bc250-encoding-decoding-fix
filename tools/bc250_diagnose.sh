@@ -45,16 +45,23 @@ echo -e "  ${GREEN}✓ CPU Processing Threads: ${cores}${NC}"
 
 # 2. Audio Subsystem
 echo -e "\n${BOLD}[2/5] Checking Audio Subsystem...${NC}"
-if lsmod | grep bc250_audio_fix > /dev/null 2>&1; then
-    echo -e "  ${GREEN}✓ bc250_audio_fix kernel module is ACTIVE${NC}"
-else
-    echo -e "  ${YELLOW}! bc250_audio_fix module is not loaded.${NC}"
-    echo -e "    Run: cd audio-fix && sudo ./install_dkms.sh"
-fi
-
+hdmi_devs=0
 if command -v aplay &> /dev/null; then
     hdmi_devs=$(aplay -l 2>/dev/null | grep -i -E "hdmi|displayport" | wc -l)
-    echo -e "  ${GREEN}✓ Detected ${hdmi_devs} digital audio endpoints${NC}"
+fi
+
+if [ "$hdmi_devs" -gt 0 ]; then
+    echo -e "  ${GREEN}✓ Detected ${hdmi_devs} digital audio endpoints (native kernel audio functional; legacy DKMS module not needed)${NC}"
+    if lsmod | grep bc250_audio_fix > /dev/null 2>&1; then
+        echo -e "  ${YELLOW}! bc250_audio_fix module is also loaded alongside native audio.${NC}"
+        echo -e "    On modern kernels (e.g. CachyOS 7.2+), native kernel audio works directly. To avoid clashes:"
+        echo -e "    cd audio-fix && sudo ./uninstall_dkms.sh"
+    fi
+elif lsmod | grep bc250_audio_fix > /dev/null 2>&1; then
+    echo -e "  ${GREEN}✓ bc250_audio_fix kernel module is ACTIVE (legacy DKMS)${NC}"
+else
+    echo -e "  ${YELLOW}! No digital audio endpoints detected and bc250_audio_fix module is not loaded.${NC}"
+    echo -e "    If running on an older kernel without native audio support, run: cd audio-fix && sudo ./install_dkms.sh"
 fi
 
 # 3. VA-API Driver Installation
@@ -259,7 +266,7 @@ else
         echo -e "    should apply normally; the check below is meaningful here."
     fi
 
-    if pgrep -x gamescope > /dev/null 2>&1; then
+    if pgrep -f "gamescope" > /dev/null 2>&1 || [ -n "${GAMESCOPE_WAYLAND_DISPLAY:-}" ] || [ "${XDG_CURRENT_DESKTOP:-}" = "gamescope" ] || [ "${DESKTOP_SESSION:-}" = "gamescope" ]; then
         echo -e "  ${BLUE}ℹ Active Gamescope / Gaming Mode session detected.${NC}"
         if [ "$CAPEFF" = "0000000000000000" ] && [ "${SUNSHINE_UID:-0}" != "0" ]; then
             echo -e "  ${RED}✗ In Gaming Mode, Sunshine lacks DRM KMS capture capabilities (CapEff=0000000000000000).${NC}"

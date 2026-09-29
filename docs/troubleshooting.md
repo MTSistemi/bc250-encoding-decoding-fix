@@ -528,5 +528,48 @@ In Arch Linux, `lib32-x264` is located in the **Arch User Repository (AUR)** rat
    * **Single-Slice Enforcement**: The driver automatically detects Steam Remote Play callers and forces single-slice encoding (`num_slices = 1` and `b_sliced_threads = 0`) across both [`va_backend.c`](file:///D:/Kai/bc250-encoding-decoding-fix/approach1-compute-encoder/src/va_backend.c), [`encoder_h264.c`](file:///D:/Kai/bc250-encoding-decoding-fix/approach1-compute-encoder/src/encoder_h264.c), and [`encoder_x264.c`](file:///D:/Kai/bc250-encoding-decoding-fix/approach1-compute-encoder/src/encoder_x264.c), even if `BC250_SLICES_PER_FRAME=4` is present in system environment configs. Slices can still be manually forced with `BC250_FORCE_SLICES=1`.
 8. **Heavy 3D Game / RDR 2 Benchmark 200ms Latency Spike Elimination**:
    * **Root Cause**: Titles that saturate 100% of the 40 Compute Units (such as Red Dead Redemption 2 running on DirectX 12 / Vulkan via Proton) submit massive rendering command buffers to the GPU. In the compute encoder, [`gpu_compute_sync_slot()`](file:///D:/Kai/bc250-encoding-decoding-fix/approach1-compute-encoder/src/gpu_compute.c) previously waited with an unbounded fence timeout (`UINT64_MAX`), blocking the streaming thread for up to 200 ms while waiting for GPU compute passes to schedule behind RDR 2's graphics queue. Additionally, the governor oscillated back to GPU compute every other frame, causing severe latency spikes to recur frequently.
-   * **16ms Fence Timeout & Immediate CPU Failover**: [`gpu_compute_sync_slot()`](file:///D:/Kai/bc250-encoding-decoding-fix/approach1-compute-encoder/src/gpu_compute.c) and [`gpu_compute_begin_picture()`](file:///D:/Kai/bc250-encoding-decoding-fix/approach1-compute-encoder/src/gpu_compute.c) now strictly bound fence waits to 16 ms (1 frame interval at 60 fps) for live streaming sessions (overrideable via `BC250_GPU_TIMEOUT_MS`). If the GPU is blocked behind a game, the wait immediately times out, the frame completes in 0.1 ms on CPU as a safe P_Skip frame, and the Dynamic Governor engages Tier 3 Failover and Tier 2 CPU SIMD offload with 8-frame hysteresis to prevent fluttering. Total latency is strictly bounded under 16 ms.
+   * **16ms Fence Timeout & Immediate CPU Failover**: [`gpu_compute_sync_slot()`](approach1-compute-encoder/src/gpu_compute.c) and [`gpu_compute_begin_picture()`](approach1-compute-encoder/src/gpu_compute.c) now bound fence waits to 16 ms (1 frame interval at 60 fps) for live streaming sessions (overrideable via `BC250_GPU_TIMEOUT_MS`). If the GPU is blocked behind a game, the wait times out and the frame completes as a safe P_Skip.
+    > ⚠️ **Correction:** the "Total latency is strictly bounded under 16 ms" claim in the original text of this item was wrong, and this is where it stopped being true. Bounding the *fence wait* bounds one thing; a frame can still be blown by an unbounded `nanosleep` elsewhere in the same encode path, or by doing much more work than the tier it was on. Both happened - see §20, which is the full account.
+
    * **Recommended Zero-GPU Mode for 100% Saturated Titles**: For games that fully saturate the 40 CUs, using the CPU encoder (`backend=x264`, the default H.264 mode when `BC250_H264_BACKEND` is unset) ensures 0% GPU compute overhead and steady 2–4 ms encode latency on the Zen 2 CPU cores.
+
+## 20. Latency Spikes and Garbled Video That Survived the 16 ms Fix (§19 item 8)
+
+### Symptoms
+A live stream is fine on the desktop and degrades sharply during fast action in a GPU-saturating game. Two separate things are reported, and they have two separate causes:
+
+* **Host processing latency spikes past 200 ms**, with the Sunshine statistics showing a min/max/avg like `5.3/218.5/141.6 ms` and the frame rate collapsing to single digits. The stream's own numbers look "very close to running without Sunshine", which is the part that makes it look like a measurement mistake.
+* **The picture is garbled** - macroblock-level corruption, not just a soft frame. Much worse during fast action; a lesser version of the same thing appears during game benchmarks.
+
+### Why the 16 ms fence bound did not catch either
+
+The bound covers the `vkWaitForFences` in `gpu_compute_sync_slot()`. Neither of these spikes is a fence wait:
+
+1. **An unbounded sleep in the same encode path.** The transient-failure retries in `gpu_compute_create_image()` and `gpu_compute_end_picture()` slept 20, 40, 80, 160, 320, 640 ms between up to 7 attempts. A live caller hitting an allocation or a submit retry once had a *half-second* stall sitting in the frame, and a 160 ms one is by itself a ">200 ms spike" once the rest of the frame is counted. Those retries exist for real GPU contention, so a game that causes them is exactly the game that triggers them.
+
+2. **Work that got dramatically more expensive when it was least affordable.** Governor Tier 2 ("CPU SIMD Offload") is the tier that engages when the GPU is slow, and it moved the whole motion search to the CPU. The cost of that move was not counted anywhere: the SIMD search runs over a surface allocated `HOST_VISIBLE|HOST_COHERENT`, which on this APU is the GART aperture rather than a cached host mapping, so its many scattered 16-byte loads cannot be served from CPU cache at all. The search's own early-exits (static blocks, spatial predictor) are what keep it cheap on ordinary content - and they are exactly what stops working on fast action. So the tier meant to absorb GPU pressure was itself paying tens of milliseconds, precisely when the frame had least budget for it.
+
+### The garbling: a genuine read/write race, not a quality problem
+
+The same CPU ME path is the only place in this encoder that reads the input frame and the reconstruction **from the CPU** rather than handing them to a compute shader, and both of those reads were unordered:
+
+* The input surface is written by a **foreign GPU context** - Sunshine's own GL pass, through a dma-buf this driver exported. The existing protection was `gpu_compute_wait_for_image_ready()`, which snapshots the dma-buf read fence and hands it to `vkQueueSubmit()` as a Vulkan semaphore. That orders the *GPU* dispatch. It orders nothing on a `vkMapMemory()` + CPU load, which happens in this thread before that submit has even been recorded.
+* The reconstruction is written by **this driver's own GPU**, and in the synchronous path that is finished by construction. In the pipelined path it is not, and the CPU read raced it.
+
+Both produce a torn frame, and a torn frame produces exactly the reported symptom: corruption that scales with how busy the GPU is, because a busy GPU is what makes the foreign render pass slow *and* what makes the governor choose the tier that reads it. Garbling that tracks GPU load is a race, not a bitrate.
+
+### Fixes applied
+
+* **Live callers get a short retry schedule** - 3 attempts over 6 ms instead of 7 over 1260 ms - and then report failure to a caller that already has the correct answer (certify the frame P_Skip, which is what a decoder repeats for a frame it gets no new information for). An offline transcode keeps the long schedule, where spending two seconds to avoid a re-encode is right.
+* **The CPU ME path waits before it reads.** `gpu_compute_wait_for_image_ready_host()` blocks on the same dma-buf read fence the GPU was going to be given microseconds later, so it costs the wait that was going to happen anyway and additionally orders the CPU. `gpu_compute_cpu_read_safe()` separately requires this driver's own last submission to be complete, which covers the pipelined case; failing either gate falls back to GPU ME, i.e. the behaviour from before Tier 2 existed.
+* **The CPU ME path stages through cached host RAM.** One streaming row-by-row copy of each luma plane per frame, then the search runs out of ordinary cached memory instead of out of the GART. This is the difference between ~2 ms and tens of ms for the same search.
+* **The governor holds a tier before entering the offload** (`BC250_GOVERNOR_DWELL_FRAMES`, default 8 for live callers, 0 offline). The existing 8-frame hysteresis governed *leaving* the offload and said nothing about entering it, so a single bad frame could cross into a full CPU ME and back.
+* **A Tier 3 failover now lands on Tier 1, not Tier 2.** One late frame is not evidence that the GPU is unusable, and Tier 2 is the most expensive frame in the cycle. Sustained pressure still reaches Tier 2 through the EMA, which is an average and is unmoved by one spike.
+
+### Ring-fencing the CUs
+
+The related question - can the game be stopped from taking every CU - has an answer, with a granularity caveat, and it is not a driver setting. See **[`docs/streaming-ringfence.md`](streaming-ringfence.md)** and `tools/sunshine_preset/apply_gpu_ringfence.sh`.
+
+Short version: `VK_AMD_shader_core_policy` is the extension that would do this from inside a Vulkan app and **RADV does not expose it**. Mesa's per-process `AMD_CU_MASK` (Mesa ≥ 22.0) does work, but it is a mask *within* a shader array applied to *every* array, so "2 CUs" means 2 per array, and Mesa rejects a mask that would leave its hardware late-allocation constraints unsatisfied. `BC250_CU_REPORT=1` prints the topology and the two masks to use.
+
+Be clear-eyed about what a fence buys: it stops the game from dispatching on those CUs, which shortens how long the encoder's submission waits its turn. It does not create GPU time, and it does not touch the CPU-side cost, which DEVLOG §24.6 measures going from 7.1 ms to 24.0 ms under the same load with no code change.

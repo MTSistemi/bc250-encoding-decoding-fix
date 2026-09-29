@@ -23,11 +23,25 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <linux/dma-buf.h>
 
 #if defined(__linux__)
 extern char *program_invocation_short_name;
 #endif
+
+/* This file is long and its live-vs-offline policies are all defined together
+ * near the fence waits at the bottom, so every call site that needs one sits
+ * above its definition. Declared here rather than scattered. Each is defined
+ * once: get_fence_timeout_ns() is the fence-wait budget and the host-side
+ * cross-API wait's budget alike, is_live_caller() is the one definition of
+ * "this caller has a frame deadline" that the retry schedule also consults,
+ * and the two retry helpers exist only so those two sites cannot drift into
+ * disagreeing about the schedule (see their doc comment). */
+static uint64_t get_fence_timeout_ns(void);
+static bool is_live_caller(void);
+static int bc250_retry_attempts(void);
+static long bc250_retry_backoff_ms(int attempt);
 
 #define BC250_DEVICE_ID 0x13FE
 #define AMD_VENDOR_ID   0x1002
@@ -651,6 +665,207 @@ static VkShaderModule load_spirv_shader(VkDevice device, const char *filename) {
     return shader;
 }
 
+/* ============================================================================
+ * CU topology report (BC250_CU_REPORT=1)
+ *
+ * WHY THIS IS A REPORT AND NOT A FENCE
+ *
+ * "Ring-fence N Compute Units for the encoder" has exactly one user-space
+ * mechanism on this stack, and it is *not* a Vulkan API:
+ *
+ *  - VK_AMD_shader_core_policy (vkCmdSetShaderCorePolicyAMD, AMD_SHADER_CORE_
+ *    POLICY_FLAG_CU_MASK) is the vendor extension that would do it from
+ *    inside the process - and RADV does not expose it. Mesa's
+ *    radv_physical_device_get_supported_extensions() lists
+ *    AMD_shader_core_properties and AMD_shader_core_properties2, and no
+ *    shader_core_policy. Implementing the call anyway would be code that can
+ *    never run on the driver this driver actually loads.
+ *  - VK_EXT_global_priority reorders service, it does not partition
+ *    resources, and it needs CAP_SYS_NICE to get above MEDIUM
+ *    (BC250_QUEUE_PRIORITY=high, see bc250_gpu_init()).
+ *  - What *is* available is Mesa's per-process AMD_CU_MASK (Mesa >= 22.0,
+ *    both radeonsi and RADV, parsed by set_custom_cu_en_mask() in
+ *    src/amd/common/ac_gpu_info.c). It is read when the Mesa screen is
+ *    created, so it has to be in the *environment* of the process to be
+ *    affected - setting it from here, after Sunshine has already brought up
+ *    its own GL context, would do nothing at all.
+ *
+ * So the honest answer to "which CUs do I have, and what do I set?" is a
+ * report the user runs once, plus docs/streaming-ringfence.md plus
+ * tools/sunshine_preset/apply_gpu_ringfence.sh, which does the setting. The
+ * granularity detail that makes the report worth printing is in
+ * bc250_cu_mask_note() below and it is the part people get wrong: AMD_CU_MASK
+ * is a mask *within one shader array*, applied identically to every array on
+ * the part. "Ring-fence 2 CUs" therefore means "one CU in each of the 8
+ * shader arrays" = 8 real CUs on a 40-CU part, and there is no way to ask
+ * for two specific CUs out of forty through this interface.
+ * ========================================================================== */
+
+/* Vulkan-Headers older than the AMD shader-core-properties registry entry
+ * (pre-1.1.88) cannot describe this device's CU topology at all. Compile the
+ * whole report out there rather than hand-declaring the structs: a struct
+ * layout transcribed by hand is exactly the kind of thing that is subtly
+ * wrong and reads garbage, and the report is pure diagnostics - the
+ * ring-fencing it describes is applied by
+ * tools/sunshine_preset/apply_gpu_ringfence.sh, which reads the topology from
+ * the driver at runtime instead. Same pattern, and same reason, as the
+ * DMA_BUF_IOCTL_EXPORT_SYNC_FILE guard on the cross-API wait below. */
+#ifdef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD
+
+/* Mesa's own legality rules, transcribed from set_custom_cu_en_mask() in
+ * src/amd/common/ac_gpu_info.c (Mesa 22.0+). A mask naming none of these
+ * bits is REJECTED by the driver with a message on stderr and silently falls
+ * back to "all CUs", which is the worst possible outcome for a user who
+ * thinks they have ring-fenced something. Printed so the numbers below can be
+ * checked rather than trusted, and checked again in code below so a mask this
+ * driver recommends is one Mesa will actually accept. */
+static const char *bc250_cu_mask_note(void)
+{
+    return "Mesa requires: at least 1 CU per SA; and at least one of CU0/CU1/CU3/CU4 "
+           "(SPI late-alloc) plus at least one of CU2/CU3 (PS late-alloc). A mask "
+           "failing any of these is rejected and silently becomes 'all CUs'.";
+}
+
+/* Renders {lo..hi} as the AMD_CU_MASK ID-list syntax ("3,4" / "0-3" / a single
+ * "2"), which is what set_custom_cu_en_mask() parses. */
+static void bc250_format_cu_range(char *buf, size_t buf_size, unsigned lo, unsigned hi)
+{
+    if (lo == hi) snprintf(buf, buf_size, "%u", lo);
+    else          snprintf(buf, buf_size, "%u-%u", lo, hi);
+}
+
+/* The gfx10 legality rules above, applied to one candidate mask. Returns
+ * true when Mesa would accept it. Kept next to bc250_cu_mask_note() so the
+ * note and the check cannot drift apart. */
+static bool bc250_cu_mask_is_legal(unsigned cu_per_sa, unsigned lo, unsigned hi)
+{
+    if (lo > hi || hi >= cu_per_sa || lo >= 32) return false;
+    /* At least one CU in the range (the "at least 1 CU per SA" rule). */
+    if (lo > 0) return false;
+    /* gfx10 SPI/PS late-alloc: one of {0,1,3,4} and one of {2,3}. */
+    const bool ge_ok = (lo <= 0 && hi >= 0) || (lo <= 1 && hi >= 1) ||
+                       (lo <= 3 && hi >= 3) || (lo <= 4 && hi >= 4);
+    const bool ps_ok = (lo <= 2 && hi >= 2) || (lo <= 3 && hi >= 3);
+    return ge_ok && ps_ok;
+}
+
+void gpu_compute_report_cu_topology(gpu_context_t *ctx)
+{
+    if (!ctx || !ctx->physical_device) return;
+
+    uint32_t ext_count = 0;
+    vkEnumerateDeviceExtensionProperties(ctx->physical_device, NULL, &ext_count, NULL);
+    bool have_core_props = false, have_core_props2 = false;
+    VkExtensionProperties *ep = ext_count ? malloc(ext_count * sizeof(*ep)) : NULL;
+    if (ep) {
+        vkEnumerateDeviceExtensionProperties(ctx->physical_device, NULL, &ext_count, ep);
+        for (uint32_t i = 0; i < ext_count; i++) {
+            if (strcmp(ep[i].extensionName, "VK_AMD_shader_core_properties") == 0) have_core_props = true;
+#ifdef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_2_AMD
+            if (strcmp(ep[i].extensionName, "VK_AMD_shader_core_properties2") == 0) have_core_props2 = true;
+#endif
+        }
+        free(ep);
+    }
+
+    if (!have_core_props && !have_core_props2) {
+        fprintf(stderr, "[bc250-gpu] CU report: VK_AMD_shader_core_properties absent - "
+                        "cannot determine the CU topology from inside the driver.\n"
+                        "            Get it from the driver instead: "
+                        "`RADV_DEBUG=info vulkaninfo 2>&1 | grep -iE 'cu|shader_engine'`, "
+                        "or `vkcube --c` / `VK_LOADER_DEBUG` on a stock Mesa.\n");
+        return;
+    }
+
+    VkPhysicalDeviceShaderCorePropertiesAMD core = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD
+    };
+#ifdef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_2_AMD
+    /* Chained in when the device has it, purely for activeComputeUnitCount -
+     * the one number that says whether the part is harvesting CUs, which
+     * changes what a mask naming CU indices 0..CU/SA-1 actually selects. */
+    VkPhysicalDeviceShaderCoreProperties2AMD core2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_2_AMD
+    };
+    if (have_core_props2) core.pNext = &core2;
+#endif
+
+    VkPhysicalDeviceProperties2 p2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &core
+    };
+    vkGetPhysicalDeviceProperties2(ctx->physical_device, &p2);
+
+    const unsigned se       = core.shaderEngineCount;
+    const unsigned sa_per_se= core.shaderArraysPerEngineCount;
+    const unsigned cu_per_sa= core.computeUnitsPerShaderArray;
+    if (!se || !sa_per_se || !cu_per_sa) {
+        fprintf(stderr, "[bc250-gpu] CU report: driver reported an incomplete topology "
+                        "(SE=%u SA/SE=%u CU/SA) - skipping the mask advice\n",
+                se, sa_per_se, cu_per_sa);
+        return;
+    }
+    const unsigned total = se * sa_per_se * cu_per_sa;
+    unsigned active = 0;
+#ifdef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_2_AMD
+    if (have_core_props2) active = core2.activeComputeUnitCount;
+#endif
+
+    fprintf(stderr, "[bc250-gpu] CU topology: %u SE x %u SA x %u CU/SA = %u CUs"
+                    " (wave%u%s)\n",
+            se, sa_per_se, cu_per_sa, total, (unsigned)core.wavefrontSize,
+            (active && active != total) ? ", harvested" : "");
+
+    /* "Ring-fence K CUs for the encoder" in the only granularity this
+     * interface has: the encoder takes the top K CUs of every shader array,
+     * the game is told to use the bottom (CU/SA - K) and nothing else. Print
+     * both halves, because they are set in two different processes. */
+    const char *k_env = getenv("BC250_RINGFENCE_CUS_PER_SA");
+    unsigned k = (k_env && *k_env) ? (unsigned)atoi(k_env) : 2u;
+    if (k == 0 || k >= cu_per_sa) {
+        fprintf(stderr, "[bc250-gpu]   BC250_RINGFENCE_CUS_PER_SA=%u is out of range for "
+                        "%u CU/SA - using 2\n", k, cu_per_sa);
+        k = 2u;
+    }
+    /* Mesa rejects a single-CU mask on gfx10 (the late-alloc rules below need
+     * two distinct bits), so K=1 cannot be honoured and is reported as such
+     * rather than silently rounded. */
+    const unsigned enc_lo = cu_per_sa - k, enc_hi = cu_per_sa - 1;
+    const unsigned game_lo = 0, game_hi = cu_per_sa - k - 1;
+
+    char enc[64], game[64];
+    bc250_format_cu_range(enc, sizeof enc, enc_lo, enc_hi);
+    bc250_format_cu_range(game, sizeof game, game_lo, game_hi);
+
+    fprintf(stderr, "[bc250-gpu]   ring-fence: game  -> AMD_CU_MASK=%s   (%u of %u CU/SA, %u CUs total)\n",
+            game, game_hi + 1u, cu_per_sa, (game_hi + 1u) * se * sa_per_se);
+    fprintf(stderr, "[bc250-gpu]   ring-fence: encode-> AMD_CU_MASK=%s   (%u CU/SA, %u CUs total)\n",
+            enc, k, k * se * sa_per_se);
+    fprintf(stderr, "[bc250-gpu]   %s\n", bc250_cu_mask_note());
+
+    if (!bc250_cu_mask_is_legal(cu_per_sa, enc_lo, enc_hi)) {
+        fprintf(stderr, "[bc250-gpu]   NOTE: AMD_CU_MASK=%s would be REJECTED by Mesa on this part; "
+                        "the finest legal per-SA split is 2 CUs (e.g. 2,3).\n", enc);
+    }
+    if (!bc250_cu_mask_is_legal(cu_per_sa, game_lo, game_hi)) {
+        fprintf(stderr, "[bc250-gpu]   NOTE: AMD_CU_MASK=%s would be REJECTED by Mesa on this part; "
+                        "give the game at least 3 CU/SA.\n", game);
+    }
+    fprintf(stderr, "[bc250-gpu]   Apply with tools/sunshine_preset/apply_gpu_ringfence.sh; see "
+                    "docs/streaming-ringfence.md for what this does and does not guarantee.\n");
+}
+
+#else /* !VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD */
+
+void gpu_compute_report_cu_topology(gpu_context_t *ctx)
+{
+    (void)ctx;
+    fprintf(stderr, "[bc250-gpu] CU report: this build's Vulkan headers predate "
+                    "VK_AMD_shader_core_properties - skipping the topology report.\n");
+}
+
+#endif /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD */
+
 static VkPipeline create_compute_pipeline(VkDevice device, VkShaderModule shader, VkPipelineLayout layout) {
     if (!shader || !layout) return VK_NULL_HANDLE;
 
@@ -973,6 +1188,15 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         VK_CHECK(vkCreateDevice(ctx->physical_device, &dev_info, NULL, &ctx->device));
     }
     vkGetDeviceQueue(ctx->device, ctx->compute_queue_family, 0, &ctx->compute_queue);
+
+    /* One-time topology report, so the CU-ring-fencing knobs documented in
+     * docs/streaming-ringfence.md can be computed from this machine instead
+     * of guessed at. Diagnostic only, opt-in (BC250_CU_REPORT=1), and it
+     * changes no behaviour - see its own doc comment for why it is not the
+     * place where the fence is actually applied. */
+    if (getenv("BC250_CU_REPORT")) {
+        gpu_compute_report_cu_topology(ctx);
+    }
 
     if (have_memory_fd && have_dma_buf) {
         ctx->get_memory_fd_khr = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(ctx->device, "vkGetMemoryFdKHR");
@@ -1571,13 +1795,14 @@ int gpu_compute_create_image(gpu_context_t *ctx, int width, int height, int form
     image->current_layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
 
     VkResult result = VK_ERROR_UNKNOWN;
-    for (int attempt = 0; attempt < BC250_ALLOC_MAX_ATTEMPTS; attempt++) {
+    int max_attempts = bc250_retry_attempts();
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
         if (attempt > 0) {
-            long backoff_ms = 20L << (attempt - 1); /* 20, 40, 80 ms */
+            long backoff_ms = bc250_retry_backoff_ms(attempt); /* 20, 40, 80 ms; 2, 4 ms live */
             struct timespec ts = { .tv_sec = backoff_ms / 1000, .tv_nsec = (backoff_ms % 1000) * 1000000L };
             nanosleep(&ts, NULL);
             fprintf(stderr, "[bc250-gpu] Retrying image allocation (attempt %d/%d) after %ldms backoff\n",
-                    attempt + 1, BC250_ALLOC_MAX_ATTEMPTS, backoff_ms);
+                    attempt + 1, max_attempts, backoff_ms);
         }
 
         /* Chained onto both planes' VkImageCreateInfo (only when the device
@@ -1729,6 +1954,11 @@ int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int 
         fprintf(stderr, "[bc250-gpu] Vulkan error %d at %s:%d (vkGetMemoryFdKHR)\n", result, __FILE__, __LINE__);
         return -1;
     }
+    /* Remembered for the CPU-side read path: from here on, surfaces in this
+     * context may be being written by a foreign GPU API context, so a CPU
+     * reader has to establish the dma-buf fence before reading them (see
+     * ctx->any_surface_exported and gpu_compute_wait_for_image_ready_host()). */
+    ctx->any_surface_exported = true;
     return 0;
 }
 
@@ -1795,6 +2025,81 @@ int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory) {
     return 0;
 }
 
+/* The host-side twin of the wait above, sharing its fence snapshot.
+ *
+ * Same dma-buf read fence, same kernel mechanism - the only difference is
+ * that it is waited on by the CPU instead of being handed to the next
+ * vkQueueSubmit() as a semaphore. It has to exist because a semaphore that
+ * has not been submitted yet orders nothing on a CPU load: the Tier 2 CPU SIMD
+ * ME offload maps this surface and searches it directly, in this thread, at a
+ * point where the GPU-side wait queued above has not run yet. Under exactly
+ * the conditions that make a live stream enter that tier - a busy GPU, so
+ * Sunshine's own GL render pass into this surface is itself queued behind
+ * everything else - that read sees a half-written frame. See
+ * gpu_compute_wait_for_image_ready_host() in gpu_compute.h for why that
+ * shows up as garbled video rather than as a stall.
+ *
+ * Bounded: the same budget the fence waits in this file use, so a live
+ * caller can never park here past its frame deadline. A timeout is reported
+ * as -1, and the caller's correct response is to not read the surface this
+ * frame - the same safe fallback it already has for every other "no data"
+ * path, and cheap, because the frame it skips is a frame it would have
+ * certified P_Skip anyway under this much pressure. */
+int gpu_compute_wait_for_image_ready_host(gpu_context_t *ctx, gpu_memory_t memory) {
+    if (!ctx || !ctx->have_external_semaphore_fd || !ctx->import_semaphore_fd_khr) return -1;
+
+    int dmabuf_fd;
+    if (gpu_compute_export_nv12_dmabuf(ctx, memory, &dmabuf_fd) != 0) return -1;
+
+    struct dma_buf_export_sync_file sync_file_info = {
+        .flags = DMA_BUF_SYNC_READ,
+        .fd = -1
+    };
+    int ioctl_ret = ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &sync_file_info);
+    /* Our own independent reference to the buffer object (a fresh
+     * vkGetMemoryFdKHR call above) - the ioctl only reads the attached
+     * fences, it does not consume the dmabuf fd. */
+    close(dmabuf_fd);
+    if (ioctl_ret != 0) {
+        if (getenv("BC250_DEBUG_DMABUF")) {
+            fprintf(stderr, "[bc250-gpu] DMA_BUF_IOCTL_EXPORT_SYNC_FILE failed: %s\n", strerror(errno));
+        }
+        return -1;
+    }
+
+    /* Same 16 ms live-caller budget (or whatever BC250_GPU_TIMEOUT_MS set) the
+     * GPU fence waits use, in the units poll() wants. An unbounded budget (a
+     * non-live caller, or BC250_GPU_TIMEOUT_MS=0) still gets a cap here, but
+     * a generous one: the GPU-side waits can rely on Vulkan's own queue
+     * progress, and this one is a bare poll() on someone else's fence, which
+     * nothing in this driver can force. A second is far longer than any real
+     * render pass and far shorter than a hang. */
+    uint64_t budget_ns = get_fence_timeout_ns();
+    int timeout_ms = (budget_ns == UINT64_MAX) ? 1000 : (int)(budget_ns / 1000000ULL);
+    if (timeout_ms == 0) timeout_ms = 1;
+
+    struct pollfd pfd = { .fd = sync_file_info.fd, .events = POLLIN };
+    int n = poll(&pfd, 1, timeout_ms);
+    /* poll() consumes nothing; the sync fd is ours to close either way. */
+    close(sync_file_info.fd);
+
+    if (n < 0) {
+        if (getenv("BC250_DEBUG_DMABUF")) {
+            fprintf(stderr, "[bc250-gpu] poll() on the image-ready sync_file failed: %s\n", strerror(errno));
+        }
+        return -1;
+    }
+    if (n == 0) {
+        static int host_wait_timeout_count = 0;
+        if (host_wait_timeout_count++ < 5 || (host_wait_timeout_count % 300 == 0)) {
+            fprintf(stderr, "[bc250-gpu] host wait for the foreign writer of this surface timed out "
+                            "(%dms) - NOT reading it this frame\n", timeout_ms);
+        }
+        return -1;
+    }
+    return 0;
+}
+
 #else  /* !DMA_BUF_IOCTL_EXPORT_SYNC_FILE - pre-6.0 kernel headers */
 
 int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory) {
@@ -1803,6 +2108,14 @@ int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory) {
      * explicit wait was queued" and proceed, relying on the kernel's
      * implicit dma-buf fencing exactly as this driver did before the
      * explicit wait was added. */
+    return -1;
+}
+
+int gpu_compute_wait_for_image_ready_host(gpu_context_t *ctx, gpu_memory_t memory) {
+    (void)ctx; (void)memory;
+    /* Same reasoning, same contract: -1 means "could not establish the
+     * dependency", and the CPU ME offload that consumes this treats that as
+     * "do not read the surface this frame" rather than reading it anyway. */
     return -1;
 }
 
@@ -2212,6 +2525,24 @@ static double bc250_diag_delta_ms(const struct timespec *t0, const struct timesp
            (double)(t1->tv_nsec - t0->tv_nsec) / 1e6;
 }
 
+static bool is_live_caller(void)
+{
+#if defined(__linux__)
+    return program_invocation_short_name &&
+           (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+            strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+            strcmp(program_invocation_short_name, "wivrn") == 0 ||
+            strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0 ||
+            strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
+            strcmp(program_invocation_short_name, "gamescope") == 0 ||
+            strstr(program_invocation_short_name, "steam") != NULL ||
+            strstr(program_invocation_short_name, "gamescope") != NULL);
+#else
+    return false;
+#endif
+}
+
 static uint64_t get_fence_timeout_ns(void) {
     const char *env_timeout = getenv("BC250_GPU_TIMEOUT_MS");
     if (env_timeout && *env_timeout) {
@@ -2219,22 +2550,61 @@ static uint64_t get_fence_timeout_ns(void) {
         if (ms > 0) return (uint64_t)ms * 1000000ULL;
         if (ms == 0) return UINT64_MAX;
     }
-#if defined(__linux__)
-    if (program_invocation_short_name &&
-        (strcmp(program_invocation_short_name, "sunshine") == 0 ||
-         strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
-         strcmp(program_invocation_short_name, "wivrn") == 0 ||
-         strcmp(program_invocation_short_name, "steam") == 0 ||
-         strcmp(program_invocation_short_name, "streaming_client") == 0 ||
-         strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
-         strstr(program_invocation_short_name, "steam") != NULL)) {
+    if (is_live_caller()) {
         /* Live streaming deadline protection: 16ms max fence wait (1 frame @ 60fps).
          * Prevents heavy GPU-saturating 3D titles (e.g. RDR 2 benchmark) from stalling
          * the encoder thread for 200ms behind graphics queues. */
         return 16000000ULL;
     }
-#endif
     return UINT64_MAX;
+}
+
+int gpu_compute_cpu_read_safe(gpu_context_t *ctx) {
+    if (!ctx) return 0;
+    /* Nothing has ever been submitted: nothing can be outstanding. */
+    if (ctx->frames_submitted == 0) return 1;
+    /* The slot holding the most recent submission is the one current_buf
+     * points away from (gpu_compute_end_picture() toggles after submitting -
+     * see gpu_compute_submitted_slot()). A signaled fence is the driver-level
+     * proof that every command in that buffer, and therefore every write this
+     * driver has made to its own images and staging buffers, has completed. */
+    int slot = gpu_compute_submitted_slot(ctx);
+    if (slot < 0 || !ctx->fences[slot]) return 1;
+    return vkGetFenceStatus(ctx->device, ctx->fences[slot]) == VK_SUCCESS;
+}
+
+/* ============================================================================
+ * Retry schedule for the two transient-failure recoveries in this file: an
+ * image allocation (gpu_compute_create_image()) and a queue submission
+ * (gpu_compute_end_picture()). Both are documented in place as the same
+ * failure class - a busy GPU making an otherwise valid call fail
+ * transiently - and both used to share one schedule: up to 7 attempts with a
+ * 20, 40, 80, 160, 320, 640 ms backoff, i.e. up to 1260 ms.
+ *
+ * That schedule is right for a transcode and wrong for a stream, and the
+ * difference is not a matter of degree. A live caller has a 16.6 ms frame
+ * budget: a 160 ms sleep inside the encode path is not a slow frame, it is a
+ * dropped second, and Sunshine's own statistics show it as host-processing
+ * latency, which is exactly the ">200 ms spikes during fast action" this
+ * schedule can produce on its own - a game heavy enough to make an allocation
+ * or a submit fail transiently is a game that will make them fail again
+ * within milliseconds anyway, so the long sleeps buy nothing for a stream and
+ * cost ten frames.
+ *
+ * A live caller therefore gets three attempts over 6 ms, and then reports
+ * failure to its caller, which already has a correct, spec-legal answer for
+ * "no new GPU work this frame" (certify the frame P_Skip and send it, rather
+ * than sending stale data or nothing). An offline caller keeps the long
+ * schedule, where spending two seconds to avoid a re-encode is exactly right.
+ * ========================================================================== */
+static int bc250_retry_attempts(void) {
+    return is_live_caller() ? 3 : BC250_ALLOC_MAX_ATTEMPTS;
+}
+
+static long bc250_retry_backoff_ms(int attempt) {
+    /* attempt is 1-based: the delay *before* the given retry. */
+    return is_live_caller() ? (2L << (attempt - 1))   /* 2, 4 ms */
+                            : (20L << (attempt - 1)); /* 20, 40, 80 ... ms */
 }
 
 int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target) {
@@ -2935,17 +3305,19 @@ int gpu_compute_end_picture(gpu_context_t *ctx) {
      * this frame," rather than sending fabricated stale data as if it were
      * this frame's real content. */
     VkResult submit_result = VK_ERROR_UNKNOWN;
-    for (int attempt = 0; attempt < BC250_ALLOC_MAX_ATTEMPTS; attempt++) {
+    int submit_max_attempts = bc250_retry_attempts();
+    for (int attempt = 0; attempt < submit_max_attempts; attempt++) {
         if (attempt > 0) {
-            long backoff_ms = 20L << (attempt - 1); /* 20, 40, 80... ms - same schedule as gpu_compute_create_image() */
+            long backoff_ms = bc250_retry_backoff_ms(attempt); /* 20, 40, 80... ms; 2, 4 ms live - see bc250_retry_attempts() */
             struct timespec ts = { .tv_sec = backoff_ms / 1000, .tv_nsec = (backoff_ms % 1000) * 1000000L };
             nanosleep(&ts, NULL);
             fprintf(stderr, "[bc250-gpu] Retrying queue submit (attempt %d/%d) after %ldms backoff\n",
-                    attempt + 1, BC250_ALLOC_MAX_ATTEMPTS, backoff_ms);
+                    attempt + 1, submit_max_attempts, backoff_ms);
         }
         submit_result = vkQueueSubmit(ctx->compute_queue, 1, &submit_info, ctx->fences[ctx->current_buf]);
         if (submit_result == VK_SUCCESS) {
             clock_gettime(CLOCK_MONOTONIC, &ctx->submit_time[ctx->current_buf]);
+            ctx->frames_submitted++;
             break;
         }
         fprintf(stderr, "[bc250-gpu] vkQueueSubmit failed: %d\n", submit_result);
