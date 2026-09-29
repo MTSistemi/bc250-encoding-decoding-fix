@@ -533,7 +533,7 @@ VAStatus bc250_CreateSurfaces2(VADriverContextP ctx, unsigned int format, unsign
                 if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_VA && mem_type != 0) {
                     return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
                 }
-            } else if (attrib_list[i].type == VASurfaceAttribExternalBuffers) {
+            } else if (attrib_list[i].type == VASurfaceAttribExternalBufferDescriptor) {
                 /* External buffer descriptor passed directly without memory type flag */
                 return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
             } else if (attrib_list[i].type == VASurfaceAttribPixelFormat) {
