@@ -16,6 +16,9 @@
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
+#if defined(__linux__)
+extern char *program_invocation_short_name;
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -1459,7 +1462,9 @@ static void encode_mb_i16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
     bool left_avail = (mbx > 0 && (mb - 1) >= nc->start_mb);
     bool top_avail  = (mby > 0 && (mb - nc->width_in_mbs) >= nc->start_mb);
     int raw_luma_mode = gpu_pred_mode_i16(pred_modes, mb);
+    int raw_chroma_mode = gpu_chroma_pred_mode(pred_modes, mb);
     int pred_mode = h264_sanitize_i16_mode(raw_luma_mode, top_avail, left_avail);
+    int chroma_pred_mode = h264_sanitize_chroma_mode(raw_chroma_mode, top_avail, left_avail);
 
     int dc_in[4][4];
     for (int r = 0; r < 4; r++)
@@ -1497,13 +1502,7 @@ static void encode_mb_i16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
                     (mby > 0 && (mb - nc->width_in_mbs) >= nc->start_mb ? 1 : 0);
     cabac_write_mb_type_i16x16(cb, ctx_intra, cbp_luma_flag != 0, cbp_chroma, pred_mode);
 
-    /* intra_chroma_pred_mode: this project always transmits mode 0 (DC) -
-     * see cavlc_write_mb_i16x16_header()'s hardcoded 0 - so every possible
-     * neighbor also always has mode 0, making the ctxIdxInc formula's
-     * "neighbor's mode != 0" test always false regardless of availability;
-     * ctx is therefore always 0 without needing a dedicated neighbor-mode
-     * tracking array. */
-    cabac_write_intra_chroma_pred_mode(cb, 0, 0);
+    cabac_write_intra_chroma_pred_mode(cb, 0, chroma_pred_mode);
 
     *last_dqp_nonzero = cabac_write_qp_delta(cb, 0, *last_dqp_nonzero);
 
@@ -1769,6 +1768,19 @@ static int get_default_slice_threads(int num_slices) {
     return (num_slices < def_cap) ? num_slices : def_cap;
 }
 
+static bool is_steam_caller(void)
+{
+#if defined(__linux__)
+    if (!program_invocation_short_name) return false;
+    return (strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0 ||
+            strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
+            strstr(program_invocation_short_name, "steam") != NULL);
+#else
+    return false;
+#endif
+}
+
 h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
                                     uint32_t width, uint32_t height,
                                     uint32_t fps, uint32_t bitrate,
@@ -1822,6 +1834,17 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
             }
         }
     }
+#if defined(__linux__)
+    /* Steam Link hardware/app client decoders fail on multi-slice H.264 streams,
+     * rendering a grey or black screen. Steam Link callers MUST stay on 1 slice
+     * unless explicitly forced with BC250_FORCE_SLICES=1. */
+    if (is_steam_caller()) {
+        const char *force_slices = getenv("BC250_FORCE_SLICES");
+        if (!force_slices || (strcmp(force_slices, "1") != 0 && strcmp(force_slices, "true") != 0)) {
+            encoder->num_slices = 1;
+        }
+    }
+#endif
     encoder->quality_level = 4;
     encoder->max_frame_bits = 0;
 
@@ -2878,7 +2901,16 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
                 }
             }
         }
-        } /* gpu_compute_sync() == 0 */
+        } else {
+            /* GPU fence wait timed out or failed under heavy graphics contention (e.g. RDR 2 benchmark).
+             * Notify the dynamic governor with high latency so it immediately engages failover
+             * and CPU offload rather than oscillating. */
+            double timeout_ms = gpu_compute_get_last_latency_ms(gpu_ctx);
+            if (timeout_ms < 16.0) timeout_ms = 20.0;
+            if (!is_idr) {
+                dynamic_governor_update(&encoder->governor, timeout_ms);
+            }
+        }
     } else {
         /* Emergency Failover or submit failure: no GPU work was submitted for this frame.
          * Notify the governor so any Tier 3 Failover steps down to Tier 2 CPU offload. */

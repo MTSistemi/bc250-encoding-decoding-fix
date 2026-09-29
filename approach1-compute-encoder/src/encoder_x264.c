@@ -7,10 +7,31 @@
 #include "encoder_x264.h"
 #include "rate_control.h"
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <x264.h>
+
+#if defined(__linux__)
+extern char *program_invocation_short_name;
+#endif
+
+static bool is_steam_caller(void)
+{
+#if defined(__linux__)
+    if (!program_invocation_short_name) return false;
+    return (strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0 ||
+            strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
+            strstr(program_invocation_short_name, "steam") != NULL);
+#else
+    return false;
+#endif
+}
 
 struct h264_x264 {
     x264_t *h;
@@ -301,8 +322,11 @@ static int open_encoder(h264_x264_t *x, const h264_x264_config_t *cfg)
     p->i_threads = x->threads;
     if (cfg->live) {
         /* Sliced threads process each frame in parallel across threads without
-         * adding frame delay, keeping latency strictly under 4ms. */
-        p->b_sliced_threads = 1;
+         * adding frame delay, keeping latency strictly under 4ms.
+         * For Steam Link (steam, streaming_client), hardware and client decoders
+         * drop or fail on multiple slices per frame, causing solid grey or black screens.
+         * Enforce single slice (b_sliced_threads = 0) for Steam Link. */
+        p->b_sliced_threads = is_steam_caller() ? 0 : 1;
         p->rc.i_lookahead = 0;
         p->i_sync_lookahead = 0;
     }

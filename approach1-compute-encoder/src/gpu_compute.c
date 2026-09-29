@@ -25,6 +25,10 @@
 #include <fcntl.h>
 #include <linux/dma-buf.h>
 
+#if defined(__linux__)
+extern char *program_invocation_short_name;
+#endif
+
 #define BC250_DEVICE_ID 0x13FE
 #define AMD_VENDOR_ID   0x1002
 
@@ -2208,32 +2212,47 @@ static double bc250_diag_delta_ms(const struct timespec *t0, const struct timesp
            (double)(t1->tv_nsec - t0->tv_nsec) / 1e6;
 }
 
+static uint64_t get_fence_timeout_ns(void) {
+    const char *env_timeout = getenv("BC250_GPU_TIMEOUT_MS");
+    if (env_timeout && *env_timeout) {
+        int ms = atoi(env_timeout);
+        if (ms > 0) return (uint64_t)ms * 1000000ULL;
+        if (ms == 0) return UINT64_MAX;
+    }
+#if defined(__linux__)
+    if (program_invocation_short_name &&
+        (strcmp(program_invocation_short_name, "sunshine") == 0 ||
+         strcmp(program_invocation_short_name, "wivrn-server") == 0 ||
+         strcmp(program_invocation_short_name, "wivrn") == 0 ||
+         strcmp(program_invocation_short_name, "steam") == 0 ||
+         strcmp(program_invocation_short_name, "streaming_client") == 0 ||
+         strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
+         strstr(program_invocation_short_name, "steam") != NULL)) {
+        /* Live streaming deadline protection: 16ms max fence wait (1 frame @ 60fps).
+         * Prevents heavy GPU-saturating 3D titles (e.g. RDR 2 benchmark) from stalling
+         * the encoder thread for 200ms behind graphics queues. */
+        return 16000000ULL;
+    }
+#endif
+    return UINT64_MAX;
+}
+
 int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target) {
     (void)render_target;
     struct timespec w0, w1;
     if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &w0);
-    /* Unchecked until now - same "assume success" gap already fixed for
-     * vkQueueSubmit() in gpu_compute_end_picture() (see that function's doc
-     * comment), just on the wait side instead of the submit side. A
-     * UINT64_MAX timeout can't return VK_TIMEOUT, but real GPU contention
-     * (a concurrently active compositor/cursor-plane update sharing this
-     * same hardware queue) can make the underlying driver return
-     * VK_ERROR_DEVICE_LOST here without the fence's GPU work having
-     * actually finished. Falling through in that case would vkResetFences()
-     * and immediately start recording new commands into cmd_bufs[current_buf]
-     * while the GPU might still be executing the previous submission into
-     * it - undefined behavior that reads exactly like the corruption this
-     * was chasing (garbage/partial data landing in scattered blocks of the
-     * frame). Bail out instead and let the caller treat this the same as
-     * an end_picture() submit failure: no new GPU work this frame. */
-    VkResult wait_result = vkWaitForFences(ctx->device, 1, &ctx->fences[ctx->current_buf], VK_TRUE, UINT64_MAX);
+    uint64_t timeout_ns = get_fence_timeout_ns();
+    VkResult wait_result = vkWaitForFences(ctx->device, 1, &ctx->fences[ctx->current_buf], VK_TRUE, timeout_ns);
     if (ctx->perf_stats_enabled) {
         clock_gettime(CLOCK_MONOTONIC, &w1);
-        fprintf(stderr, "[BC250_PERF_WAIT] site=begin_picture buf=%d wait_ms=%.3f\n",
-                ctx->current_buf, bc250_diag_delta_ms(&w0, &w1));
+        fprintf(stderr, "[BC250_PERF_WAIT] site=begin_picture buf=%d wait_ms=%.3f res=%d\n",
+                ctx->current_buf, bc250_diag_delta_ms(&w0, &w1), wait_result);
     }
     if (wait_result != VK_SUCCESS) {
-        fprintf(stderr, "[bc250-gpu] vkWaitForFences failed in begin_picture: %d\n", wait_result);
+        static int begin_fail_count = 0;
+        if (begin_fail_count++ < 5 || (begin_fail_count % 300 == 0)) {
+            fprintf(stderr, "[bc250-gpu] vkWaitForFences in begin_picture timed out or failed (%d): skipping GPU submit\n", wait_result);
+        }
         return -1;
     }
     vkResetFences(ctx->device, 1, &ctx->fences[ctx->current_buf]);
@@ -2975,14 +2994,23 @@ int gpu_compute_sync_slot(gpu_context_t *ctx, int slot) {
      * submit reported success, the exact same stale-buffer read follows.
      * Report failure so the caller skips the staging-buffer fetch instead
      * of reading quant/coeff/mv data the GPU may still be mid-write on. */
-    VkResult wait_result = vkWaitForFences(ctx->device, 1, &ctx->fences[prev_buf], VK_TRUE, UINT64_MAX);
+    uint64_t timeout_ns = get_fence_timeout_ns();
+    VkResult wait_result = vkWaitForFences(ctx->device, 1, &ctx->fences[prev_buf], VK_TRUE, timeout_ns);
     struct timespec sync_now;
     clock_gettime(CLOCK_MONOTONIC, &sync_now);
     ctx->last_gpu_duration_ms = bc250_diag_delta_ms(&ctx->submit_time[prev_buf], &sync_now);
     if (ctx->perf_stats_enabled) {
         clock_gettime(CLOCK_MONOTONIC, &w1);
-        fprintf(stderr, "[BC250_PERF_WAIT] site=sync buf=%d wait_ms=%.3f gpu_total_ms=%.3f\n",
-                prev_buf, bc250_diag_delta_ms(&w0, &w1), ctx->last_gpu_duration_ms);
+        fprintf(stderr, "[BC250_PERF_WAIT] site=sync buf=%d wait_ms=%.3f gpu_total_ms=%.3f res=%d\n",
+                prev_buf, bc250_diag_delta_ms(&w0, &w1), ctx->last_gpu_duration_ms, wait_result);
+    }
+    if (wait_result == VK_TIMEOUT) {
+        static int timeout_log_count = 0;
+        if (timeout_log_count++ < 5 || (timeout_log_count % 300 == 0)) {
+            fprintf(stderr, "[bc250-gpu] GPU fence wait timeout (%.1fms) under heavy contention (game load) - engaging failover\n",
+                    ctx->last_gpu_duration_ms);
+        }
+        return -1;
     }
     if (wait_result != VK_SUCCESS) {
         fprintf(stderr, "[bc250-gpu] vkWaitForFences failed in sync: %d\n", wait_result);

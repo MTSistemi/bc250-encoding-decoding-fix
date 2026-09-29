@@ -20,6 +20,10 @@
 #include <errno.h>
 #include <math.h>
 
+#if defined(__linux__)
+extern char *program_invocation_short_name;
+#endif
+
 #ifndef VA_RC_ICQ
 #define VA_RC_ICQ 0x00000040
 #endif
@@ -44,6 +48,19 @@ static int big_decode(VAProfile profile, VAEntrypoint entrypoint)
 {
     return entrypoint == VAEntrypointVLD
         && (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10);
+}
+
+static bool is_steam_caller(void)
+{
+#if defined(__linux__)
+    if (!program_invocation_short_name) return false;
+    return (strcmp(program_invocation_short_name, "steam") == 0 ||
+            strcmp(program_invocation_short_name, "streaming_client") == 0 ||
+            strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
+            strstr(program_invocation_short_name, "steam") != NULL);
+#else
+    return false;
+#endif
 }
 
 static int get_cmdline_threads(void)
@@ -681,7 +698,7 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                 } else {
                     c->h264_enc = h264_encoder_create(&data->gpu, picture_width, picture_height, 30, 4000000, prof);
                     if (c->h264_enc) {
-                        int def_slices = 4;
+                        int def_slices = is_steam_caller() ? 1 : 4;
                         const char *s_env = getenv("BC250_SLICES_PER_FRAME");
                         if (s_env) {
                             int s = atoi(s_env);
@@ -690,6 +707,15 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                             int cmd_t = get_cmdline_threads();
                             if (cmd_t >= 1 && cmd_t <= 16) def_slices = cmd_t;
                             else if (picture_width < 1280 && picture_height < 720) def_slices = 1;
+                        }
+                        /* Steam Link hardware and client decoders fail on multi-slice H.264 streams,
+                         * rendering a grey or black screen. Steam Link callers MUST stay on 1 slice
+                         * unless explicitly forced with BC250_FORCE_SLICES=1. */
+                        if (is_steam_caller()) {
+                            const char *force_slices = getenv("BC250_FORCE_SLICES");
+                            if (!force_slices || (strcmp(force_slices, "1") != 0 && strcmp(force_slices, "true") != 0)) {
+                                def_slices = 1;
+                            }
                         }
                         h264_encoder_set_num_slices(c->h264_enc, def_slices);
                         for (int a = 0; a < data->configs[config_id].num_attribs; a++) {

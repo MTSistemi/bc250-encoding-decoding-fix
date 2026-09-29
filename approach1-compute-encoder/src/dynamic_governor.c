@@ -15,6 +15,10 @@
 #include <string.h>
 #include <stdio.h>
 
+#if defined(__linux__)
+extern char *program_invocation_short_name;
+#endif
+
 void dynamic_governor_init(dynamic_governor_t *gov)
 {
     if (!gov) return;
@@ -50,17 +54,21 @@ void dynamic_governor_init(dynamic_governor_t *gov)
     if (program_invocation_short_name &&
         (strcmp(program_invocation_short_name, "sunshine") == 0 ||
          strcmp(program_invocation_short_name, "steam") == 0 ||
-         strcmp(program_invocation_short_name, "streaming_client") == 0)) {
+         strcmp(program_invocation_short_name, "streaming_client") == 0 ||
+         strcmp(program_invocation_short_name, "steamwebhelper") == 0 ||
+         strstr(program_invocation_short_name, "steam") != NULL)) {
         /* In Sunshine and Steam Link, enable hybrid CPU SIMD ME offload by default
          * and tune thresholds to protect 60fps streaming deadlines (<16.6ms).
          * Tier 0: < 7.0ms (GPU Full ME)
          * Tier 1: 7.0 - 10.5ms (GPU Fast ME)
          * Tier 2: 10.5 - 15.5ms (CPU SIMD Offload, relieves GPU CUs for games)
-         * Tier 3: > 15.5ms (Emergency Failover P_Skip) */
+         * Tier 3: > 15.5ms (Emergency Failover P_Skip)
+         * Increase step_down_hysteresis to 8 to avoid fluttering under heavy game contention. */
         gov->cpu_offload_enabled = true;
         gov->tier1_threshold_ms = 7.0;
         gov->tier2_threshold_ms = 10.5;
         gov->tier3_threshold_ms = 15.5;
+        gov->step_down_hysteresis = 8;
     }
     if (program_invocation_short_name && strcmp(program_invocation_short_name, "ffmpeg") == 0) {
         /* For FFmpeg transcoding in compute/hybrid mode, enable CPU ME offload
