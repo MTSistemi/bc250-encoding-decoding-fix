@@ -1,6 +1,6 @@
-# bc250-encoding-decoding-fix v0.5.1 - https://github.com/simpmix/bc250-encoding-decoding-fix
+# bc250-encoding-decoding-fix v0.5.2 - https://github.com/simpmix/bc250-encoding-decoding-fix
 cmake_minimum_required(VERSION 3.16)
-project(bc250-compute-encoder VERSION 0.5.1 LANGUAGES C)
+project(bc250-compute-encoder VERSION 0.5.2 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O2 -fPIC")
@@ -271,6 +271,23 @@ if(BC250_WITH_X264)
         message(STATUS "libx264 ${X264_VERSION} found: H.264 encodes through x264")
     else()
         message(WARNING "libx264 not found: H.264 falls back to the compute encoder")
+    endif()
+endif()
+
+# HEVC through libx265 - see src/encoder_x265.h for why. Optional: without
+# it HEVC is encoded by the compute encoder, as before.
+option(BC250_WITH_X265 "Encode HEVC through libx265" ON)
+if(BC250_WITH_X265)
+    pkg_check_modules(X265 x265)
+    if(X265_FOUND)
+        target_sources(bc250_drv_video PRIVATE src/encoder_x265.c)
+        target_include_directories(bc250_drv_video PRIVATE ${X265_INCLUDE_DIRS})
+        target_link_libraries(bc250_drv_video ${X265_LINK_LIBRARIES})
+        target_compile_definitions(bc250_drv_video PRIVATE BC250_HAVE_X265)
+        message(STATUS "libx265 ${X265_VERSION} found: HEVC encodes through x265")
+    else()
+        target_sources(bc250_drv_video PRIVATE src/encoder_x265.c)
+        message(WARNING "libx265 not found: HEVC falls back to the compute encoder")
     endif()
 endif()
 

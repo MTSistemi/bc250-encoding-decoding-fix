@@ -121,6 +121,7 @@ typedef struct bc250_gpu_context {
     VkPipeline color_convert_pipeline;
     VkPipeline vpp_pipeline;      /* video_proc.comp, eight bit */
     VkPipeline vpp_pipeline10;    /* video_proc10.comp, ten bit */
+    VkPipeline vpp_pipeline_tonemap; /* video_proc_tonemap.comp, HDR10 to SDR */
     VkPipeline reconstruct_pipeline;
     VkPipeline intra_wavefront_pipeline;
 
@@ -444,6 +445,14 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
  * own contract for vaExportSurfaceHandle() says the same: "backend driver
  * will not close the file descriptor"). Returns 0 on success. */
 int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int *out_fd);
+
+/* Imports an external DMA-BUF memory fd into a Vulkan image (zero-copy hardware ingestion).
+ * Returns 0 on success, or -1 if the device cannot import the descriptor or format. */
+int gpu_compute_import_dmabuf_image(gpu_context_t *ctx,
+                                    int dma_buf_fd,
+                                    int width, int height, int format,
+                                    uint32_t stride, uint32_t offset,
+                                    gpu_image_t *image, gpu_memory_t *memory);
 
 /* Explicit GPU-side wait for whatever wrote into `memory` last, through
  * *any* API/context - not just this driver's own Vulkan submissions.

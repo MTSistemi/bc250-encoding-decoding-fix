@@ -407,9 +407,66 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
                 if (best_cost == 0) break;
             }
 
-            /* Convert integer motion vector to quarter-pel units (multiply by 4) */
-            out_mvs[mb_idx].mvx = best_mv.x * 4;
-            out_mvs[mb_idx].mvy = best_mv.y * 4;
+            int qx = best_mv.x * 4;
+            int qy = best_mv.y * 4;
+            if (best_cost > 128 && best_cost < 3000) {
+                /* Half-pel refinement (2 quarter-pels offset) around best integer MV */
+                int int_x = best_mv.x;
+                int int_y = best_mv.y;
+                int base_x = px + int_x;
+                int base_y = py + int_y;
+                if (base_x > 0 && base_x + 17 < max_x && base_y > 0 && base_y + 17 < max_y) {
+                    const int hpel_off[4][2] = { {2, 0}, {-2, 0}, {0, 2}, {0, -2} };
+                    int best_sub_x = 0;
+                    int best_sub_y = 0;
+                    uint32_t lowest_sad = best_cost;
+
+                    for (int h = 0; h < 4; h++) {
+                        int sx = hpel_off[h][0];
+                        int sy = hpel_off[h][1];
+                        uint32_t sad = 0;
+                        if (sx != 0) {
+                            int shift = (sx > 0) ? 1 : -1;
+                            const uint8_t *r0 = ref_y + base_y * ref_pitch + base_x;
+                            const uint8_t *r1 = r0 + shift;
+                            for (int r = 0; r < 16; r++) {
+                                const uint8_t *s = curr_mb + r * src_pitch;
+                                const uint8_t *p0 = r0 + r * ref_pitch;
+                                const uint8_t *p1 = r1 + r * ref_pitch;
+                                for (int c = 0; c < 16; c++) {
+                                    uint8_t interp = (uint8_t)(((uint32_t)p0[c] + (uint32_t)p1[c] + 1) >> 1);
+                                    sad += (uint32_t)abs((int)s[c] - (int)interp);
+                                }
+                            }
+                        } else {
+                            int shift = (sy > 0) ? ref_pitch : -ref_pitch;
+                            const uint8_t *r0 = ref_y + base_y * ref_pitch + base_x;
+                            const uint8_t *r1 = r0 + shift;
+                            for (int r = 0; r < 16; r++) {
+                                const uint8_t *s = curr_mb + r * src_pitch;
+                                const uint8_t *p0 = r0 + r * ref_pitch;
+                                const uint8_t *p1 = r1 + r * ref_pitch;
+                                for (int c = 0; c < 16; c++) {
+                                    uint8_t interp = (uint8_t)(((uint32_t)p0[c] + (uint32_t)p1[c] + 1) >> 1);
+                                    sad += (uint32_t)abs((int)s[c] - (int)interp);
+                                }
+                            }
+                        }
+                        if (sad < lowest_sad) {
+                            lowest_sad = sad;
+                            best_sub_x = sx;
+                            best_sub_y = sy;
+                        }
+                    }
+                    qx += best_sub_x;
+                    qy += best_sub_y;
+                    best_cost = lowest_sad;
+                }
+            }
+
+            /* Convert integer + half-pel motion vector to quarter-pel units */
+            out_mvs[mb_idx].mvx = qx;
+            out_mvs[mb_idx].mvy = qy;
             out_mvs[mb_idx].sad = best_cost;
             out_mvs[mb_idx]._pad = 0;
         }

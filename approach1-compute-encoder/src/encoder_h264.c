@@ -2065,8 +2065,7 @@ void h264_encoder_set_bitrate(h264_encoder_t *encoder, uint32_t bitrate_bps) {
      * again here) is likewise just "don't reset state that didn't need to
      * change." */
     if (encoder && bitrate_bps > 0 && bitrate_bps != encoder->rc.target_bitrate) {
-        rc_init(&encoder->rc, encoder->rc.mode, bitrate_bps, (double)encoder->fps,
-                encoder->width, encoder->height);
+        rc_update_bitrate(&encoder->rc, bitrate_bps, encoder->width, encoder->height);
     }
 }
 

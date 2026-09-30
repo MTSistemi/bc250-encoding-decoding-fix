@@ -1669,6 +1669,12 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         vkDestroyShaderModule(ctx->device, vpp10_shader, NULL);
     }
 
+    VkShaderModule vpp_tonemap_shader = load_spirv_shader(ctx->device, "video_proc_tonemap.comp.spv");
+    if (vpp_tonemap_shader != VK_NULL_HANDLE) {
+        ctx->vpp_pipeline_tonemap = create_compute_pipeline(ctx->device, vpp_tonemap_shader, ctx->vpp_layout);
+        vkDestroyShaderModule(ctx->device, vpp_tonemap_shader, NULL);
+    }
+
     VkShaderModule cc_shader = load_spirv_shader(ctx->device, "color_convert.comp.spv");
     if (cc_shader) {
         ctx->color_convert_pipeline = create_compute_pipeline(ctx->device, cc_shader, ctx->color_convert_layout);
@@ -1744,6 +1750,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->color_convert_pipeline) vkDestroyPipeline(ctx->device, ctx->color_convert_pipeline, NULL);
     if (ctx->vpp_pipeline) vkDestroyPipeline(ctx->device, ctx->vpp_pipeline, NULL);
     if (ctx->vpp_pipeline10) vkDestroyPipeline(ctx->device, ctx->vpp_pipeline10, NULL);
+    if (ctx->vpp_pipeline_tonemap) vkDestroyPipeline(ctx->device, ctx->vpp_pipeline_tonemap, NULL);
     if (ctx->reconstruct_pipeline) vkDestroyPipeline(ctx->device, ctx->reconstruct_pipeline, NULL);
     if (ctx->intra_wavefront_pipeline) vkDestroyPipeline(ctx->device, ctx->intra_wavefront_pipeline, NULL);
 
@@ -2058,6 +2065,137 @@ int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int 
      * context may be being written by a foreign GPU API context, so a CPU
      * reader has to establish the dma-buf fence before reading them (see
      * ctx->any_surface_exported and gpu_compute_wait_for_image_ready_host()). */
+    ctx->any_surface_exported = true;
+    return 0;
+}
+
+int gpu_compute_import_dmabuf_image(gpu_context_t *ctx,
+                                    int dma_buf_fd,
+                                    int width, int height, int format,
+                                    uint32_t stride, uint32_t offset,
+                                    gpu_image_t *image, gpu_memory_t *memory)
+{
+    (void)stride;
+    if (!ctx || dma_buf_fd < 0 || width <= 0 || height <= 0 || !image || !memory) return -1;
+    if (!ctx->get_memory_fd_khr) return -1;
+
+    const VkFormat vk_y = (format == GPU_IMAGE_P010) ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
+    const VkFormat vk_uv = (format == GPU_IMAGE_P010) ? VK_FORMAT_R16G16_UNORM : VK_FORMAT_R8G8_UNORM;
+
+    image->format = format;
+    image->width = width;
+    image->height = height;
+    image->current_layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+
+    VkExternalMemoryImageCreateInfo ext_image_info = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    };
+
+    VkImageCreateInfo y_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = &ext_image_info,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = vk_y,
+        .extent = { (uint32_t)width, (uint32_t)height, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_LINEAR,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED
+    };
+
+    VkResult result = vkCreateImage(ctx->device, &y_info, NULL, &image->y_plane);
+    if (result != VK_SUCCESS) return -1;
+
+    VkImageCreateInfo uv_info = y_info;
+    uv_info.format = vk_uv;
+    uv_info.extent.width = width / 2;
+    uv_info.extent.height = height / 2;
+    result = vkCreateImage(ctx->device, &uv_info, NULL, &image->uv_plane);
+    if (result != VK_SUCCESS) {
+        vkDestroyImage(ctx->device, image->y_plane, NULL);
+        image->y_plane = VK_NULL_HANDLE;
+        return -1;
+    }
+
+    VkMemoryRequirements y_req, uv_req;
+    vkGetImageMemoryRequirements(ctx->device, image->y_plane, &y_req);
+    vkGetImageMemoryRequirements(ctx->device, image->uv_plane, &uv_req);
+
+    VkDeviceSize align = uv_req.alignment > y_req.alignment ? uv_req.alignment : y_req.alignment;
+    VkDeviceSize uv_offset = (offset > 0) ? offset : ((y_req.size + align - 1) & ~(align - 1));
+    VkDeviceSize total_size = uv_offset + uv_req.size;
+
+    uint32_t mem_bits = y_req.memoryTypeBits & uv_req.memoryTypeBits;
+    if (mem_bits == 0) mem_bits = y_req.memoryTypeBits | uv_req.memoryTypeBits;
+
+    int dup_fd = dup(dma_buf_fd);
+    if (dup_fd < 0) {
+        vkDestroyImage(ctx->device, image->y_plane, NULL);
+        vkDestroyImage(ctx->device, image->uv_plane, NULL);
+        image->y_plane = VK_NULL_HANDLE;
+        image->uv_plane = VK_NULL_HANDLE;
+        return -1;
+    }
+
+    VkImportMemoryFdInfoKHR import_info = {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        .fd = dup_fd
+    };
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &import_info,
+        .allocationSize = total_size,
+        .memoryTypeIndex = find_memory_type(ctx->physical_device, mem_bits,
+                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+    };
+
+    result = vkAllocateMemory(ctx->device, &alloc_info, NULL, &memory->memory);
+    if (result != VK_SUCCESS) {
+        alloc_info.memoryTypeIndex = find_memory_type(ctx->physical_device, mem_bits, 0);
+        result = vkAllocateMemory(ctx->device, &alloc_info, NULL, &memory->memory);
+    }
+    if (result != VK_SUCCESS) {
+        close(dup_fd);
+        vkDestroyImage(ctx->device, image->y_plane, NULL);
+        vkDestroyImage(ctx->device, image->uv_plane, NULL);
+        image->y_plane = VK_NULL_HANDLE;
+        image->uv_plane = VK_NULL_HANDLE;
+        return -1;
+    }
+
+    memory->size = total_size;
+    memory->mapped_ptr = NULL;
+
+    result = vkBindImageMemory(ctx->device, image->y_plane, memory->memory, 0);
+    if (result == VK_SUCCESS) {
+        result = vkBindImageMemory(ctx->device, image->uv_plane, memory->memory, uv_offset);
+    }
+    if (result != VK_SUCCESS) {
+        gpu_compute_destroy_image(ctx, *image, *memory);
+        image->y_plane = VK_NULL_HANDLE;
+        image->uv_plane = VK_NULL_HANDLE;
+        memory->memory = VK_NULL_HANDLE;
+        return -1;
+    }
+
+    VkImageViewCreateInfo view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = image->y_plane,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = vk_y,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}
+    };
+    VK_CHECK(vkCreateImageView(ctx->device, &view_info, NULL, &image->y_view));
+
+    view_info.image = image->uv_plane;
+    view_info.format = vk_uv;
+    VK_CHECK(vkCreateImageView(ctx->device, &view_info, NULL, &image->uv_view));
+
     ctx->any_surface_exported = true;
     return 0;
 }
@@ -3193,11 +3331,14 @@ int gpu_compute_video_proc(gpu_context_t *ctx,
                            gpu_image_t *src, const int src_rect[4],
                            gpu_image_t *dst, const int dst_rect[4])
 {
-    if (!ctx || !src || !dst || !src_rect || !dst_rect) return -1;
-    if (src->format != dst->format) return -1;
-
-    VkPipeline pipeline = (dst->format == GPU_IMAGE_P010)
-                          ? ctx->vpp_pipeline10 : ctx->vpp_pipeline;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (src->format == dst->format) {
+        pipeline = (dst->format == GPU_IMAGE_P010) ? ctx->vpp_pipeline10 : ctx->vpp_pipeline;
+    } else if (src->format == GPU_IMAGE_P010 && dst->format == GPU_IMAGE_NV12) {
+        pipeline = ctx->vpp_pipeline_tonemap;
+    } else {
+        return -1;
+    }
     if (pipeline == VK_NULL_HANDLE) return -1;
     if (!src->y_view || !src->uv_view || !dst->y_view || !dst->uv_view) return -1;
 

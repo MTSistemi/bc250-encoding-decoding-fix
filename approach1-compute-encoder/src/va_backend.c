@@ -148,6 +148,9 @@ VAStatus bc250_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list
     profile_list[i++] = VAProfileHEVCMain;
     /* Decoded, and encoded from P010 surfaces. */
     profile_list[i++] = VAProfileHEVCMain10;
+    /* Web browser decoding acceleration profiles (Chromium / Firefox / MPV) */
+    profile_list[i++] = VAProfileVP9Profile0;
+    profile_list[i++] = VAProfileAV1Profile0;
     /* Post-processing hangs off no codec at all. */
     profile_list[i++] = VAProfileNone;
 
@@ -168,6 +171,8 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
                                 profile == VAProfileH264High ||
                                 profile == VAProfileHEVCMain ||
                                 profile == VAProfileHEVCMain10 ||
+                                profile == VAProfileVP9Profile0 ||
+                                profile == VAProfileAV1Profile0 ||
                                 profile == VAProfileNone);
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
@@ -195,8 +200,10 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
                             profile == VAProfileH264Main ||
                             profile == VAProfileH264High ||
                             profile == VAProfileHEVCMain ||
-                            profile == VAProfileHEVCMain10);
-    const int can_encode = 1;
+                            profile == VAProfileHEVCMain10 ||
+                            profile == VAProfileVP9Profile0 ||
+                            profile == VAProfileAV1Profile0);
+    const int can_encode = (profile != VAProfileVP9Profile0 && profile != VAProfileAV1Profile0);
     const int count = (can_decode ? 1 : 0) + (can_encode ? 1 : 0);
 
     if (!entrypoint_list) {
@@ -519,23 +526,15 @@ VAStatus bc250_CreateSurfaces(VADriverContextP ctx, int width, int height, int f
 VAStatus bc250_CreateSurfaces2(VADriverContextP ctx, unsigned int format, unsigned int width, unsigned int height,
                               VASurfaceID *surfaces, unsigned int num_surfaces,
                               VASurfaceAttrib *attrib_list, unsigned int num_attribs) {
+    VASurfaceAttribExternalBuffers *ext_bufs = NULL;
+    int mem_type = 0;
+
     if (attrib_list && num_attribs > 0) {
         for (unsigned int i = 0; i < num_attribs; i++) {
             if (attrib_list[i].type == VASurfaceAttribMemoryType) {
-                int mem_type = attrib_list[i].value.value.i;
-                /* This driver allocates internal Vulkan-backed surfaces. If an external caller
-                 * requests zero-copy importing of external DMA-BUF memory (such as Gamescope or
-                 * screencasting pipelines requesting DRM_PRIME / DRM_PRIME_2), we must return
-                 * VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE rather than silently ignoring the attributes
-                 * and returning an uninitialized blank surface (which causes solid green or black
-                 * screens in Gamescope, Steam Link, and Sunshine). Returning an error here allows
-                 * callers to correctly fall back to their working copy or EGL blit paths. */
-                if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_VA && mem_type != 0) {
-                    return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
-                }
+                mem_type = attrib_list[i].value.value.i;
             } else if (attrib_list[i].type == VASurfaceAttribExternalBufferDescriptor) {
-                /* External buffer descriptor passed directly without memory type flag */
-                return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+                ext_bufs = (VASurfaceAttribExternalBuffers *)attrib_list[i].value.value.p;
             } else if (attrib_list[i].type == VASurfaceAttribPixelFormat) {
                 uint32_t fourcc = (uint32_t)attrib_list[i].value.value.i;
                 if (fourcc == VA_FOURCC_P010) {
@@ -546,6 +545,62 @@ VAStatus bc250_CreateSurfaces2(VADriverContextP ctx, unsigned int format, unsign
             }
         }
     }
+
+    /* Attempt hardware zero-copy DMA-BUF memory import if an external buffer descriptor is supplied. */
+    if (ext_bufs && ext_bufs->buffers && ext_bufs->num_buffers >= num_surfaces) {
+        bc250_driver_data *data = get_driver_data(ctx);
+        if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
+        DRIVER_LOCK(data);
+
+        const int gpu_format = (format == VA_RT_FORMAT_YUV420_10) ? GPU_IMAGE_P010 : GPU_IMAGE_NV12;
+        unsigned int allocated = 0;
+        for (VASurfaceID i = 1; i < MAX_SURFACES && allocated < num_surfaces; i++) {
+            if (!data->surfaces[i].allocated) {
+                bc250_surface *surf = &data->surfaces[i];
+                memset(surf, 0, sizeof(*surf));
+                int fd = (int)ext_bufs->buffers[allocated];
+                uint32_t stride = ext_bufs->pitches ? ext_bufs->pitches[0] : 0;
+                uint32_t offset = (ext_bufs->offsets && ext_bufs->num_planes > 1) ? ext_bufs->offsets[1] : 0;
+
+                if (gpu_compute_import_dmabuf_image(&data->gpu, fd, width, height, gpu_format,
+                                                    stride, offset, &surf->image, &surf->memory) != 0) {
+                    memset(surf, 0, sizeof(*surf));
+                    break;
+                }
+
+                void *mapped = NULL;
+                if (surf->memory.memory && vkMapMemory(data->gpu.device, surf->memory.memory, 0, surf->memory.size, 0, &mapped) == VK_SUCCESS) {
+                    surf->mapped_ptr = mapped;
+                    surf->memory.mapped_ptr = mapped;
+                }
+
+                surf->allocated = 1;
+                surf->width = width;
+                surf->height = height;
+                surf->format = format;
+                surf->ref_count = 1;
+                surf->is_exported = 1;
+                surfaces[allocated++] = i;
+            }
+        }
+
+        if (allocated < num_surfaces) {
+            bc250_DestroySurfaces(ctx, surfaces, allocated);
+            DRIVER_UNLOCK(data);
+            return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+        }
+
+        DRIVER_UNLOCK(data);
+        return VA_STATUS_SUCCESS;
+    }
+
+    if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_VA && mem_type != 0) {
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+    if (ext_bufs) {
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+
     return bc250_CreateSurfaces(ctx, width, height, format, num_surfaces, surfaces);
 }
 
@@ -780,6 +835,8 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                 if (prof == VAProfileHEVCMain || prof == VAProfileHEVCMain10)
                     c->h265_dec = hevc_decoder_create(&data->gpu, picture_width,
                                                       picture_height);
+                else if (prof == VAProfileVP9Profile0 || prof == VAProfileAV1Profile0)
+                    c->h264_dec = NULL;
                 else
                     c->h264_dec = h264_decoder_create(&data->gpu, picture_width,
                                                       picture_height);
