@@ -199,12 +199,13 @@ static int open_encoder(hevc_x265_t *x, const hevc_x265_config_t *cfg)
     x->param.internalBitDepth = cfg->ten_bit ? 10 : 8;
     x->param.fpsNum = cfg->fps ? cfg->fps : 30;
     x->param.fpsDenom = 1;
-    x->param.frameNumThreads = x->threads;
+    x->param.frameNumThreads = cfg->live ? 1 : x->threads;
     x->param.keyframeMax = cfg->gop ? (int)cfg->gop : (int)x->param.fpsNum;
     x->param.bRepeatHeaders = 1;
     x->param.bAnnexB = 1;
 
     if (cfg->live) {
+        x->param.frameNumThreads = 1;
         x->param.bFrameAdaptive = 0;
         x->param.bframes = 0;
         x->param.rc.cuTree = 0;
