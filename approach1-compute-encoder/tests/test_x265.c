@@ -96,9 +96,8 @@ int main(void)
         .rc_mode = RC_CQP,
         .qp = 26,
         .quality_level = 4,
-        .profile_idc = 1, /* Main profile */
+        .ten_bit = false,
         .live = true,
-        .is_p010 = false,
     };
     hevc_x265_config_t c;
 
