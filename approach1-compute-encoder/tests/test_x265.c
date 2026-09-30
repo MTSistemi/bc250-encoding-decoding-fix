@@ -120,6 +120,27 @@ int main(void)
     c.live = true;
     run_hevc_test("HEVC Low Latency Live", c, 6, -1);
 
+    /* Dynamic bitrate reconfiguration test */
+    {
+        hevc_x265_t *x = hevc_x265_create();
+        assert(x);
+        hevc_x265_config_t dyn = base;
+        dyn.rc_mode = RC_VBR;
+        dyn.bitrate = 500000;
+        fill_frame(0);
+        int n1 = hevc_x265_encode(x, &dyn, y_plane, W, uv_plane, W, false, 0, out, sizeof(out));
+        assert(n1 > 0);
+
+        /* Change bitrate on the fly */
+        dyn.bitrate = 1200000;
+        fill_frame(1);
+        int n2 = hevc_x265_encode(x, &dyn, y_plane, W, uv_plane, W, false, 0, out, sizeof(out));
+        assert(n2 > 0);
+
+        hevc_x265_destroy(x);
+        printf("[test_x265] %-32s ok\n", "Dynamic bitrate reconfig");
+    }
+
     printf("[test_x265] all tests passed!\n");
     return 0;
 }

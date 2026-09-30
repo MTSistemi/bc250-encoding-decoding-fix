@@ -832,14 +832,20 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                 c->vpp = 1;
                 c->vpp_state.source = VA_INVALID_SURFACE;
             } else if (entry == VAEntrypointVLD) {
-                if (prof == VAProfileHEVCMain || prof == VAProfileHEVCMain10)
+                if (prof == VAProfileHEVCMain || prof == VAProfileHEVCMain10) {
                     c->h265_dec = hevc_decoder_create(&data->gpu, picture_width,
                                                       picture_height);
-                else if (prof == VAProfileVP9Profile0 || prof == VAProfileAV1Profile0)
-                    c->h264_dec = NULL;
-                else
+                } else if (prof == VAProfileVP9Profile0 || prof == VAProfileAV1Profile0) {
+                    /* Not implemented in CPU software decoder; reject context creation
+                     * so Chromium/Firefox/mpv fall back to built-in libvpx/dav1d
+                     * instead of producing blank/frozen frames. */
+                    memset(c, 0, sizeof(*c));
+                    DRIVER_UNLOCK(data);
+                    return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+                } else {
                     c->h264_dec = h264_decoder_create(&data->gpu, picture_width,
                                                       picture_height);
+                }
             }
 
             *context = i;
@@ -2021,6 +2027,11 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
             surf->ref_count++;
             buf->derived_surface = surface;
             img->surface_id = surface;
+        } else {
+            bc250_DestroyBuffer(ctx, img->buffer_id);
+            img->allocated = 0;
+            DRIVER_UNLOCK(data);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
         }
     }
     DRIVER_UNLOCK(data);

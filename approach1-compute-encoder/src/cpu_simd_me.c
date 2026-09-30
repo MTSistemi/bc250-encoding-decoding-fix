@@ -433,10 +433,19 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
                                 const uint8_t *s = curr_mb + r * src_pitch;
                                 const uint8_t *p0 = r0 + r * ref_pitch;
                                 const uint8_t *p1 = r1 + r * ref_pitch;
+#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+                                __m128i v0 = _mm_loadu_si128((const __m128i *)p0);
+                                __m128i v1 = _mm_loadu_si128((const __m128i *)p1);
+                                __m128i vs = _mm_loadu_si128((const __m128i *)s);
+                                __m128i interp = _mm_avg_epu8(v0, v1);
+                                __m128i sad_v = _mm_sad_epu8(vs, interp);
+                                sad += (uint32_t)_mm_cvtsi128_si32(sad_v) + (uint32_t)_mm_extract_epi16(sad_v, 4);
+#else
                                 for (int c = 0; c < 16; c++) {
                                     uint8_t interp = (uint8_t)(((uint32_t)p0[c] + (uint32_t)p1[c] + 1) >> 1);
                                     sad += (uint32_t)abs((int)s[c] - (int)interp);
                                 }
+#endif
                             }
                         } else {
                             int shift = (sy > 0) ? ref_pitch : -ref_pitch;
@@ -446,10 +455,19 @@ int cpu_simd_me_search_frame(const uint8_t *src_y, int src_pitch,
                                 const uint8_t *s = curr_mb + r * src_pitch;
                                 const uint8_t *p0 = r0 + r * ref_pitch;
                                 const uint8_t *p1 = r1 + r * ref_pitch;
+#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+                                __m128i v0 = _mm_loadu_si128((const __m128i *)p0);
+                                __m128i v1 = _mm_loadu_si128((const __m128i *)p1);
+                                __m128i vs = _mm_loadu_si128((const __m128i *)s);
+                                __m128i interp = _mm_avg_epu8(v0, v1);
+                                __m128i sad_v = _mm_sad_epu8(vs, interp);
+                                sad += (uint32_t)_mm_cvtsi128_si32(sad_v) + (uint32_t)_mm_extract_epi16(sad_v, 4);
+#else
                                 for (int c = 0; c < 16; c++) {
                                     uint8_t interp = (uint8_t)(((uint32_t)p0[c] + (uint32_t)p1[c] + 1) >> 1);
                                     sad += (uint32_t)abs((int)s[c] - (int)interp);
                                 }
+#endif
                             }
                         }
                         if (sad < lowest_sad) {

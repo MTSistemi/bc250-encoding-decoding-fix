@@ -246,6 +246,18 @@ hevc_x265_t *hevc_x265_create(void)
     return x;
 }
 
+static bool same_structure(const hevc_x265_config_t *a, const hevc_x265_config_t *b)
+{
+    return a->width == b->width && a->height == b->height && a->fps == b->fps
+        && a->ten_bit == b->ten_bit && a->live == b->live && a->rc_mode == b->rc_mode;
+}
+
+static bool same_rate(const hevc_x265_config_t *a, const hevc_x265_config_t *b)
+{
+    return a->rc_mode == b->rc_mode && a->bitrate == b->bitrate && a->qp == b->qp
+        && a->crf == b->crf && a->cbr_intent == b->cbr_intent;
+}
+
 int hevc_x265_encode(hevc_x265_t *x, const hevc_x265_config_t *cfg,
                      const uint8_t *y, int y_stride,
                      const uint8_t *uv, int uv_stride,
@@ -254,10 +266,14 @@ int hevc_x265_encode(hevc_x265_t *x, const hevc_x265_config_t *cfg,
 {
     if (!x || !cfg || !y || !uv || !out || out_cap == 0) return -1;
 
-    if (!x->h || x->applied.width != cfg->width || x->applied.height != cfg->height ||
-        x->applied.fps != cfg->fps || x->applied.ten_bit != cfg->ten_bit ||
-        x->applied.rc_mode != cfg->rc_mode) {
+    if (!x->h || !same_structure(cfg, &x->applied)) {
         if (open_encoder(x, cfg) < 0) return -1;
+    } else if (!same_rate(cfg, &x->applied)) {
+        set_rate(&x->param, cfg);
+        if (x265_encoder_reconfig(x->h, &x->param) < 0) {
+            if (open_encoder(x, cfg) < 0) return -1;
+        }
+        x->applied = *cfg;
     }
 
     /* Prepare planar I420 chroma buffers from interleaved UV */

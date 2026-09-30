@@ -135,8 +135,8 @@ void rc_update_bitrate(rate_control_t *rc, uint32_t bitrate, uint32_t width, uin
     double ratio = (double)bitrate / old_rate;
 
     rc->target_bitrate = bitrate;
-    rc->max_bitrate = bitrate * 3 / 2;
-    rc->target_bits_per_frame = (uint32_t)(rc->target_bitrate / rc->framerate);
+    double fps = (rc->framerate > 0.0) ? rc->framerate : 30.0;
+    rc->target_bits_per_frame = (uint32_t)(rc->target_bitrate / fps);
     if (rc->target_bits_per_frame < 100) rc->target_bits_per_frame = 100;
 
     int64_t old_size = rc->buffer_size;
