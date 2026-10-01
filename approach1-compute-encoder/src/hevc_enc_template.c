@@ -216,7 +216,7 @@ static inline uint32_t FUNC(compute_sad_4x4_chroma)(const pixel *src_cb,
  * as int16 (in the int32 buffer, half of it used), and only the vertical
  * filter over it, for the corner phase, needs 32 bits, which PMADDWD gives
  * two rows at a time. */
-static void FUNC(build_hpel)(hevc_encoder_t *enc)
+static void FUNC(hpel_pass)(hevc_encoder_t *enc, int pass, int r_begin, int r_end)
 {
     const int w = (int)enc->coded_width, h = (int)enc->coded_height;
     const int M = HPEL_MARGIN, ps = enc->hpel_stride;
@@ -229,10 +229,8 @@ static void FUNC(build_hpel)(hevc_encoder_t *enc)
 
     /* Pass 1: every source row, edge-extended, through the horizontal
      * filter; and the whole-sample plane, which is the same row. */
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int r = 0; r < rows + 7; r++) {
+    if (pass == 1)
+    for (int r = r_begin; r < r_end; r++) {
         int sy = r - M - 3;
         sy = sy < 0 ? 0 : (sy >= h ? h - 1 : sy);
         const pixel *row = ref + (size_t)sy * w;
@@ -260,10 +258,8 @@ static void FUNC(build_hpel)(hevc_encoder_t *enc)
     }
 
     /* Pass 2: right half, lower half, both. */
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int r = 0; r < rows; r++) {
+    if (pass == 2)
+    for (int r = r_begin; r < r_end; r++) {
         const int16_t *t8 = T + (size_t)r * ps;
         pixel *Hr = H + (size_t)r * ps, *Vr = V + (size_t)r * ps, *HVr = HV + (size_t)r * ps;
         const pixel *e[8];
@@ -313,7 +309,7 @@ static void FUNC(build_hpel)(hevc_encoder_t *enc)
     }
 }
 #else
-static void FUNC(build_hpel)(hevc_encoder_t *enc)
+static void FUNC(hpel_pass)(hevc_encoder_t *enc, int pass, int r_begin, int r_end)
 {
     const int w = (int)enc->coded_width, h = (int)enc->coded_height;
     const int M = HPEL_MARGIN, ps = enc->hpel_stride;
@@ -332,10 +328,8 @@ static void FUNC(build_hpel)(hevc_encoder_t *enc)
     /* Pass 1: every source row, edge-extended by M + 4 samples on each side,
      * then the horizontal filter over it - one clean loop the compiler can
      * vectorize, instead of a clamp per tap. */
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int r = 0; r < rows + 7; r++) {
+    if (pass == 1)
+    for (int r = r_begin; r < r_end; r++) {
         const pixel *row = ref + (size_t)CLAMPY(r - M - 3) * w;
         pixel ext[w + 2 * M + 8];
         for (int i = 0; i < M + 3; i++) ext[i] = row[0];
@@ -350,10 +344,8 @@ static void FUNC(build_hpel)(hevc_encoder_t *enc)
     }
 
     /* Pass 2: right half, lower half, both. */
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int r = 0; r < rows; r++) {
+    if (pass == 2)
+    for (int r = r_begin; r < r_end; r++) {
         const int32_t *t8 = T + (size_t)r * ps;   /* row r of T is picture row r - M - 3 */
         pixel *Hr = H + (size_t)r * ps;
         pixel *Vr = V + (size_t)r * ps, *HVr = HV + (size_t)r * ps;
@@ -381,6 +373,28 @@ static void FUNC(build_hpel)(hevc_encoder_t *enc)
 #undef CLAMPY
 }
 #endif
+
+/* The two passes over the encoder's pool, the second once the first is
+ * done: it reads rows of the first's output on either side of its own. */
+typedef struct {
+    hevc_encoder_t *enc;
+    int pass;
+} FUNC(hpel_job_t);
+
+static void FUNC(hpel_rows)(void *arg, int begin, int end)
+{
+    const FUNC(hpel_job_t) *j = arg;
+    FUNC(hpel_pass)(j->enc, j->pass, begin, end);
+}
+
+static void FUNC(build_hpel)(hevc_encoder_t *enc)
+{
+    const int rows = (int)enc->coded_height + 2 * HPEL_MARGIN;
+    FUNC(hpel_job_t) j = { enc, 1 };
+    worker_pool_for(enc->pool, rows + 7, 16, FUNC(hpel_rows), &j, enc->threads);
+    j.pass = 2;
+    worker_pool_for(enc->pool, rows, 16, FUNC(hpel_rows), &j, enc->threads);
+}
 
 /* 8x8 SAD between the source and a block of a half plane, and between the
  * source and the average of two such blocks - both in the plane's own
