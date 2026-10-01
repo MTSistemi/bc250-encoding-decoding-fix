@@ -406,6 +406,14 @@ struct hevc_encoder {
     /* A CU whose merge residual quantizes to nothing is a skip, decided
      * there: on unless BC250_HEVC_EARLY_SKIP=0. */
     bool early_skip;
+    /* The live preset, for a caller streaming while something else - the
+     * game - needs the processor too. Each part trades a little compression
+     * for time; see hevc_encoder_create_depth(). */
+    bool live;
+    bool rough_rd;      /* candidates costed by rough bits, not through CABAC */
+    bool intra_in_p;    /* intra tried in P pictures */
+    bool inter_tu4;     /* inter luma also tried as four 4x4 transforms */
+    bool qpel;          /* motion refined to quarter samples */
     int16_t *mv_x_map;
     int16_t *mv_y_map;
     uint32_t last_frame_sad;
@@ -602,6 +610,33 @@ hevc_encoder_t *hevc_encoder_create_depth(bc250_gpu_context_t *gpu_ctx,
         enc->deadzone = !(e && strcmp(e, "0") == 0);
         e = getenv("BC250_HEVC_EARLY_SKIP");
         enc->early_skip = !(e && strcmp(e, "0") == 0);
+
+        /* Live: on for the callers is_live_caller() knows - Sunshine,
+         * Steam, Gamescope, WiVRn - and BC250_HEVC_PRESET=live or quality
+         * says so for anyone. On a BC-250, 1080p, three derf clips, one
+         * thread, against the quality preset:
+         *
+         *                                   cycles    bits
+         *   candidates by rough bits         -12%    +0.7%
+         *   + no intra trial in P pictures   -25%    +6.8%
+         *   + no 4x4 inter transforms        -32%    +8.9%
+         *   + no quarter-sample motion       -42%   +15.1%
+         *
+         * Streaming 1080p60 with a game running, the quality preset kept up
+         * with 56 frames a second and the live one with all 60, on six
+         * cores. Lighter mixes - quarter samples back, 4x4 transforms back -
+         * held 59-60 with nothing to spare. */
+        e = getenv("BC250_HEVC_PRESET");
+        enc->live = e && strcmp(e, "live") == 0 ? true
+                  : e && strcmp(e, "quality") == 0 ? false
+                  : is_live_caller();
+        enc->rough_rd = enc->live;
+        enc->intra_in_p = !enc->live;
+        enc->inter_tu4 = !enc->live;
+        enc->qpel = !enc->live;
+        if (enc->live)
+            fprintf(stderr, "[bc250-hevc] live preset: rough bits, no intra in P pictures, "
+                            "8x8 inter transforms, half-sample motion\n");
     }
     enc->mv_x_map = calloc(num_cus, sizeof(int16_t));
     enc->mv_y_map = calloc(num_cus, sizeof(int16_t));

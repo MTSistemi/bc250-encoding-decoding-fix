@@ -915,6 +915,7 @@ static void FUNC(inter_residual)(const hevc_encoder_t *enc, int cu_x, int cu_y,
         FUNC(inter_residual_luma)(enc, cu_x, cu_y, py, 1, &r8);
         only8 = !r8.cbf_y8;
     }
+    if (enc->tu8 && !enc->inter_tu4) only8 = 1;
     if (!only8) FUNC(inter_residual_luma)(enc, cu_x, cu_y, py, 0, r);
     if (enc->tu8) {
         if (only8 || r8.dist_y * 256 + enc->lambda_sse_q8 * r8.bits_y < r->dist_y * 256 + enc->lambda_sse_q8 * r->bits_y) {
@@ -1019,7 +1020,7 @@ static hevc_mv_t FUNC(motion_search)(const hevc_encoder_t *enc, int cu_x, int cu
 
     /* Half, then quarter samples around the best so far. */
     hevc_mv_t m = { (int16_t)(bx * 4), (int16_t)(by * 4) };
-    for (int s = 2; s >= 1; s >>= 1) {
+    for (int s = 2; s >= (enc->qpel ? 1 : 2); s >>= 1) {
         const hevc_mv_t c0 = m;
         for (int k = 0; k < 8; k++) {
             static const int ox[8] = { -1, 0, 1, -1, 1, -1, 0, 1 };
@@ -1189,6 +1190,21 @@ static int64_t FUNC(pred_dist)(const hevc_encoder_t *enc, int cu_x, int cu_y,
          + FUNC(sse)((const pixel *)enc->src_cr + co, ccw, pcr, 4, 4, 4);
 }
 
+/* The live preset's count of a candidate's bits: those of its
+ * coefficients, roughly (coeff_bits()), and a fixed guess at its own syntax
+ * - the skip flag and merge index, the merge flag and the residual's flags,
+ * the vector difference, four intra modes. Where the CABAC count follows
+ * the contexts, this does not; it costs 0.7% of bits for 12% of the time. */
+static inline int FUNC(rough_mode_bits)(int kind, int merge_idx, const hevc_mv_t *mvd)
+{
+    switch (kind) {
+    case CU_SKIP:  return 2 + merge_idx;
+    case CU_MERGE: return 6 + merge_idx;
+    case CU_AMVP:  return 7 + mvd_bits(mvd->x) + mvd_bits(mvd->y);
+    default:       return 18;
+    }
+}
+
 /* Decide one 8x8 CU of a P picture by rate and distortion, and reconstruct
  * it into the frame; the syntax is left for emit_cu(). Every candidate's
  * bits are counted by running its syntax through `chain`, which then moves
@@ -1237,7 +1253,13 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
         const int64_t dj_ = (int64_t)(dist_) * 256;                                \
         if (dj_ + enc->lambda_sse_q8 * (int64_t)(rb_) >= best_j) break;            \
         cd.kind = (kind_);                                                         \
-        const int64_t j_ = FUNC(rd_cost)(enc, chain, cu_x, cu_y, y_min, &cd, (dist_), &after); \
+        int64_t j_;                                                                \
+        if (enc->rough_rd) {                                                       \
+            j_ = dj_ + enc->lambda_sse_q8                                          \
+                 * (int64_t)((rb_) + FUNC(rough_mode_bits)((kind_), cd.merge_idx, &cd.mvd)); \
+            after = *chain;                                                        \
+        } else                                                                     \
+            j_ = FUNC(rd_cost)(enc, chain, cu_x, cu_y, y_min, &cd, (dist_), &after); \
         if (j_ < best_j) { best_j = j_; *d = cd; d->j = j_; best_after = after; best_mv = (mv_); } \
     } while (0)
 
@@ -1314,7 +1336,7 @@ static void FUNC(decide_cu)(hevc_encoder_t *enc, hevc_cabac_t *chain, int cu_x, 
      * here wins on this CU's bits alone and leaves no motion for the next
      * CUs and pictures to merge with: not trying it saved 4.6% of the time
      * on the BC-250 and 0.5% of bits (park_joy 1.9%). */
-    if (d->kind == CU_SKIP || !FUNC(inter_any_cbf)(&d->res)) goto decided;
+    if (d->kind == CU_SKIP || !FUNC(inter_any_cbf)(&d->res) || !enc->intra_in_p) goto decided;
     FUNC(intra_trial)(enc, cu_x, cu_y, y_min, &cd.intra);
     const int64_t dist_intra =
           FUNC(sse)(src, cw, (const pixel *)enc->recon_y + (size_t)cu_y * cw + cu_x, cw, 8, 8)
